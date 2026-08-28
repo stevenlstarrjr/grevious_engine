@@ -11,11 +11,12 @@ The delivery sequence is raster PBR, hybrid raster/ray tracing, real-time GI,
 then an experimental low-sample path-traced mode. Rasterization remains the
 portable primary-visibility path; ray tracing is always optional.
 
-PBRT-v4 and the fourth-edition PBRT book in the parent workspace are references
-for radiometry, BSDFs, sampling, and light transport. The local PBRT-v4 scene
-corpus supplies reference cameras, lights, environments, materials, geometry,
-and rendered targets. Their parser and offline object model are not the runtime
-architecture. The glTF sample repository supplies runtime-format test data;
+The pinned `reference/pbrt-v4` and `reference/pbr-book` submodules are
+references for radiometry, BSDFs, sampling, and light transport. The
+`reference/pbrt-v4-scenes` corpus supplies reference cameras, lights,
+environments, materials, geometry, and rendered targets. Their parser and
+offline object model are not the runtime architecture. The
+`reference/glTF-Sample-Assets` submodule supplies runtime-format test data;
 individual asset licenses must be checked before redistribution.
 
 ## Ownership boundaries
@@ -727,7 +728,8 @@ assumptions so later spectral experiments remain possible.
 
 ## Reference and PBR verification protocol
 
-The local `pbrt-v4` source and fourth-edition `pbr-book` are correctness
+The pinned `reference/pbrt-v4` source and fourth-edition
+`reference/pbr-book` submodules are correctness
 references, never linked runtime dependencies. For GPU design, the wavefront
 chapter and PBRT work queues inform structure-of-arrays layout, bounded work
 queues, and explicit stage scheduling. For shading, PBRT's BxDF interfaces,
@@ -760,7 +762,7 @@ Before declaring the PBR milestone complete:
    against equations verified from the local PBRT sources/book.
 2. Analytic furnace tests and dielectric/metallic parameter sweeps will catch
    energy gain, roughness singularities, and color-space mistakes.
-3. Visual tests will use assets from the local `glTF-Sample-Assets` repository,
+3. Visual tests use assets from the pinned `reference/glTF-Sample-Assets` submodule,
    starting with `CompareMetallic`, `CompareRoughness`, `CompareNormal`,
    `MetalRoughSpheres`, `MetalRoughSpheresNoTextures`, and
    `NormalTangentTest`.

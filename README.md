@@ -1,9 +1,12 @@
 # Bloxel Renderer
 
+Current developer handoff: [`HANDOFF.md`](HANDOFF.md)
+
 A Linux/Wayland-only, real-time C++20 renderer built directly on Vulkan 1.3.
 Milestones 1 through 7 are implemented at baseline. Milestone 8 has started
 with capability-gated Vulkan ray-tracing device setup and a certified raster
-fallback; BLAS/TLAS construction and ray-traced output are not live yet. The
+fallback. Static BLAS/TLAS ownership and build recording are implemented but
+remain RTX-unverified; ray-traced output is not live yet. The
 demo owns the Vulkan
 window/device/swapchain, suballocated GPU
 resources, asynchronous uploads, SPIR-V shader reflection, descriptors, cached
@@ -26,9 +29,10 @@ materials, visibility masks, and current/previous transforms into fixed-layout
 GPU records. `KHR_materials_emissive_strength` is applied to linear emissive
 factors before GPU packing.
 
-PBRT-v4, the PBRT book, PBRT-v4 scenes, and Khronos glTF sample assets in the
-parent workspace are design and test references only. They are not linked,
-copied, or fetched by this build.
+PBRT-v4, the PBRT book, PBRT-v4 scenes, and Khronos glTF sample assets are
+pinned under `reference/`. They are design and test references only and are not
+linked into the renderer. See [`reference/README.md`](reference/README.md) for
+their roles and selective initialization commands.
 
 ## Prerequisites
 
@@ -49,11 +53,14 @@ callback algorithm through a renderer-owned adapter. The local simdjson target
 prevents dependency downloads during configure. ThorVG
 and Yoga are present but deliberately not linked until a renderer-facing vector
 or layout use is approved.
-After cloning, initialize them with:
+After cloning, initialize the runtime dependencies and glTF test resources with:
 
 ```sh
-git submodule update --init --recursive
+git submodule update --init --recursive thirdparty reference/glTF-Sample-Assets
 ```
+
+The PBRT references are optional for normal builds; initialize them selectively
+using the commands in [`reference/README.md`](reference/README.md).
 
 ## Build and run
 
@@ -304,8 +311,9 @@ The loader reports and skips an unusable system D3D12/`dzn` ICD on this host;
 that loader warning is not emitted by the renderer or the validation layer.
 AMD and NVIDIA still require runtime certification on representative hardware.
 
-Following `GAME_RENDERER.md`, the glTF ingestion gate uses the parent workspace's
-`glTF-Sample-Assets` directly rather than copying its data. Current coverage
+The glTF ingestion gate uses the pinned
+`reference/glTF-Sample-Assets` submodule directly rather than copying its data.
+Current coverage
 includes external-buffer glTF, image-bearing GLB, hierarchy evaluation, and the
 98-material `MetalRoughSpheresNoTextures` sweep. Unsupported extensions,
 animation, skins, morph targets, and unsupported vertex semantics fail with
@@ -326,7 +334,7 @@ measurable reference path (153 ms in the optimized PBRT-environment run) that
 will later move to the asset compiler or GPU preprocessing without changing the
 runtime texture interface.
 
-The local `pbrt-v4-scenes` corpus supplies PBRT reference configurations,
+The pinned `reference/pbrt-v4-scenes` corpus supplies PBRT reference configurations,
 textures, geometry, HDR environments, and reference renders. Near-term checks
 will use the compact Ganesha environment, Killeroo area lighting, and Barcelona
 Pavilion day/night setups; Bistro, San Miguel, and Landscape are later

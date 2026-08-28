@@ -1,7 +1,8 @@
 # PBRT-v4 provenance
 
 PBRT-v4 is the renderer's mathematical reference, not a linked runtime
-dependency or an architecture template. The reviewed local revision is
+dependency or an architecture template. It is pinned under
+`reference/pbrt-v4`; the reviewed revision is
 `5f7a606806a4ac7b939131ded9d7a30ebd02416e`. PBRT-v4 is distributed under the
 Apache License 2.0; this project preserves attribution whenever implementation
 code is ported. Derived source carries PBRT's copyright and Apache-2.0

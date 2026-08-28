@@ -28,3 +28,15 @@
 [submodule "thirdparty/MikkTSpace"]
 	path = thirdparty/MikkTSpace
 	url = https://github.com/mmikk/MikkTSpace.git
+[submodule "reference/glTF-Sample-Assets"]
+	path = reference/glTF-Sample-Assets
+	url = https://github.com/KhronosGroup/glTF-Sample-Assets.git
+[submodule "reference/pbrt-v4"]
+	path = reference/pbrt-v4
+	url = https://github.com/mmp/pbrt-v4.git
+[submodule "reference/pbr-book"]
+	path = reference/pbr-book
+	url = https://github.com/mmp/pbr-book-website.git
+[submodule "reference/pbrt-v4-scenes"]
+	path = reference/pbrt-v4-scenes
+	url = https://github.com/mmp/pbrt-v4-scenes.git

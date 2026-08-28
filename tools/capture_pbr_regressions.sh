@@ -2,18 +2,25 @@
 set -euo pipefail
 
 renderer_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-workspace_root="$(cd -- "${renderer_root}/.." && pwd)"
+reference_root="${renderer_root}/reference"
+environment="${PBR_ENVIRONMENT:-${renderer_root}/../hdri/hangar_interior_4k.hdr}"
 build_dir="${1:-${renderer_root}/build/release}"
 output_dir="${2:-${renderer_root}/captures/current}"
 baseline="${renderer_root}/captures/regression/damaged_helmet_hangar.png"
 capture="${output_dir}/damaged_helmet_hangar.png"
 maximum_rmse="${PBR_MAX_RMSE:-0.025}"
 
+if [[ ! -f "${environment}" ]]; then
+    echo "Missing PBR regression environment: ${environment}" >&2
+    echo "Set PBR_ENVIRONMENT to the certified hangar_interior_4k.hdr path." >&2
+    exit 1
+fi
+
 cmake --build "${build_dir}" -j4
 mkdir -p "${output_dir}"
 env SDL_VIDEODRIVER=wayland "${build_dir}/bin/renderer_demo" \
-    --scene "${workspace_root}/glTF-Sample-Assets/Models/DamagedHelmet/glTF/DamagedHelmet.gltf" \
-    --environment "${workspace_root}/hdri/hangar_interior_4k.hdr" \
+    --scene "${reference_root}/glTF-Sample-Assets/Models/DamagedHelmet/glTF/DamagedHelmet.gltf" \
+    --environment "${environment}" \
     --environment-rotation 0 \
     --exposure-ev -1 \
     --taa off \

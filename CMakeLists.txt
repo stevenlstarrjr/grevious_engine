@@ -459,7 +459,7 @@ if(BUILD_TESTING)
     target_compile_features(gltf_importer_test PRIVATE cxx_std_20)
     target_link_libraries(gltf_importer_test PRIVATE renderer_gltf)
     target_compile_definitions(gltf_importer_test PRIVATE
-        RENDERER_GLTF_SAMPLE_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../glTF-Sample-Assets"
+        RENDERER_GLTF_SAMPLE_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/reference/glTF-Sample-Assets"
     )
     set_target_properties(gltf_importer_test PROPERTIES CXX_EXTENSIONS OFF)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -498,7 +498,7 @@ if(BUILD_TESTING)
         renderer_pbr
     )
     target_compile_definitions(gltf_pbr_integration_test PRIVATE
-        RENDERER_GLTF_SAMPLE_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../glTF-Sample-Assets"
+        RENDERER_GLTF_SAMPLE_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/reference/glTF-Sample-Assets"
     )
     set_target_properties(gltf_pbr_integration_test PROPERTIES CXX_EXTENSIONS OFF)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -517,7 +517,7 @@ if(BUILD_TESTING)
     target_compile_features(image_decoder_test PRIVATE cxx_std_20)
     target_link_libraries(image_decoder_test PRIVATE renderer_images)
     target_compile_definitions(image_decoder_test PRIVATE
-        RENDERER_GLTF_SAMPLE_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../glTF-Sample-Assets"
+        RENDERER_GLTF_SAMPLE_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/reference/glTF-Sample-Assets"
     )
     set_target_properties(image_decoder_test PROPERTIES CXX_EXTENSIONS OFF)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 renderer_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-workspace_root="$(cd -- "${renderer_root}/.." && pwd)"
+reference_root="${renderer_root}/reference"
 build_dir="${1:-${renderer_root}/build/debug}"
 output_dir="${2:-${renderer_root}/captures/current/post_processing}"
 renderer="${build_dir}/bin/renderer_demo"
@@ -219,7 +219,7 @@ camera_stats="$(image_stats "${output_dir}/camera_motion.png")"
 require_ge "$(field "${camera_stats}" finite)" 1 "camera-motion bloom output"
 
 capture gltf_emissive 8 --resolution 1280 720 \
-    --scene "${workspace_root}/glTF-Sample-Assets/Models/BoomBox/glTF/BoomBox.gltf" \
+    --scene "${reference_root}/glTF-Sample-Assets/Models/BoomBox/glTF/BoomBox.gltf" \
     --taa off --bloom on --debug-view bloom
 emissive_stats="$(image_stats "${output_dir}/gltf_emissive.png")"
 require_ge "$(field "${emissive_stats}" finite)" 1 "glTF emissive bloom output"
