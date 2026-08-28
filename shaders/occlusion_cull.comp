@@ -1,0 +1,173 @@
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform FrameData
+{
+    mat4 viewProjection;
+    mat4 inverseViewProjection;
+    mat4 unjitteredViewProjection;
+    mat4 previousViewProjection;
+    mat4 previousUnjitteredViewProjection;
+    vec4 cameraPositionExposure;
+    vec4 directionalDirectionIntensity;
+    vec4 directionalColor;
+    vec4 pointPositionIntensity;
+    vec4 pointColorRange;
+    vec4 environmentParameters;
+    uvec4 cullingParameters;
+    uvec4 visibilityMask;
+    vec4 temporalJitter;
+    uvec4 temporalFlags;
+    vec4 shadowSceneCenterRadius;
+    vec4 shadowCascadeCenterRadius1;
+    vec4 shadowCascadeCenterRadius2;
+    vec4 shadowCascadeSplits;
+    vec4 shadowCascadeDepthRadii;
+    vec4 previousCameraPosition;
+} frameData;
+
+struct InstanceRecord
+{
+    vec4 centerRadius;
+    uvec4 meshMaterial;
+    uvec4 visibilityLayer;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Instances
+{
+    InstanceRecord instances[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer FrustumVisibleInstances
+{
+    uint frustumVisibleInstanceIndices[];
+};
+
+struct DrawIndexedIndirectCommand
+{
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer FrustumIndirectCommands
+{
+    DrawIndexedIndirectCommand frustumDrawCommands[];
+};
+
+layout(set = 0, binding = 4) uniform sampler2D hiZLevels[16];
+
+layout(std430, set = 0, binding = 5) writeonly buffer VisibleInstances
+{
+    uint visibleInstanceIndices[];
+};
+
+layout(std430, set = 0, binding = 6) buffer IndirectCommands
+{
+    DrawIndexedIndirectCommand drawCommands[];
+};
+
+layout(std430, set = 0, binding = 7) readonly buffer FrustumDrawCount
+{
+    uint frustumDrawCount;
+};
+
+layout(std430, set = 0, binding = 8) buffer DrawCount
+{
+    uint drawCount;
+};
+
+vec4 matrixRow(mat4 matrix, int row)
+{
+    return vec4(matrix[0][row], matrix[1][row], matrix[2][row], matrix[3][row]);
+}
+
+bool sphereOccluded(vec3 center, float radius)
+{
+    if (frameData.cullingParameters.x == 0u) {
+        return false;
+    }
+
+    // The Hi-Z pyramid contains the preceding frame's depth. Project the
+    // static world-space bound through that same frame's camera. Mixing the
+    // current camera with previous depth causes false rejection while moving.
+    vec4 centerClip = frameData.previousUnjitteredViewProjection * vec4(center, 1.0);
+    vec4 row0 = matrixRow(frameData.previousUnjitteredViewProjection, 0);
+    vec4 row1 = matrixRow(frameData.previousUnjitteredViewProjection, 1);
+    vec4 row3 = matrixRow(frameData.previousUnjitteredViewProjection, 3);
+    float minimumW = centerClip.w - radius * length(row3.xyz);
+    if (minimumW <= 0.0001) {
+        return false;
+    }
+
+    vec2 centerNdc = centerClip.xy / centerClip.w;
+    vec2 radiusNdc = 2.0 * radius * vec2(length(row0.xyz), length(row1.xyz)) / minimumW;
+    vec2 minimumUv = centerNdc * 0.5 + 0.5 - radiusNdc * 0.5;
+    vec2 maximumUv = centerNdc * 0.5 + 0.5 + radiusNdc * 0.5;
+    // Depth outside the previous viewport is unknown. Newly revealed objects
+    // at a moving screen edge must remain visible instead of sampling the
+    // clamped border and being rejected by unrelated depth.
+    if (any(lessThan(minimumUv, vec2(0.0))) || any(greaterThan(maximumUv, vec2(1.0)))) {
+        return false;
+    }
+
+    vec2 baseExtent = vec2(frameData.cullingParameters.zw);
+    float maximumPixelExtent = max((maximumUv.x - minimumUv.x) * baseExtent.x,
+                                   (maximumUv.y - minimumUv.y) * baseExtent.y);
+    uint levelCount = max(frameData.cullingParameters.y, 1u);
+    uint level = uint(clamp(ceil(log2(max(maximumPixelExtent, 1.0))) - 1.0,
+                            0.0, float(levelCount - 1u)));
+
+    float maximumOccluderDepth = 0.0;
+    maximumOccluderDepth = max(maximumOccluderDepth,
+                               texture(hiZLevels[nonuniformEXT(level)], minimumUv).r);
+    maximumOccluderDepth = max(maximumOccluderDepth,
+                               texture(hiZLevels[nonuniformEXT(level)],
+                                       vec2(maximumUv.x, minimumUv.y)).r);
+    maximumOccluderDepth = max(maximumOccluderDepth,
+                               texture(hiZLevels[nonuniformEXT(level)],
+                                       vec2(minimumUv.x, maximumUv.y)).r);
+    maximumOccluderDepth = max(maximumOccluderDepth,
+                               texture(hiZLevels[nonuniformEXT(level)], maximumUv).r);
+    maximumOccluderDepth = max(maximumOccluderDepth,
+                               texture(hiZLevels[nonuniformEXT(level)],
+                                       (minimumUv + maximumUv) * 0.5).r);
+
+    vec3 towardCamera = frameData.previousCameraPosition.xyz - center;
+    float distanceToCamera = length(towardCamera);
+    if (distanceToCamera <= radius) {
+        return false;
+    }
+    vec3 nearestPoint = center + towardCamera * (radius / distanceToCamera);
+    vec4 nearestClip = frameData.previousUnjitteredViewProjection * vec4(nearestPoint, 1.0);
+    if (nearestClip.w <= 0.0) {
+        return false;
+    }
+    float nearestDepth = nearestClip.z / nearestClip.w;
+    return nearestDepth > maximumOccluderDepth + 0.002;
+}
+
+void main()
+{
+    uint commandIndex = gl_GlobalInvocationID.x;
+    if (commandIndex >= frustumDrawCount || commandIndex >= frustumDrawCommands.length()) {
+        return;
+    }
+    uint instanceIndex = frustumVisibleInstanceIndices[commandIndex];
+    InstanceRecord instance = instances[instanceIndex];
+    if (sphereOccluded(instance.centerRadius.xyz, instance.centerRadius.w)) {
+        return;
+    }
+    uint outputIndex = atomicAdd(drawCount, 1u);
+    if (outputIndex >= drawCommands.length() || outputIndex >= visibleInstanceIndices.length()) {
+        return;
+    }
+    visibleInstanceIndices[outputIndex] = instanceIndex;
+    DrawIndexedIndirectCommand command = frustumDrawCommands[commandIndex];
+    command.firstInstance = outputIndex;
+    drawCommands[outputIndex] = command;
+}

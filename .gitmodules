@@ -1,0 +1,30 @@
+[submodule "thirdparty/SDL"]
+	path = thirdparty/SDL
+	url = https://github.com/libsdl-org/SDL.git
+[submodule "thirdparty/volk"]
+	path = thirdparty/volk
+	url = https://github.com/zeux/volk.git
+[submodule "thirdparty/VMA"]
+	path = thirdparty/VMA
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+[submodule "thirdparty/glm"]
+	path = thirdparty/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "thirdparty/fastgltf"]
+	path = thirdparty/fastgltf
+	url = https://github.com/spnda/fastgltf.git
+[submodule "thirdparty/simdjson"]
+	path = thirdparty/simdjson
+	url = https://github.com/simdjson/simdjson.git
+[submodule "thirdparty/stb"]
+	path = thirdparty/stb
+	url = https://github.com/nothings/stb.git
+[submodule "thirdparty/ThorVG"]
+	path = thirdparty/ThorVG
+	url = https://github.com/thorvg/thorvg.git
+[submodule "thirdparty/Yoga"]
+	path = thirdparty/Yoga
+	url = https://github.com/facebook/yoga.git
+[submodule "thirdparty/MikkTSpace"]
+	path = thirdparty/MikkTSpace
+	url = https://github.com/mmikk/MikkTSpace.git

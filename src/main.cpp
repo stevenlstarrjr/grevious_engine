@@ -1,0 +1,537 @@
+#include "renderer/core/Log.hpp"
+#include "renderer/platform/Window.hpp"
+#include "renderer/renderer/Renderer.hpp"
+#include "renderer/vulkan/Device.hpp"
+#include "renderer/vulkan/Instance.hpp"
+
+#include <array>
+#include <charconv>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <iostream>
+#include <numbers>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+namespace {
+
+enum class ResizeScript { none, standard, odd, stress };
+
+struct Options {
+    std::optional<std::uint64_t> frameLimit;
+    std::filesystem::path scenePath;
+    std::filesystem::path environmentPath;
+    float exposureCompensationEv = 0.0F;
+    float environmentRotationDegrees = 0.0F;
+    std::filesystem::path capturePath;
+    std::filesystem::path timingOutputPath;
+    std::uint64_t captureFrame = 8;
+    renderer::RenderLayerMask visibilityMask = renderer::defaultViewVisibilityMask;
+    bool taaEnabled = true;
+    bool bloomEnabled = true;
+    float bloomIntensity = renderer::post::bloomIntensity;
+    float bloomRadius = 1.0F;
+    bool emissiveSphereDemo = false;
+    bool directionalShadowDemo = false;
+    bool alphaShadowDemo = false;
+    bool shadowsEnabled = true;
+    renderer::ray_tracing::Request rayTracingRequest = renderer::ray_tracing::Request::automatic;
+    bool occlusionCullingEnabled = true;
+    renderer::post::TestPattern postTestPattern = renderer::post::TestPattern::none;
+    float postTestSourceValue = 4.0F;
+    glm::vec2 postTestPosition{0.5F};
+    std::uint32_t width = 1280;
+    std::uint32_t height = 720;
+    renderer::TemporalDebugView temporalDebugView = renderer::TemporalDebugView::none;
+    renderer::TemporalCameraScript temporalCameraScript = renderer::TemporalCameraScript::none;
+    ResizeScript resizeScript = ResizeScript::none;
+    bool captureFrameSpecified = false;
+    renderer::vulkan::ValidationMode validation =
+#if RENDERER_VALIDATION_DEFAULT
+        renderer::vulkan::ValidationMode::available;
+#else
+        renderer::vulkan::ValidationMode::off;
+#endif
+};
+
+float parseExposure(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < -16.0F || value > 16.0F) {
+        throw std::runtime_error("--exposure-ev requires a finite value in [-16, 16]");
+    }
+    return value;
+}
+
+float parsePostSourceValue(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.0F || value > 65504.0F) {
+        throw std::runtime_error("--post-value requires a finite value in [0, 65504]");
+    }
+    return value;
+}
+
+float parseBloomIntensity(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.0F || value > 16.0F) {
+        throw std::runtime_error("--bloom-intensity requires a finite value in [0, 16]");
+    }
+    return value;
+}
+
+float parseBloomRadius(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.25F || value > 16.0F) {
+        throw std::runtime_error("--bloom-radius requires a finite value in [0.25, 16]");
+    }
+    return value;
+}
+
+float parseUnitCoordinate(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.0F || value > 1.0F) {
+        throw std::runtime_error("--post-position requires two finite coordinates in [0, 1]");
+    }
+    return value;
+}
+
+std::uint32_t parseExtent(std::string_view text) {
+    std::uint32_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0U || value > 16384U) {
+        throw std::runtime_error("--resolution requires dimensions in [1, 16384]");
+    }
+    return value;
+}
+
+renderer::post::TestPattern parsePostTestPattern(std::string_view value) {
+    using renderer::post::TestPattern;
+    if (value == "off") {
+        return TestPattern::none;
+    }
+    if (value == "black") {
+        return TestPattern::black;
+    }
+    if (value == "constant") {
+        return TestPattern::constant;
+    }
+    if (value == "impulse") {
+        return TestPattern::impulse;
+    }
+    if (value == "small-square") {
+        return TestPattern::square;
+    }
+    if (value == "horizontal-line") {
+        return TestPattern::horizontalLine;
+    }
+    if (value == "vertical-line") {
+        return TestPattern::verticalLine;
+    }
+    if (value == "multiple") {
+        return TestPattern::multipleSources;
+    }
+    if (value == "checkerboard") {
+        return TestPattern::checkerboard;
+    }
+    if (value == "moving-square") {
+        return TestPattern::movingSquare;
+    }
+    throw std::runtime_error(
+        "--post-test requires off, black, constant, impulse, small-square, horizontal-line, "
+        "vertical-line, multiple, checkerboard, or moving-square");
+}
+
+float parseEnvironmentRotation(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value)) {
+        throw std::runtime_error("--environment-rotation requires a finite angle in degrees");
+    }
+    return std::remainder(value, 360.0F);
+}
+
+std::uint64_t parseFrameCount(std::string_view text) {
+    std::uint64_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0) {
+        throw std::runtime_error("--frames requires a positive integer");
+    }
+    return value;
+}
+
+renderer::RenderLayerMask parseVisibilityMask(std::string_view text) {
+    int base = 10;
+    if (text.starts_with("0x") || text.starts_with("0X")) {
+        text.remove_prefix(2);
+        base = 16;
+    }
+    renderer::RenderLayerMask value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value, base);
+    if (text.empty() || error != std::errc{} || end != text.data() + text.size()) {
+        throw std::runtime_error(
+            "--visibility-mask requires an unsigned decimal or 0x-prefixed 64-bit mask");
+    }
+    return value;
+}
+
+Options parseOptions(int argc, char** argv) {
+    Options options;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--help") {
+            std::cout << "Usage: renderer_demo [--frames N] "
+                         "[--validation off|available|required] "
+                         "[--scene PATH] "
+                         "[--environment PATH] [--environment-rotation DEGREES] "
+                         "[--exposure-ev STOPS] [--capture PATH] "
+                         "[--timing-output PATH] "
+                         "[--capture-frame N] [--visibility-mask MASK] "
+                         "[--taa on|off] [--bloom on|off] [--bloom-intensity VALUE] "
+                         "[--bloom-radius VALUE] "
+                         "[--shadows on|off] [--ray-tracing off|auto|required] "
+                         "[--occlusion-culling on|off] "
+                         "[--demo pbr-grid|emissive-sphere|directional-shadow|alpha-shadow] "
+                         "[--debug-view final|motion|history-validity|bloom|hdr] "
+                         "[--post-test PATTERN] [--post-value LINEAR_HDR] "
+                         "[--post-position X Y] "
+                         "[--resolution WIDTH HEIGHT] "
+                         "[--camera-script none|translate|teleport|rotate|approach] "
+                         "[--resize-script [standard|odd|stress]]\n";
+            std::exit(0);
+        }
+        if (argument == "--frames" && index + 1 < argc) {
+            options.frameLimit = parseFrameCount(argv[++index]);
+            continue;
+        }
+        if (argument == "--validation" && index + 1 < argc) {
+            const std::string_view mode(argv[++index]);
+            if (mode == "off") {
+                options.validation = renderer::vulkan::ValidationMode::off;
+            } else if (mode == "available") {
+                options.validation = renderer::vulkan::ValidationMode::available;
+            } else if (mode == "required") {
+                options.validation = renderer::vulkan::ValidationMode::required;
+            } else {
+                throw std::runtime_error("Unknown validation mode: " + std::string(mode));
+            }
+            continue;
+        }
+        if (argument == "--environment" && index + 1 < argc) {
+            options.environmentPath = argv[++index];
+            if (options.environmentPath.empty()) {
+                throw std::runtime_error("--environment requires a non-empty path");
+            }
+            continue;
+        }
+        if (argument == "--scene" && index + 1 < argc) {
+            options.scenePath = argv[++index];
+            if (options.scenePath.empty()) {
+                throw std::runtime_error("--scene requires a non-empty path");
+            }
+            continue;
+        }
+        if (argument == "--exposure-ev" && index + 1 < argc) {
+            options.exposureCompensationEv = parseExposure(argv[++index]);
+            continue;
+        }
+        if (argument == "--environment-rotation" && index + 1 < argc) {
+            options.environmentRotationDegrees = parseEnvironmentRotation(argv[++index]);
+            continue;
+        }
+        if (argument == "--capture" && index + 1 < argc) {
+            options.capturePath = argv[++index];
+            if (options.capturePath.empty()) {
+                throw std::runtime_error("--capture requires a non-empty PNG path");
+            }
+            continue;
+        }
+        if (argument == "--timing-output" && index + 1 < argc) {
+            options.timingOutputPath = argv[++index];
+            if (options.timingOutputPath.empty()) {
+                throw std::runtime_error("--timing-output requires a non-empty path");
+            }
+            continue;
+        }
+        if (argument == "--capture-frame" && index + 1 < argc) {
+            options.captureFrame = parseFrameCount(argv[++index]);
+            options.captureFrameSpecified = true;
+            continue;
+        }
+        if (argument == "--visibility-mask" && index + 1 < argc) {
+            options.visibilityMask = parseVisibilityMask(argv[++index]);
+            continue;
+        }
+        if (argument == "--taa" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.taaEnabled = true;
+            } else if (value == "off") {
+                options.taaEnabled = false;
+            } else {
+                throw std::runtime_error("--taa requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--bloom" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.bloomEnabled = true;
+            } else if (value == "off") {
+                options.bloomEnabled = false;
+            } else {
+                throw std::runtime_error("--bloom requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--bloom-intensity" && index + 1 < argc) {
+            options.bloomIntensity = parseBloomIntensity(argv[++index]);
+            continue;
+        }
+        if (argument == "--bloom-radius" && index + 1 < argc) {
+            options.bloomRadius = parseBloomRadius(argv[++index]);
+            continue;
+        }
+        if (argument == "--shadows" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.shadowsEnabled = true;
+            } else if (value == "off") {
+                options.shadowsEnabled = false;
+            } else {
+                throw std::runtime_error("--shadows requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--ray-tracing" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "off") {
+                options.rayTracingRequest = renderer::ray_tracing::Request::disabled;
+            } else if (value == "auto") {
+                options.rayTracingRequest = renderer::ray_tracing::Request::automatic;
+            } else if (value == "required") {
+                options.rayTracingRequest = renderer::ray_tracing::Request::required;
+            } else {
+                throw std::runtime_error("--ray-tracing requires off, auto, or required");
+            }
+            continue;
+        }
+        if (argument == "--occlusion-culling" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.occlusionCullingEnabled = true;
+            } else if (value == "off") {
+                options.occlusionCullingEnabled = false;
+            } else {
+                throw std::runtime_error("--occlusion-culling requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--demo" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "pbr-grid") {
+                options.emissiveSphereDemo = false;
+                options.directionalShadowDemo = false;
+                options.alphaShadowDemo = false;
+            } else if (value == "emissive-sphere") {
+                options.emissiveSphereDemo = true;
+                options.directionalShadowDemo = false;
+                options.alphaShadowDemo = false;
+            } else if (value == "directional-shadow") {
+                options.emissiveSphereDemo = false;
+                options.directionalShadowDemo = true;
+                options.alphaShadowDemo = false;
+            } else if (value == "alpha-shadow") {
+                options.emissiveSphereDemo = false;
+                options.directionalShadowDemo = false;
+                options.alphaShadowDemo = true;
+            } else {
+                throw std::runtime_error(
+                    "--demo requires pbr-grid, emissive-sphere, directional-shadow, or "
+                    "alpha-shadow");
+            }
+            continue;
+        }
+        if (argument == "--post-test" && index + 1 < argc) {
+            options.postTestPattern = parsePostTestPattern(argv[++index]);
+            continue;
+        }
+        if (argument == "--post-value" && index + 1 < argc) {
+            options.postTestSourceValue = parsePostSourceValue(argv[++index]);
+            continue;
+        }
+        if (argument == "--post-position" && index + 2 < argc) {
+            options.postTestPosition.x = parseUnitCoordinate(argv[++index]);
+            options.postTestPosition.y = parseUnitCoordinate(argv[++index]);
+            continue;
+        }
+        if (argument == "--resolution" && index + 2 < argc) {
+            options.width = parseExtent(argv[++index]);
+            options.height = parseExtent(argv[++index]);
+            continue;
+        }
+        if (argument == "--debug-view" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "final") {
+                options.temporalDebugView = renderer::TemporalDebugView::none;
+            } else if (value == "motion") {
+                options.temporalDebugView = renderer::TemporalDebugView::motion;
+            } else if (value == "history-validity") {
+                options.temporalDebugView = renderer::TemporalDebugView::historyValidity;
+            } else if (value == "bloom") {
+                options.temporalDebugView = renderer::TemporalDebugView::bloom;
+            } else if (value == "hdr") {
+                options.temporalDebugView = renderer::TemporalDebugView::hdr;
+            } else {
+                throw std::runtime_error(
+                    "--debug-view requires final, motion, history-validity, bloom, or hdr");
+            }
+            continue;
+        }
+        if (argument == "--camera-script" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "none") {
+                options.temporalCameraScript = renderer::TemporalCameraScript::none;
+            } else if (value == "translate") {
+                options.temporalCameraScript = renderer::TemporalCameraScript::translate;
+            } else if (value == "teleport") {
+                options.temporalCameraScript = renderer::TemporalCameraScript::teleport;
+            } else if (value == "rotate") {
+                options.temporalCameraScript = renderer::TemporalCameraScript::rotate;
+            } else if (value == "approach") {
+                options.temporalCameraScript = renderer::TemporalCameraScript::approach;
+            } else {
+                throw std::runtime_error(
+                    "--camera-script requires none, translate, teleport, rotate, or approach");
+            }
+            continue;
+        }
+        if (argument == "--resize-script") {
+            options.resizeScript = ResizeScript::standard;
+            if (index + 1 < argc && std::string_view(argv[index + 1]) == "standard") {
+                ++index;
+            } else if (index + 1 < argc && std::string_view(argv[index + 1]) == "odd") {
+                ++index;
+                options.resizeScript = ResizeScript::odd;
+            } else if (index + 1 < argc && std::string_view(argv[index + 1]) == "stress") {
+                ++index;
+                options.resizeScript = ResizeScript::stress;
+            }
+            continue;
+        }
+        throw std::runtime_error("Unknown or incomplete argument: " + std::string(argument));
+    }
+    if (options.captureFrameSpecified && options.capturePath.empty()) {
+        throw std::runtime_error("--capture-frame requires --capture");
+    }
+    if (!options.capturePath.empty() && options.frameLimit.has_value() &&
+        *options.frameLimit < options.captureFrame) {
+        throw std::runtime_error("--frames must reach the requested capture frame");
+    }
+    if (!options.taaEnabled &&
+        options.temporalDebugView == renderer::TemporalDebugView::historyValidity) {
+        throw std::runtime_error("history-validity debug view requires --taa on");
+    }
+    if (!options.bloomEnabled && options.temporalDebugView == renderer::TemporalDebugView::bloom) {
+        throw std::runtime_error("bloom debug view requires --bloom on");
+    }
+    if ((options.emissiveSphereDemo || options.directionalShadowDemo || options.alphaShadowDemo) &&
+        !options.scenePath.empty()) {
+        throw std::runtime_error("Procedural --demo modes cannot be combined with --scene");
+    }
+    return options;
+}
+
+int run(const Options& options) {
+    renderer::platform::Window window(options.width, options.height,
+                                      "Bloxel Renderer — Vulkan 1.3");
+    renderer::vulkan::Instance instance(window, options.validation);
+    std::uint64_t frameCount = 0;
+    {
+        renderer::vulkan::Device device(instance);
+        {
+            renderer::Renderer renderer(
+                window, instance, device,
+                {.scenePath = options.scenePath,
+                 .environmentPath = options.environmentPath,
+                 .exposureCompensationEv = options.exposureCompensationEv,
+                 .environmentRotationRadians =
+                     options.environmentRotationDegrees * std::numbers::pi_v<float> / 180.0F,
+                 .capturePath = options.capturePath,
+                 .timingOutputPath = options.timingOutputPath,
+                 .captureFrame = options.captureFrame,
+                 .view = {.visibilityMask = options.visibilityMask},
+                 .taaEnabled = options.taaEnabled,
+                 .bloomEnabled = options.bloomEnabled,
+                 .bloomIntensity = options.bloomIntensity,
+                 .bloomRadius = options.bloomRadius,
+                 .emissiveSphereDemo = options.emissiveSphereDemo,
+                 .directionalShadowDemo = options.directionalShadowDemo,
+                 .alphaShadowDemo = options.alphaShadowDemo,
+                 .shadowsEnabled = options.shadowsEnabled,
+                 .rayTracingRequest = options.rayTracingRequest,
+                 .occlusionCullingEnabled = options.occlusionCullingEnabled,
+                 .postTestPattern = options.postTestPattern,
+                 .postTestSourceValue = options.postTestSourceValue,
+                 .postTestPosition = options.postTestPosition,
+                 .temporalDebugView = options.temporalDebugView,
+                 .temporalCameraScript = options.temporalCameraScript});
+            while (!window.shouldClose() &&
+                   (!options.frameLimit.has_value() || frameCount < *options.frameLimit)) {
+                window.pollEvents();
+                if (options.resizeScript == ResizeScript::standard && frameCount == 2U) {
+                    window.resize(960, 540);
+                } else if (options.resizeScript == ResizeScript::standard && frameCount == 6U) {
+                    window.resize(options.width, options.height);
+                } else if (options.resizeScript == ResizeScript::odd && frameCount == 2U) {
+                    window.resize(1279, 719);
+                } else if (options.resizeScript == ResizeScript::odd && frameCount == 6U) {
+                    window.resize(options.width, options.height);
+                } else if (options.resizeScript == ResizeScript::stress && frameCount >= 2U &&
+                           frameCount <= 16U && (frameCount & 1U) == 0U) {
+                    constexpr std::array sizes{std::pair{1280U, 720U},  std::pair{1279U, 719U},
+                                               std::pair{2560U, 1440U}, std::pair{1920U, 1080U},
+                                               std::pair{960U, 541U},   std::pair{1601U, 901U},
+                                               std::pair{1279U, 719U},  std::pair{1920U, 1080U}};
+                    const auto [width, height] = sizes[((frameCount - 2U) / 2U) % sizes.size()];
+                    window.resize(width, height);
+                }
+                renderer.drawFrame();
+                ++frameCount;
+            }
+            renderer.waitIdle();
+        }
+    }
+    if (instance.validationErrorCount() != 0) {
+        renderer::core::log(renderer::core::LogLevel::error, "Validation reported ",
+                            instance.validationErrorCount(), " error message(s)");
+        return 2;
+    }
+    renderer::core::log(renderer::core::LogLevel::info, "Clean shutdown after ", frameCount,
+                        " frames");
+    return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    try {
+        return run(parseOptions(argc, argv));
+    } catch (const std::exception& error) {
+        renderer::core::log(renderer::core::LogLevel::error, error.what());
+        return 1;
+    }
+}

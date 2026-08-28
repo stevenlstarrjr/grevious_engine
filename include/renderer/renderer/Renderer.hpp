@@ -1,0 +1,417 @@
+#pragma once
+
+#include "renderer/post/PostProcessing.hpp"
+#include "renderer/ray_tracing/AccelerationStructurePlan.hpp"
+#include "renderer/ray_tracing/RayTracingPolicy.hpp"
+#include "renderer/render_graph/RenderGraph.hpp"
+#include "renderer/temporal/TemporalState.hpp"
+#include "renderer/visibility/Visibility.hpp"
+#include "renderer/vulkan/Buffer.hpp"
+#include "renderer/vulkan/Descriptors.hpp"
+#include "renderer/vulkan/Image.hpp"
+#include "renderer/vulkan/MemoryAllocator.hpp"
+#include "renderer/vulkan/Pipeline.hpp"
+#include "renderer/vulkan/Sampler.hpp"
+#include "renderer/vulkan/Shader.hpp"
+#include "renderer/vulkan/Swapchain.hpp"
+#include "renderer/vulkan/UploadContext.hpp"
+
+#include <volk.h>
+
+#include <glm/mat4x4.hpp>
+#include <glm/vec2.hpp>
+#include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
+
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <span>
+#include <vector>
+
+namespace renderer::platform {
+class Window;
+}
+
+namespace renderer::vulkan {
+class AccelerationStructure;
+class Device;
+class Instance;
+} // namespace renderer::vulkan
+
+namespace renderer {
+
+enum class TemporalDebugView : std::uint32_t {
+    none = 0,
+    motion = 1,
+    historyValidity = 2,
+    bloom = 3,
+    hdr = 4,
+};
+enum class TemporalCameraScript : std::uint32_t {
+    none = 0,
+    translate = 1,
+    teleport = 2,
+    rotate = 3,
+    approach = 4,
+};
+
+struct RendererConfig {
+    std::filesystem::path scenePath;
+    std::filesystem::path environmentPath;
+    float exposureCompensationEv = 0.0F;
+    float environmentRotationRadians = 0.0F;
+    std::filesystem::path capturePath;
+    std::filesystem::path timingOutputPath;
+    std::uint64_t captureFrame = 8;
+    RenderView view;
+    bool taaEnabled = true;
+    bool bloomEnabled = true;
+    // Final bloom contribution at composite; independent of filtering strategy.
+    float bloomIntensity = post::bloomIntensity;
+    // Dimensionless desired perceptual extent. 1.0 preserves the certified baseline.
+    float bloomRadius = 1.0F;
+    bool emissiveSphereDemo = false;
+    bool directionalShadowDemo = false;
+    bool alphaShadowDemo = false;
+    bool shadowsEnabled = true;
+    ray_tracing::Request rayTracingRequest = ray_tracing::Request::automatic;
+    bool occlusionCullingEnabled = true;
+    post::TestPattern postTestPattern = post::TestPattern::none;
+    float postTestSourceValue = 4.0F;
+    glm::vec2 postTestPosition{0.5F};
+    TemporalDebugView temporalDebugView = TemporalDebugView::none;
+    TemporalCameraScript temporalCameraScript = TemporalCameraScript::none;
+};
+
+class Renderer final {
+  public:
+    Renderer(platform::Window& window, const vulkan::Instance& instance,
+             const vulkan::Device& device, RendererConfig config = {});
+    ~Renderer();
+
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
+
+    void drawFrame();
+    void waitIdle();
+    void setViewVisibilityMask(RenderLayerMask mask) {
+        mainView_.visibilityMask = mask;
+        temporalState_.invalidateHistory();
+        hiZReady_ = false;
+    }
+    [[nodiscard]] RenderLayerMask viewVisibilityMask() const { return mainView_.visibilityMask; }
+    void resetTemporalHistory() {
+        temporalState_.reset();
+        hiZReady_ = false;
+    }
+
+  private:
+    struct Frame {
+        VkCommandPool commandPool = VK_NULL_HANDLE;
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+        VkSemaphore imageAvailable = VK_NULL_HANDLE;
+        std::uint64_t completionValue = 0;
+        bool timingPending = false;
+    };
+
+    struct FrameUniform {
+        glm::mat4 viewProjection{1.0F};
+        glm::mat4 inverseViewProjection{1.0F};
+        glm::mat4 unjitteredViewProjection{1.0F};
+        glm::mat4 previousViewProjection{1.0F};
+        glm::mat4 previousUnjitteredViewProjection{1.0F};
+        glm::vec4 cameraPositionExposure{0.0F};
+        glm::vec4 directionalDirectionIntensity{0.0F};
+        glm::vec4 directionalColor{1.0F};
+        glm::vec4 pointPositionIntensity{0.0F};
+        glm::vec4 pointColorRange{1.0F};
+        glm::vec4 environmentParameters{0.0F};
+        glm::uvec4 cullingParameters{0U};
+        // Low/high RenderLayerMask words, post-test ID, bloom-intensity float bits.
+        glm::uvec4 visibilityMask{0U};
+        // Current.xy and previous.zw camera jitter in pixel units.
+        glm::vec4 temporalJitter{0.0F};
+        // History valid, debug view, TAA enabled, reserved.
+        glm::uvec4 temporalFlags{0U};
+        // Cascade 0 XYZ center and W coverage radius. W=0 disables shadow sampling.
+        glm::vec4 shadowSceneCenterRadius{0.0F};
+        glm::vec4 shadowCascadeCenterRadius1{0.0F};
+        glm::vec4 shadowCascadeCenterRadius2{0.0F};
+        // XYZ are far view-distance splits; W is the active cascade count.
+        glm::vec4 shadowCascadeSplits{0.0F};
+        // XYZ are light-axis half-depths for cascades 0..2.
+        glm::vec4 shadowCascadeDepthRadii{0.0F};
+        // Previous camera position used with previous-frame Hi-Z occlusion data.
+        glm::vec4 previousCameraPosition{0.0F};
+    };
+
+    struct BloomControls {
+        glm::vec4 intensityFilterScaleThresholdKnee{post::bloomIntensity, 1.0F,
+                                                    post::bloomThreshold, post::bloomKnee};
+    };
+
+    struct BloomLevelGraphResources {
+        VkExtent2D extent{};
+        render_graph::ImageHandle filtered;
+        render_graph::ImageHandle scratch;
+    };
+
+    static_assert(sizeof(FrameUniform) == 144 * sizeof(float));
+
+    struct GraphFrameContext {
+        std::uint32_t imageIndex = 0;
+        std::size_t frameIndex = 0;
+        std::size_t historyReadIndex = 0;
+        std::size_t historyWriteIndex = 0;
+        bool capture = false;
+    };
+
+    void createFrameResources();
+    void createCaptureBuffer();
+    void createTemporalResources();
+    void destroyFrameResources();
+    void createSceneResources();
+    void createRayTracingResources(std::span<const gpu_scene::TransformRecord> transforms);
+    void createGraphicsPipelines();
+    void createRenderGraph();
+    void updateToneMappingDescriptor();
+    void updateShadowDescriptor();
+    void updateHiZDescriptors();
+    void resetCamera();
+    void updateCamera();
+    void updateFrameUniform(std::size_t frameIndex);
+    void recreateSwapchain();
+    void recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageIndex,
+                     std::size_t frameIndex, bool capture);
+    void recordPbrPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                       const GraphFrameContext& context);
+    void recordCullingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context);
+    void recordShadowCullingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context,
+                                 std::size_t cascadeIndex);
+    void recordShadowPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                          const GraphFrameContext& context, std::size_t cascadeIndex,
+                          render_graph::ImageHandle shadowImage);
+    void recordOcclusionCullingPass(VkCommandBuffer commandBuffer,
+                                    const GraphFrameContext& context);
+    void recordHiZPass(VkCommandBuffer commandBuffer, std::size_t level);
+    void recordTaaPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context);
+    void recordToneMappingPass(VkCommandBuffer commandBuffer,
+                               const render_graph::RenderGraph& graph,
+                               const GraphFrameContext& context);
+    void recordCapturePass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph);
+    void writeCapture() const;
+    enum class GpuTimingPass : std::uint32_t {
+        shadowCulling,
+        shadowMap,
+        bloomDownsample,
+        bloomHorizontal,
+        bloomVertical,
+        toneMapping,
+    };
+    void recordBloomPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                         render_graph::ImageHandle target, const vulkan::GraphicsPipeline& pipeline,
+                         std::size_t descriptorSetIndex, std::size_t frameIndex,
+                         GpuTimingPass timingPass);
+    void writeGpuTimestamp(VkCommandBuffer commandBuffer, std::size_t frameIndex,
+                           GpuTimingPass pass, bool end) const;
+    void collectGpuTimings(std::size_t frameIndex);
+    void writeGpuTimingReport();
+
+    static constexpr std::size_t framesInFlight = 2;
+    static constexpr std::uint32_t maxBindlessTextures = 64;
+    static constexpr std::uint32_t maxHiZLevels = 16;
+    static constexpr std::uint32_t directionalShadowResolution = 2048;
+    static constexpr std::size_t directionalShadowCascadeCount = 3;
+    static constexpr std::size_t gpuTimingPassCount = 6;
+    platform::Window& window_;
+    const vulkan::Instance& instance_;
+    const vulkan::Device& device_;
+    RendererConfig config_;
+    ray_tracing::ShadowBackend rayTracingShadowBackend_ = ray_tracing::ShadowBackend::raster;
+    bool rayTracingFoundationEnabled_ = false;
+    ray_tracing::SceneBuildPlan rayTracingBuildPlan_;
+    RenderView mainView_;
+    vulkan::Swapchain swapchain_;
+    vulkan::MemoryAllocator memoryAllocator_;
+    vulkan::PipelineCache pipelineCache_;
+    std::unique_ptr<vulkan::Buffer> vertexBuffer_;
+    std::unique_ptr<vulkan::Buffer> indexBuffer_;
+    std::vector<std::unique_ptr<vulkan::AccelerationStructure>> bottomLevelStructures_;
+    std::unique_ptr<vulkan::AccelerationStructure> topLevelStructure_;
+    std::unique_ptr<vulkan::Buffer> rayTracingInstanceBuffer_;
+    VkDeviceSize rayTracingPersistentBytes_ = 0;
+    std::unique_ptr<vulkan::Buffer> instanceBuffer_;
+    std::unique_ptr<vulkan::Buffer> materialBuffer_;
+    std::unique_ptr<vulkan::Buffer> transformBuffer_;
+    std::unique_ptr<vulkan::Buffer> meshletWorkBuffer_;
+    std::unique_ptr<vulkan::Buffer> frustumVisibleInstanceBuffer_;
+    std::unique_ptr<vulkan::Buffer> frustumIndirectDrawBuffer_;
+    std::unique_ptr<vulkan::Buffer> frustumDrawCountBuffer_;
+    std::unique_ptr<vulkan::Buffer> visibleInstanceBuffer_;
+    std::unique_ptr<vulkan::Buffer> indirectDrawBuffer_;
+    std::unique_ptr<vulkan::Buffer> drawCountBuffer_;
+    std::array<std::unique_ptr<vulkan::Buffer>, directionalShadowCascadeCount>
+        shadowVisibleInstanceBuffers_{};
+    std::array<std::unique_ptr<vulkan::Buffer>, directionalShadowCascadeCount>
+        shadowIndirectDrawBuffers_{};
+    std::array<std::unique_ptr<vulkan::Buffer>, directionalShadowCascadeCount>
+        shadowDrawCountBuffers_{};
+    std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight> uniformBuffers_{};
+    std::unique_ptr<vulkan::Buffer> bloomControlsBuffer_;
+    std::unique_ptr<vulkan::Buffer> captureReadbackBuffer_;
+    std::vector<std::unique_ptr<vulkan::Image>> textureImages_;
+    std::vector<std::unique_ptr<vulkan::ImageView>> textureViews_;
+    std::vector<std::unique_ptr<vulkan::Sampler>> textureSamplers_;
+    std::unique_ptr<vulkan::Image> environmentImage_;
+    std::unique_ptr<vulkan::ImageView> environmentView_;
+    std::unique_ptr<vulkan::Image> diffuseIrradianceImage_;
+    std::unique_ptr<vulkan::ImageView> diffuseIrradianceView_;
+    std::unique_ptr<vulkan::Image> prefilteredSpecularImage_;
+    std::unique_ptr<vulkan::ImageView> prefilteredSpecularView_;
+    std::unique_ptr<vulkan::Image> brdfLutImage_;
+    std::unique_ptr<vulkan::ImageView> brdfLutView_;
+    std::array<std::unique_ptr<vulkan::Image>, 2> historyColorImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, 2> historyColorViews_{};
+    std::array<std::unique_ptr<vulkan::Image>, 2> historyDepthImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, 2> historyDepthViews_{};
+    std::array<std::unique_ptr<vulkan::Image>, 2> historyNormalImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, 2> historyNormalViews_{};
+    std::unique_ptr<vulkan::Sampler> iblSampler_;
+    std::unique_ptr<vulkan::Sampler> brdfLutSampler_;
+    std::unique_ptr<vulkan::Sampler> hiZSampler_;
+    std::unique_ptr<vulkan::Sampler> shadowSampler_;
+    vulkan::UploadContext uploadContext_;
+    std::unique_ptr<vulkan::ShaderModule> vertexShader_;
+    std::unique_ptr<vulkan::ShaderModule> fragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> shadowVertexShader_;
+    std::unique_ptr<vulkan::ShaderModule> shadowFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> shadowCullShader_;
+    std::unique_ptr<vulkan::ShaderModule> frustumCullShader_;
+    std::unique_ptr<vulkan::ShaderModule> occlusionCullShader_;
+    std::unique_ptr<vulkan::ShaderModule> hiZCopyShader_;
+    std::unique_ptr<vulkan::ShaderModule> hiZReduceShader_;
+    std::unique_ptr<vulkan::ShaderModule> skyFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> postTestFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> bloomDownsampleShader_;
+    std::unique_ptr<vulkan::ShaderModule> bloomBlurHorizontalShader_;
+    std::unique_ptr<vulkan::ShaderModule> bloomBlurVerticalShader_;
+    std::unique_ptr<vulkan::ShaderModule> toneMappingVertexShader_;
+    std::unique_ptr<vulkan::ShaderModule> toneMappingFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> taaFragmentShader_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> descriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> descriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> bindlessDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> bindlessDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> cullingDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> cullingDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> shadowDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> shadowDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> occlusionDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> occlusionDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> hiZDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> hiZDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> bloomDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> bloomDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> taaDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> taaDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> toneMappingDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> toneMappingDescriptorPool_;
+    std::unique_ptr<vulkan::GraphicsPipeline> graphicsPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> shadowPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> shadowCullPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> frustumCullPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> occlusionCullPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> hiZCopyPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> hiZReducePipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> skyPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> postTestPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> bloomDownsamplePipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> bloomBlurHorizontalPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> bloomBlurVerticalPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> taaPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> toneMappingPipeline_;
+    std::unique_ptr<render_graph::RenderGraph> renderGraph_;
+    render_graph::ImageHandle graphSwapchainImage_;
+    std::vector<render_graph::ImageHandle> graphTextureImages_;
+    render_graph::ImageHandle graphEnvironmentImage_;
+    render_graph::ImageHandle graphDiffuseIrradianceImage_;
+    render_graph::ImageHandle graphPrefilteredSpecularImage_;
+    render_graph::ImageHandle graphBrdfLutImage_;
+    std::array<render_graph::ImageHandle, directionalShadowCascadeCount>
+        graphDirectionalShadowImages_{};
+    render_graph::ImageHandle graphHdrImage_;
+    render_graph::ImageHandle graphMotionImage_;
+    render_graph::ImageHandle graphNormalImage_;
+    render_graph::ImageHandle graphHistoryColorReadImage_;
+    render_graph::ImageHandle graphHistoryColorWriteImage_;
+    render_graph::ImageHandle graphHistoryDepthReadImage_;
+    render_graph::ImageHandle graphHistoryDepthWriteImage_;
+    render_graph::ImageHandle graphHistoryNormalReadImage_;
+    render_graph::ImageHandle graphHistoryNormalWriteImage_;
+    std::vector<BloomLevelGraphResources> graphBloomLevels_;
+    render_graph::ImageHandle graphDepthImage_;
+    std::vector<render_graph::ImageHandle> graphHiZImages_;
+    std::vector<VkExtent2D> hiZExtents_;
+    render_graph::BufferHandle graphVertexBuffer_;
+    render_graph::BufferHandle graphIndexBuffer_;
+    render_graph::BufferHandle graphInstanceBuffer_;
+    render_graph::BufferHandle graphMaterialBuffer_;
+    render_graph::BufferHandle graphTransformBuffer_;
+    render_graph::BufferHandle graphMeshletWorkBuffer_;
+    render_graph::BufferHandle graphFrustumVisibleInstanceBuffer_;
+    render_graph::BufferHandle graphFrustumIndirectDrawBuffer_;
+    render_graph::BufferHandle graphFrustumDrawCountBuffer_;
+    render_graph::BufferHandle graphVisibleInstanceBuffer_;
+    render_graph::BufferHandle graphIndirectDrawBuffer_;
+    render_graph::BufferHandle graphDrawCountBuffer_;
+    std::array<render_graph::BufferHandle, directionalShadowCascadeCount>
+        graphShadowVisibleInstanceBuffers_{};
+    std::array<render_graph::BufferHandle, directionalShadowCascadeCount>
+        graphShadowIndirectDrawBuffers_{};
+    std::array<render_graph::BufferHandle, directionalShadowCascadeCount>
+        graphShadowDrawCountBuffers_{};
+    render_graph::BufferHandle graphUniformBuffer_;
+    render_graph::BufferHandle graphCaptureBuffer_;
+    std::array<Frame, framesInFlight> frames_{};
+    VkSemaphore frameTimeline_ = VK_NULL_HANDLE;
+    VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
+    float timestampPeriodNanoseconds_ = 0.0F;
+    std::uint32_t timestampValidBits_ = 0;
+    std::array<double, gpuTimingPassCount> gpuTimingTotalMilliseconds_{};
+    std::array<std::uint64_t, gpuTimingPassCount> gpuTimingSampleCounts_{};
+    bool timingReportWritten_ = false;
+    // Present-wait semaphores belong to acquired images. Reusing one by frame
+    // slot can race a presentation engine that has not consumed its wait yet.
+    std::vector<VkSemaphore> renderFinishedSemaphores_;
+    std::vector<bool> imageInitialized_;
+    std::size_t frameIndex_ = 0;
+    std::uint64_t nextTimelineValue_ = 1;
+    std::uint64_t renderedFrameCount_ = 0;
+    std::uint32_t sceneWorkItemCount_ = 0;
+    glm::vec3 sceneCenter_{0.0F};
+    float sceneRadius_ = 1.0F;
+    glm::vec3 cameraPosition_{0.0F, 0.0F, 1.0F};
+    float cameraYaw_ = -1.57079632679F;
+    float cameraPitch_ = 0.0F;
+    float environmentRotationRadians_ = 0.0F;
+    glm::vec3 temporalScriptOrigin_{0.0F};
+    std::chrono::steady_clock::time_point previousCameraUpdate_{};
+    VkFormat hdrFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat motionFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat normalFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat temporalDepthFormat_ = VK_FORMAT_R32_SFLOAT;
+    VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
+    temporal::TemporalState temporalState_;
+    vulkan::UploadTicket sceneUpload_{};
+    bool sceneUploadPending_ = false;
+    bool hiZReady_ = false;
+    bool cameraMovedThisFrame_ = true;
+    bool temporalImageLayoutsInitialized_ = false;
+    bool captureComplete_ = false;
+};
+
+} // namespace renderer

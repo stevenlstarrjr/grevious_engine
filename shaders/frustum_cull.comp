@@ -1,0 +1,147 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform FrameData
+{
+    mat4 viewProjection;
+    mat4 inverseViewProjection;
+    mat4 unjitteredViewProjection;
+    mat4 previousViewProjection;
+    mat4 previousUnjitteredViewProjection;
+    vec4 cameraPositionExposure;
+    vec4 directionalDirectionIntensity;
+    vec4 directionalColor;
+    vec4 pointPositionIntensity;
+    vec4 pointColorRange;
+    vec4 environmentParameters;
+    uvec4 cullingParameters;
+    uvec4 visibilityMask;
+    vec4 temporalJitter;
+    uvec4 temporalFlags;
+    vec4 shadowSceneCenterRadius;
+    vec4 shadowCascadeCenterRadius1;
+    vec4 shadowCascadeCenterRadius2;
+    vec4 shadowCascadeSplits;
+    vec4 shadowCascadeDepthRadii;
+    vec4 previousCameraPosition;
+} frameData;
+
+struct InstanceRecord
+{
+    vec4 centerRadius;
+    uvec4 meshMaterial;
+    uvec4 visibilityLayer;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Instances
+{
+    InstanceRecord instances[];
+};
+
+struct MeshletWorkRecord
+{
+    uint indexCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint instanceIndex;
+    vec2 projectedDiameterRange;
+    uint lodIndex;
+    uint reserved;
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer MeshletWork
+{
+    MeshletWorkRecord workItems[];
+};
+
+layout(std430, set = 0, binding = 3) writeonly buffer VisibleInstances
+{
+    uint visibleInstanceIndices[];
+};
+
+struct DrawIndexedIndirectCommand
+{
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 4) writeonly buffer IndirectCommands
+{
+    DrawIndexedIndirectCommand drawCommands[];
+};
+
+layout(std430, set = 0, binding = 5) buffer DrawCount
+{
+    uint drawCount;
+};
+
+vec4 matrixRow(mat4 matrix, int row)
+{
+    return vec4(matrix[0][row], matrix[1][row], matrix[2][row], matrix[3][row]);
+}
+
+bool insidePlane(vec4 plane, vec3 center, float radius)
+{
+    return dot(plane.xyz, center) + plane.w >= -radius * length(plane.xyz);
+}
+
+bool sphereInsideFrustum(vec3 center, float radius)
+{
+    vec4 row0 = matrixRow(frameData.unjitteredViewProjection, 0);
+    vec4 row1 = matrixRow(frameData.unjitteredViewProjection, 1);
+    vec4 row2 = matrixRow(frameData.unjitteredViewProjection, 2);
+    vec4 row3 = matrixRow(frameData.unjitteredViewProjection, 3);
+    return insidePlane(row3 + row0, center, radius) &&
+           insidePlane(row3 - row0, center, radius) &&
+           insidePlane(row3 + row1, center, radius) &&
+           insidePlane(row3 - row1, center, radius) &&
+           insidePlane(row2, center, radius) &&
+           insidePlane(row3 - row2, center, radius);
+}
+
+float projectedDiameterPixels(vec3 center, float radius)
+{
+    vec4 centerClip = frameData.unjitteredViewProjection * vec4(center, 1.0);
+    if (centerClip.w <= 0.0001) {
+        return 0.0;
+    }
+    float verticalProjectionScale = abs(frameData.unjitteredViewProjection[1][1]);
+    return verticalProjectionScale * radius * float(frameData.cullingParameters.w) /
+           centerClip.w;
+}
+
+void main()
+{
+    uint workIndex = gl_GlobalInvocationID.x;
+    if (workIndex >= workItems.length()) {
+        return;
+    }
+    MeshletWorkRecord work = workItems[workIndex];
+    uint instanceIndex = work.instanceIndex;
+    if (instanceIndex >= instances.length()) {
+        return;
+    }
+    InstanceRecord instance = instances[instanceIndex];
+    uvec2 commonLayers = instance.visibilityLayer.xy & frameData.visibilityMask.xy;
+    bool layerVisible = any(notEqual(commonLayers, uvec2(0u)));
+    float projectedDiameter =
+        projectedDiameterPixels(instance.centerRadius.xyz, instance.centerRadius.w);
+    bool selectedLod = projectedDiameter >= work.projectedDiameterRange.x &&
+                       projectedDiameter < work.projectedDiameterRange.y;
+    if (!layerVisible || !selectedLod ||
+        !sphereInsideFrustum(instance.centerRadius.xyz, instance.centerRadius.w)) {
+        return;
+    }
+
+    uint outputIndex = atomicAdd(drawCount, 1u);
+    if (outputIndex >= drawCommands.length() || outputIndex >= visibleInstanceIndices.length()) {
+        return;
+    }
+    visibleInstanceIndices[outputIndex] = instanceIndex;
+    drawCommands[outputIndex] = DrawIndexedIndirectCommand(
+        work.indexCount, 1u, work.firstIndex, work.vertexOffset, outputIndex);
+}

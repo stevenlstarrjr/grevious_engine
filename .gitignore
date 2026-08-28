@@ -1,0 +1,5 @@
+/build/
+/out/
+/.cache/
+/captures/current/
+compile_commands.json

@@ -1,0 +1,25 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D sourceDepth;
+layout(r32f, set = 0, binding = 1) uniform writeonly image2D destinationDepth;
+
+void main()
+{
+    ivec2 destinationCoordinate = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(destinationCoordinate, imageSize(destinationDepth)))) {
+        return;
+    }
+
+    ivec2 sourceSize = textureSize(sourceDepth, 0);
+    ivec2 sourceCoordinate = destinationCoordinate * 2;
+    float maximumDepth = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 sampleCoordinate = min(sourceCoordinate + ivec2(x, y), sourceSize - 1);
+            maximumDepth = max(maximumDepth, texelFetch(sourceDepth, sampleCoordinate, 0).r);
+        }
+    }
+    imageStore(destinationDepth, destinationCoordinate, vec4(maximumDepth));
+}
