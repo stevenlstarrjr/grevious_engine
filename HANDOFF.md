@@ -522,29 +522,121 @@ Not working yet:
 - FSR and XeSS remain future implementations behind `IUpscaler`; DLSS Super
   Resolution and DLSS Ray Reconstruction are live on Windows/NVIDIA.
 
+## Latest Windows RTX / Ray Reconstruction Checkpoint
+
+This is the exact state at the end of the 2026-08-29 Windows session:
+
+- GitHub `main` and local `main` both point to `b312d7a1e74a78fa32eae4ad7d99e0a0e1d29c9f`
+  (`Add Windows RTX path tracing and DLSS Ray Reconstruction`).
+- The Release executable built successfully at
+  `build/windows-port/bin/Release/genesis_render.exe` using Visual Studio's
+  bundled CMake. Release CTest passed **20/20** after extending the shader
+  reflection test through Ray Reconstruction bindings 20-23.
+- Hardware validation used an NVIDIA GeForce RTX 2060 SUPER with driver 595.79.
+  Streamline reported both DLSS Super Resolution and DLSS Ray Reconstruction
+  supported. The native Vulkan OFA warning and `NvLowLatencyVk.dll` warning are
+  non-fatal for this graph; do not add an unknown DLL to silence them.
+- The live Sponza test used the Khronos glTF scene at
+  `reference/glTF-Sample-Assets/Models/Sponza/glTF/Sponza.gltf` and the local
+  8K `reference/hdri/ulmer_muenster_8k.hdr`. The HDRI is intentionally ignored
+  (97 MB test data), as are generated `diagnostic_*.png` captures and the local
+  Vulkan capability dump.
+- The accepted interactive configuration is 1280x720 output, DLSS Quality at
+  853x480 internal resolution, four path bounces, one fresh sample per frame,
+  DLSS Ray Reconstruction, +2 EV, and subtle fixed film grain. The graph is:
+  `TLAS update -> noisy path tracing -> NVIDIA DLSS Ray Reconstruction -> tone
+  mapping -> Present`.
+- The last user-approved image has coherent reflected daylight on the Sponza
+  floor, cloth, columns, and lower arcade while the enclosed rear passage stays
+  darker. Movement performance and reconstruction were a large improvement over
+  the previous local/NRD path.
+
+Exact command used for that accepted run:
+
+```powershell
+.\build\windows-port\bin\Release\genesis_render.exe --render-mode path-traced --ray-tracing required --scene reference\glTF-Sample-Assets\Models\Sponza\glTF\Sponza.gltf --environment reference\hdri\ulmer_muenster_8k.hdr --camera-start interior --camera-input on --path-max-bounces 4 --path-interactive-samples 1 --path-denoiser ray-reconstruction --upscaler dlss --upscaler-quality quality --resolution 1280 720 --taa off --bloom off --film-grain 0.015 --validation off --exposure-ev 2
+```
+
+### Lighting diagnosis that must not be repeated
+
+- Increasing exposure and changing two to four bounces did not initially fix
+  the apparently black interior. Raw-radiance presentation looked equally dark,
+  proving Ray Reconstruction was not removing the light.
+- Fixed 128-frame direct-only and indirect-only captures at 640x360 proved that
+  indirect transport exists and dominates the visible interior. The direct
+  buffer contained almost only openings/sunlight; the indirect buffer contained
+  the floor, arches, cloth, and walls. The real presentation problem was the
+  compact ACES fit crushing valid low radiance when bright sun patches were in
+  the same SDR image.
+- `rendererPathTracedDisplayFitted` now preserves about three additional stops
+  of deep-shadow latitude with an exponential falloff that leaves sunlight on
+  the normal ACES shoulder. This is a path-presentation transform only; raw
+  scene-linear buffers remain unchanged.
+- The path hit shader no longer multiplies glTF baked ambient occlusion into
+  environment or recursive throughput. Ray visibility already accounts for
+  occlusion; repeated AO multiplication would bias physical transport darker.
+- Do not compensate future sampling failures with an arbitrary ambient term.
+  Use raw/direct/indirect captures to distinguish transport, reconstruction, and
+  display-transform problems.
+
+### Remaining limitations
+
+- Ray Reconstruction denoises/reconstructs sampled light; it cannot create an
+  important indirect path that the one-sample estimator never found. During
+  motion, difficult multi-bounce regions can therefore still fluctuate or lag.
+- The new shadow-latitude curve is static. There is no luminance histogram,
+  automatic exposure, or temporally smoothed eye adaptation yet.
+- There is no live performance HUD or target-frame-time dynamic resolution.
+  Quality changes still require command-line options and restarts.
+- Glass/transmission, broader punctual-light sampling, deforming geometry,
+  production animation ingestion, and PBRT runtime scene import remain absent.
+  `reference/pbrt-v4-scenes` is a pinned reference/stress source, not currently
+  a supported runtime format.
+- The signed Streamline SDK is deliberately not committed. A fresh Windows
+  checkout must run `tools/setup_streamline.ps1`; the script verifies the
+  pinned 2.12.0 archive hash before installation.
+
 ## Safest Next Steps
 
-1. Define and certify backend-level optional sharpening without weakening the
-   existing temporal validity, reactive-mask, and timing gates.
-2. Add the first vendor-neutral production adapter, with FSR as the practical
-   initial candidate, behind the existing resource and capability contract.
-3. Extend deterministic capture and motion-quality gates around the live DLSS
-   adapters, then evaluate XeSS against the same contract.
+The user selected an NVIDIA/RTX-first direction. Do not spend the next slice on
+FSR, XeSS, or another denoiser. The next image-quality bottleneck is getting the
+important indirect light sampled consistently before Ray Reconstruction.
 
-The ray-query timing, bounded transport, emissive-light, reconstruction-output,
-geometry-history validation, temporal-radiance, luminance-moment, and
-direct/indirect multi-scale denoising implementation slices are complete. The
-new spatial stage still needs its Windows hardware timing/image gates after a
-signed launch. Keep reuse bounded; production animation, alpha LOD,
-adaptive denoising, reflections
-as a separate hybrid effect, terrain, cinematic bloom replacement, and vendor
-upscalers beyond the live NVIDIA backend remain separate milestones.
+1. Implement bounded temporal/spatial reuse for indirect-light candidates—a
+   renderer-owned screen-space radiance reservoir/cache in front of Ray
+   Reconstruction. Reproject with the existing motion/depth/geometric-normal/
+   material guides, reject disocclusions and camera cuts, clamp reuse, and reset
+   exactly with the current path-history rules. Keep one fresh path sample per
+   pixel so the result remains responsive rather than freezing cached light.
+2. Add deterministic Sponza motion gates for that reuse: accepted-history ratio,
+   raw versus reused indirect RMSE, disocclusion rejection, camera-teleport
+   reset, finite/range checks, and RTX 2060 GPU timing. The success criterion is
+   visibly steadier bounced light during movement without ghosting or inventing
+   energy.
+3. Add target-frame-time dynamic internal resolution around DLSS Quality/
+   Balanced limits. Preserve 1280x720 output and use hysteresis so resolution
+   does not oscillate. Start with selectable 30 and 45 FPS targets for the RTX
+   2060 SUPER.
+4. Add a minimal in-app performance HUD: FPS/frame time, path-tracing time, Ray
+   Reconstruction time, internal/output resolution, bounce count, fresh spp,
+   GPU memory, and current exposure. This is required before further performance
+   claims.
+5. Replace the static interior shadow lift with histogram-based automatic
+   exposure and temporally smooth eye adaptation, retaining manual EV as
+   compensation. Validate indoor/outdoor transitions for comfort and flicker.
+6. Then expand materials and lighting: transmission/glass, additional punctual
+   lights, stronger emissive coverage, and animated/deforming scene tests.
+
+Keep the portable NRD/reference paths as diagnostic controls, but optimize and
+validate the RTX/Ray Reconstruction graph first. The immediate continuation is
+step 1, not backend sharpening or a cross-vendor adapter.
 
 ## Clone, Build, and Test
 
 Windows (from a Visual Studio Developer PowerShell with the Vulkan SDK installed):
 
 ```powershell
+git submodule update --init --recursive thirdparty reference/glTF-Sample-Assets
 .\tools\setup_streamline.ps1
 cmake --preset windows
 cmake --build --preset windows-debug
