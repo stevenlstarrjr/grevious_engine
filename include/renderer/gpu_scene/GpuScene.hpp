@@ -153,6 +153,17 @@ enum MaterialFlag : std::uint32_t {
 inline constexpr std::uint32_t invalidTextureDescriptor = ~std::uint32_t{0};
 inline constexpr std::uint32_t invalidEmissiveTriangleIndex = ~std::uint32_t{0};
 
+// A glTF texture may legally be reused by slots with different color-space or
+// mip semantics. Each slot class therefore resolves through its own descriptor
+// table even when all tables happen to contain the same indices.
+struct MaterialTextureDescriptorTable {
+    std::span<const std::uint32_t> baseColor;
+    std::span<const std::uint32_t> metallicRoughness;
+    std::span<const std::uint32_t> normal;
+    std::span<const std::uint32_t> occlusion;
+    std::span<const std::uint32_t> emissive;
+};
+
 struct DrawIndexedIndirectRecord {
     std::uint32_t indexCount = 0;
     std::uint32_t instanceCount = 0;
@@ -239,15 +250,20 @@ static_assert(sizeof(DrawIndexedIndirectRecord) == 5 * sizeof(std::uint32_t));
 [[nodiscard]] MaterialRecord
 packMaterial(const scene::Material& material,
              std::span<const std::uint32_t> textureDescriptorIndices = {});
+[[nodiscard]] MaterialRecord packMaterial(const scene::Material& material,
+                                          const MaterialTextureDescriptorTable& descriptors);
 [[nodiscard]] std::vector<MaterialRecord>
 packMaterials(const scene::Scene& scene,
               std::span<const std::uint32_t> textureDescriptorIndices = {});
+[[nodiscard]] std::vector<MaterialRecord>
+packMaterials(const scene::Scene& scene, const MaterialTextureDescriptorTable& descriptors);
 [[nodiscard]] PackedScene packScene(const scene::Scene& scene,
                                     std::span<const std::uint32_t> textureDescriptorIndices = {});
+[[nodiscard]] PackedScene packScene(const scene::Scene& scene,
+                                    const MaterialTextureDescriptorTable& descriptors);
 [[nodiscard]] EmissiveTriangleDistribution buildEmissiveTriangleDistribution(
     std::span<const VertexRecord> vertices, std::span<const std::uint32_t> indices,
-    std::span<const PrimitiveRecord> primitives,
-    std::span<const PrimitiveLodRange> primitiveLods,
+    std::span<const PrimitiveRecord> primitives, std::span<const PrimitiveLodRange> primitiveLods,
     std::span<const LodSourceRecord> lodSources, std::span<InstanceRecord> instances,
     std::span<const MaterialRecord> materials, std::span<const TransformRecord> transforms,
     RenderLayerMask viewMask = defaultViewVisibilityMask);

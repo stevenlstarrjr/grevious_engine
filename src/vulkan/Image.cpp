@@ -9,7 +9,8 @@ namespace renderer::vulkan {
 
 Image::Image(const Device& device, MemoryAllocator& allocator, const ImageCreateInfo& createInfo)
     : device_(device), format_(createInfo.format), extent_(createInfo.extent),
-      mipLevels_(createInfo.mipLevels), arrayLayers_(createInfo.arrayLayers) {
+      mipLevels_(createInfo.mipLevels), arrayLayers_(createInfo.arrayLayers),
+      flags_(createInfo.flags), usage_(createInfo.usage) {
     if (format_ == VK_FORMAT_UNDEFINED || createInfo.usage == 0 || extent_.width == 0 ||
         extent_.height == 0 || extent_.depth == 0 || mipLevels_ == 0 || arrayLayers_ == 0) {
         throw std::runtime_error("Image create info is incomplete");

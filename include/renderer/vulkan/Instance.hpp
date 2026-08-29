@@ -15,7 +15,8 @@ enum class ValidationMode { off, available, required };
 
 class Instance final {
   public:
-    Instance(const platform::Window& window, ValidationMode validationMode);
+    Instance(const platform::Window& window, ValidationMode validationMode,
+             PFN_vkGetInstanceProcAddr customGetInstanceProcAddr = nullptr);
     ~Instance();
 
     Instance(const Instance&) = delete;

@@ -5,12 +5,14 @@ layout(set = 0, binding = 1) uniform sampler2D currentDepth;
 layout(set = 0, binding = 2) uniform sampler2D currentMotion;
 layout(set = 0, binding = 3) uniform sampler2D previousColor;
 layout(set = 0, binding = 4) uniform sampler2D previousDepth;
+layout(set = 0, binding = 5) uniform sampler2D reactiveMask;
 
 layout(push_constant) uniform TemporalUpscalingControls
 {
     // xy: current jitter; zw: previous jitter, all in render pixels.
     vec4 temporalJitter;
-    // x: output history is valid.
+    // x: output history is valid; y: input is stochastic path-traced radiance;
+    // z: the camera moved this frame.
     uvec4 flags;
 } controls;
 
@@ -69,10 +71,16 @@ void main()
 
     vec3 accumulated = current;
     if (acceptHistory) {
-        float historyDepth = texture(previousDepth, previousUv).r;
-        float depthThreshold = max(0.0015, depthVariation * 2.0);
+        // Motion Z stores the surface's expected previous-frame device depth.
+        // Current depth is not comparable while the camera is moving.
+        float expectedPreviousDepth = motion.z;
+        ivec2 historyCoordinate = clamp(ivec2(previousUv * vec2(outputSize)),
+                                        ivec2(0), outputSize - 1);
+        float historyDepth = texelFetch(previousDepth, historyCoordinate, 0).r;
+        float depthThreshold = max(0.0005, depthVariation * 0.75);
         acceptHistory = !isnan(historyDepth) && !isinf(historyDepth) &&
-                        abs(historyDepth - depth) <= depthThreshold;
+                        expectedPreviousDepth >= 0.0 &&
+                        abs(historyDepth - expectedPreviousDepth) <= depthThreshold;
         if (acceptHistory) {
             vec3 history = texture(previousColor, previousUv).rgb;
             if (any(isnan(history)) || any(isinf(history))) {
@@ -80,7 +88,17 @@ void main()
             } else {
                 history = clamp(history, neighborhoodMinimum, neighborhoodMaximum);
                 float motionPixels = length(motion.xy * vec2(outputSize));
-                float historyWeight = clamp(0.90 - motionPixels * 0.075, 0.10, 0.90);
+                float reactive = clamp(texture(reactiveMask, uv).r, 0.0, 1.0);
+                float motionHistoryWeight = controls.flags.y != 0u
+                    ? (controls.flags.z != 0u
+                        // The corrected previous-depth test rejects history from
+                        // other surfaces. Retain a bounded amount from the same
+                        // surface to suppress one-sample noise, with reuse falling
+                        // rapidly as screen-space motion grows.
+                        ? clamp(0.60 - motionPixels * 0.03, 0.20, 0.60)
+                        : clamp(0.82 - motionPixels * 0.04, 0.10, 0.82))
+                    : clamp(0.90 - motionPixels * 0.075, 0.02, 0.90);
+                float historyWeight = motionHistoryWeight * mix(1.0, 0.10, reactive);
                 accumulated = mix(current, history, historyWeight);
             }
         }

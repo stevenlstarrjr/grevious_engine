@@ -30,8 +30,7 @@ bool EmissiveTriangleDistribution::valid() const {
         previousCdf = triangle.sampling.x;
         probabilitySum += triangle.sampling.y;
     }
-    return triangles.empty() ||
-           (previousCdf == 1.0F && std::abs(probabilitySum - 1.0F) <= 1.0e-4F);
+    return triangles.empty() || (previousCdf == 1.0F && std::abs(probabilitySum - 1.0F) <= 1.0e-4F);
 }
 
 SceneRecords makePbrSphereGrid() {
@@ -76,7 +75,7 @@ SceneRecords makePbrSphereGrid() {
 }
 
 MaterialRecord packMaterial(const scene::Material& material,
-                            std::span<const std::uint32_t> textureDescriptorIndices) {
+                            const MaterialTextureDescriptorTable& descriptors) {
     MaterialRecord packed{
         .baseColorFactor = material.baseColorFactor,
         .emissiveAlphaCutoff = {material.emissiveFactor, material.alphaCutoff},
@@ -85,27 +84,32 @@ MaterialRecord packMaterial(const scene::Material& material,
     };
 
     const auto bindTexture = [&](const scene::TextureBinding& binding,
+                                 std::span<const std::uint32_t> descriptorIndices,
                                  MaterialTextureBit presenceBit, std::uint32_t& destination) {
         if (!binding.texture.valid()) {
             return;
         }
         const std::size_t textureIndex = binding.texture.index();
-        if (textureIndex >= textureDescriptorIndices.size() ||
-            textureDescriptorIndices[textureIndex] == invalidTextureDescriptor) {
+        if (textureIndex >= descriptorIndices.size() ||
+            descriptorIndices[textureIndex] == invalidTextureDescriptor) {
             throw std::runtime_error("A material texture has no resident bindless descriptor");
         }
-        destination = textureDescriptorIndices[textureIndex];
+        destination = descriptorIndices[textureIndex];
         packed.textureState.y |= presenceBit;
         if (binding.texCoord == 1U) {
             packed.textureState.w |= presenceBit;
         }
     };
-    bindTexture(material.baseColorTexture, baseColorTextureBit, packed.textureIndices.x);
-    bindTexture(material.metallicRoughnessTexture, metallicRoughnessTextureBit,
-                packed.textureIndices.y);
-    bindTexture(material.normalTexture, normalTextureBit, packed.textureIndices.z);
-    bindTexture(material.occlusionTexture, occlusionTextureBit, packed.textureIndices.w);
-    bindTexture(material.emissiveTexture, emissiveTextureBit, packed.textureState.x);
+    bindTexture(material.baseColorTexture, descriptors.baseColor, baseColorTextureBit,
+                packed.textureIndices.x);
+    bindTexture(material.metallicRoughnessTexture, descriptors.metallicRoughness,
+                metallicRoughnessTextureBit, packed.textureIndices.y);
+    bindTexture(material.normalTexture, descriptors.normal, normalTextureBit,
+                packed.textureIndices.z);
+    bindTexture(material.occlusionTexture, descriptors.occlusion, occlusionTextureBit,
+                packed.textureIndices.w);
+    bindTexture(material.emissiveTexture, descriptors.emissive, emissiveTextureBit,
+                packed.textureState.x);
 
     switch (material.queue) {
     case scene::MaterialQueue::opaque:
@@ -126,25 +130,47 @@ MaterialRecord packMaterial(const scene::Material& material,
     return packed;
 }
 
+MaterialRecord packMaterial(const scene::Material& material,
+                            std::span<const std::uint32_t> textureDescriptorIndices) {
+    return packMaterial(material, MaterialTextureDescriptorTable{
+                                      .baseColor = textureDescriptorIndices,
+                                      .metallicRoughness = textureDescriptorIndices,
+                                      .normal = textureDescriptorIndices,
+                                      .occlusion = textureDescriptorIndices,
+                                      .emissive = textureDescriptorIndices,
+                                  });
+}
+
 std::vector<MaterialRecord> packMaterials(const scene::Scene& scene,
-                                          std::span<const std::uint32_t> textureDescriptorIndices) {
+                                          const MaterialTextureDescriptorTable& descriptors) {
     std::vector<MaterialRecord> packed;
     packed.reserve(scene.materials().size());
     for (const scene::Material& material : scene.materials()) {
-        packed.push_back(packMaterial(material, textureDescriptorIndices));
+        packed.push_back(packMaterial(material, descriptors));
     }
     return packed;
 }
 
+std::vector<MaterialRecord> packMaterials(const scene::Scene& scene,
+                                          std::span<const std::uint32_t> textureDescriptorIndices) {
+    return packMaterials(scene, MaterialTextureDescriptorTable{
+                                    .baseColor = textureDescriptorIndices,
+                                    .metallicRoughness = textureDescriptorIndices,
+                                    .normal = textureDescriptorIndices,
+                                    .occlusion = textureDescriptorIndices,
+                                    .emissive = textureDescriptorIndices,
+                                });
+}
+
 PackedScene packScene(const scene::Scene& scene,
-                      std::span<const std::uint32_t> textureDescriptorIndices) {
+                      const MaterialTextureDescriptorTable& descriptors) {
     const scene::ValidationReport validation = scene.validate();
     if (!validation.ok()) {
         throw std::runtime_error(validation.describe());
     }
 
     PackedScene packed;
-    packed.materials = packMaterials(scene, textureDescriptorIndices);
+    packed.materials = packMaterials(scene, descriptors);
     std::uint32_t defaultMaterialIndex = invalidTextureDescriptor;
     auto resolveMaterial = [&](scene::MaterialHandle material) {
         if (material.valid()) {
@@ -248,7 +274,14 @@ PackedScene packScene(const scene::Scene& scene,
     for (const scene::MeshInstance& meshInstance : evaluation.meshInstances) {
         const glm::mat4 world = meshInstance.worldTransform;
         const float determinant = glm::determinant(glm::mat3(world));
-        if (std::abs(determinant) <= 1.0e-10F) {
+        const std::array basis{glm::vec3(world[0]), glm::vec3(world[1]), glm::vec3(world[2])};
+        const std::array lengths{glm::length(basis[0]), glm::length(basis[1]),
+                                 glm::length(basis[2])};
+        const float basisVolume = lengths[0] * lengths[1] * lengths[2];
+        constexpr float relativeDeterminantTolerance = 1.0e-6F;
+        if (!std::isfinite(determinant) || !std::isfinite(basisVolume) ||
+            basisVolume <= std::numeric_limits<float>::min() ||
+            std::abs(determinant) <= relativeDeterminantTolerance * basisVolume) {
             throw std::runtime_error("GPU scene packing rejects a singular mesh transform");
         }
         if (packed.transforms.size() >= std::numeric_limits<std::uint32_t>::max()) {
@@ -266,9 +299,6 @@ PackedScene packScene(const scene::Scene& scene,
             const PrimitiveRecord& residentPrimitive = packed.primitives[residentPrimitiveIndex];
             const glm::vec3 localCenter = glm::vec3(residentPrimitive.centerRadius);
             const glm::vec3 worldCenter = glm::vec3(world * glm::vec4(localCenter, 1.0F));
-            const std::array basis{glm::vec3(world[0]), glm::vec3(world[1]), glm::vec3(world[2])};
-            const std::array lengths{glm::length(basis[0]), glm::length(basis[1]),
-                                     glm::length(basis[2])};
             constexpr float orthogonalityTolerance = 1.0e-5F;
             const bool orthogonal = std::abs(glm::dot(basis[0], basis[1])) <=
                                         orthogonalityTolerance * lengths[0] * lengths[1] &&
@@ -310,10 +340,20 @@ PackedScene packScene(const scene::Scene& scene,
     return packed;
 }
 
+PackedScene packScene(const scene::Scene& scene,
+                      std::span<const std::uint32_t> textureDescriptorIndices) {
+    return packScene(scene, MaterialTextureDescriptorTable{
+                                .baseColor = textureDescriptorIndices,
+                                .metallicRoughness = textureDescriptorIndices,
+                                .normal = textureDescriptorIndices,
+                                .occlusion = textureDescriptorIndices,
+                                .emissive = textureDescriptorIndices,
+                            });
+}
+
 EmissiveTriangleDistribution buildEmissiveTriangleDistribution(
     std::span<const VertexRecord> vertices, std::span<const std::uint32_t> indices,
-    std::span<const PrimitiveRecord> primitives,
-    std::span<const PrimitiveLodRange> primitiveLods,
+    std::span<const PrimitiveRecord> primitives, std::span<const PrimitiveLodRange> primitiveLods,
     std::span<const LodSourceRecord> lodSources, std::span<InstanceRecord> instances,
     std::span<const MaterialRecord> materials, std::span<const TransformRecord> transforms,
     RenderLayerMask viewMask) {
@@ -341,8 +381,8 @@ EmissiveTriangleDistribution buildEmissiveTriangleDistribution(
                 "Emissive-triangle instance references invalid scene residency");
         }
 
-        const glm::vec3 emission = glm::max(
-            glm::vec3(materials[materialIndex].emissiveAlphaCutoff), glm::vec3(0.0F));
+        const glm::vec3 emission =
+            glm::max(glm::vec3(materials[materialIndex].emissiveAlphaCutoff), glm::vec3(0.0F));
         if (!std::isfinite(emission.x) || !std::isfinite(emission.y) ||
             !std::isfinite(emission.z)) {
             throw std::runtime_error("Emissive-triangle material has nonfinite radiance");
@@ -373,12 +413,11 @@ EmissiveTriangleDistribution buildEmissiveTriangleDistribution(
 
         const std::uint32_t triangleCount = primitive.indexCount / 3U;
         if (distribution.triangles.size() > std::numeric_limits<std::uint32_t>::max() ||
-            triangleCount > std::numeric_limits<std::uint32_t>::max() -
-                                distribution.triangles.size()) {
+            triangleCount >
+                std::numeric_limits<std::uint32_t>::max() - distribution.triangles.size()) {
             throw std::length_error("Emissive-triangle light index space is exhausted");
         }
-        instance.visibilityLayer.z =
-            static_cast<std::uint32_t>(distribution.triangles.size());
+        instance.visibilityLayer.z = static_cast<std::uint32_t>(distribution.triangles.size());
         instance.visibilityLayer.w = triangleCount;
         const glm::mat4& world = transforms[transformIndex].world;
         for (std::uint32_t triangleIndex = 0U; triangleIndex < triangleCount; ++triangleIndex) {
@@ -394,11 +433,11 @@ EmissiveTriangleDistribution buildEmissiveTriangleDistribution(
                         "Emissive triangle references a vertex outside residency");
                 }
                 positions[corner] = glm::vec3(
-                    world * glm::vec4(vertices[static_cast<std::size_t>(vertexIndex)].position,
-                                      1.0F));
+                    world *
+                    glm::vec4(vertices[static_cast<std::size_t>(vertexIndex)].position, 1.0F));
             }
-            const float area = 0.5F * glm::length(
-                glm::cross(positions[1] - positions[0], positions[2] - positions[0]));
+            const float area = 0.5F * glm::length(glm::cross(positions[1] - positions[0],
+                                                             positions[2] - positions[0]));
             if (!std::isfinite(area)) {
                 throw std::runtime_error("Emissive triangle has nonfinite world area");
             }

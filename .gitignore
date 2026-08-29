@@ -3,3 +3,7 @@
 /.cache/
 /captures/current/
 compile_commands.json
+/thirdparty/Streamline/
+/diagnostic_*.png
+/reference/hdri/
+/windows_vulkan_hardware_capability.json

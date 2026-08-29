@@ -36,6 +36,21 @@ layout(set = 0, binding = 13, rgba16f) uniform image2D surfaceAovImage;
 layout(set = 0, binding = 14, rgba16f) uniform image2D normalAovImage;
 layout(set = 0, binding = 15, rgba32f) uniform image2D motionDepthAovImage;
 layout(set = 0, binding = 16, r32f) uniform image2D depthAovImage;
+layout(set = 0, binding = 17, rgba16f) uniform image2D nrdDiffuseInputImage;
+layout(set = 0, binding = 18, rgba16f) uniform image2D nrdSpecularInputImage;
+layout(set = 0, binding = 19, rgba16f) uniform image2D nrdMaterialImage;
+layout(set = 0, binding = 20, rgba16f) uniform image2D rrDiffuseAlbedoImage;
+layout(set = 0, binding = 21, rgba16f) uniform image2D rrSpecularAlbedoImage;
+layout(set = 0, binding = 22, rgba16f) uniform image2D rrNormalRoughnessImage;
+layout(set = 0, binding = 23, r32f) uniform image2D rrSpecularHitDistanceImage;
+
+layout(push_constant) uniform PathTracePushConstants
+{
+    uint sampleIndex;
+    uint sampleInFrame;
+    uint samplesThisFrame;
+    uint fixedPrimarySample;
+} controls;
 
 void main()
 {
@@ -47,6 +62,9 @@ void main()
             gl_WorldRayDirectionEXT, frameData.environmentParameters.x,
             frameData.environmentParameters.y > 0.5);
         radiance *= pathPowerHeuristic(payload.bouncePdf, environmentPdf);
+    }
+    if (payload.depth == 1u) {
+        payload.firstLobeHitDistance = 0.0;
     }
     if (payload.depth == 0u) {
         ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
@@ -65,7 +83,7 @@ void main()
             previousDepth = 1.0;
         }
         vec3 directRadiance = radiance;
-        uint sampleIndex = frameData.temporalFlags.x;
+        uint sampleIndex = controls.sampleIndex;
         if (sampleIndex > 0u) {
             float count = float(sampleIndex);
             directRadiance =
@@ -74,10 +92,19 @@ void main()
         }
         imageStore(directRadianceImage, pixel,
                    vec4(max(directRadiance, vec3(0.0)), 1.0));
-        imageStore(surfaceAovImage, pixel, vec4(0.0));
-        imageStore(normalAovImage, pixel, vec4(0.0));
-        imageStore(motionDepthAovImage, pixel, vec4(motion, previousDepth, 0.0));
-        imageStore(depthAovImage, pixel, vec4(1.0));
+        imageStore(nrdDiffuseInputImage, pixel, vec4(0.0));
+        imageStore(nrdSpecularInputImage, pixel, vec4(0.0));
+        imageStore(nrdMaterialImage, pixel, vec4(0.0));
+        imageStore(rrDiffuseAlbedoImage, pixel, vec4(0.0));
+        imageStore(rrSpecularAlbedoImage, pixel, vec4(0.0));
+        imageStore(rrNormalRoughnessImage, pixel, vec4(0.0, 0.0, 1.0, 1.0));
+        imageStore(rrSpecularHitDistanceImage, pixel, vec4(0.0));
+        if (controls.sampleInFrame + 1u == controls.samplesThisFrame) {
+            imageStore(surfaceAovImage, pixel, vec4(0.0));
+            imageStore(normalAovImage, pixel, vec4(0.0));
+            imageStore(motionDepthAovImage, pixel, vec4(motion, previousDepth, 0.0));
+            imageStore(depthAovImage, pixel, vec4(1.0));
+        }
     }
     payload.radiance = radiance;
 }

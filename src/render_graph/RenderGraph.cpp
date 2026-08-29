@@ -712,6 +712,10 @@ VkImage RenderGraph::image(ImageHandle handle) const { return impl_->checked(han
 
 VkImageView RenderGraph::imageView(ImageHandle handle) const { return impl_->checked(handle).view; }
 
+const vulkan::Image* RenderGraph::ownedImage(ImageHandle handle) const {
+    return impl_->checked(handle).ownedImage.get();
+}
+
 VkBuffer RenderGraph::buffer(BufferHandle handle) const { return impl_->checked(handle).buffer; }
 
 ResourceLifetime RenderGraph::lifetime(ImageHandle handle) const {

@@ -28,6 +28,7 @@ struct ShaderReflection {
 class ShaderModule final {
   public:
     ShaderModule(const Device& device, const std::filesystem::path& path);
+    ShaderModule(const Device& device, std::span<const std::uint32_t> words);
     ~ShaderModule();
 
     ShaderModule(const ShaderModule&) = delete;
@@ -37,6 +38,8 @@ class ShaderModule final {
     [[nodiscard]] const ShaderReflection& reflection() const { return reflection_; }
 
   private:
+    void create(std::span<const std::uint32_t> words);
+
     const Device& device_;
     VkShaderModule module_ = VK_NULL_HANDLE;
     ShaderReflection reflection_{};

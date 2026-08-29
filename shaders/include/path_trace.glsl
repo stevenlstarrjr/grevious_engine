@@ -12,6 +12,7 @@ struct RadiancePayload
     float coneWidth;
     float coneSpread;
     float bouncePdf;
+    float firstLobeHitDistance;
 };
 
 float pathRussianRouletteSurvivalProbability(vec3 throughput)

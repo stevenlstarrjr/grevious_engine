@@ -101,11 +101,26 @@ layout(set = 0, binding = 13, rgba16f) uniform image2D surfaceAovImage;
 layout(set = 0, binding = 14, rgba16f) uniform image2D normalAovImage;
 layout(set = 0, binding = 15, rgba32f) uniform image2D motionDepthAovImage;
 layout(set = 0, binding = 16, r32f) uniform image2D depthAovImage;
+layout(set = 0, binding = 17, rgba16f) uniform image2D nrdDiffuseInputImage;
+layout(set = 0, binding = 18, rgba16f) uniform image2D nrdSpecularInputImage;
+layout(set = 0, binding = 19, rgba16f) uniform image2D nrdMaterialImage;
+layout(set = 0, binding = 20, rgba16f) uniform image2D rrDiffuseAlbedoImage;
+layout(set = 0, binding = 21, rgba16f) uniform image2D rrSpecularAlbedoImage;
+layout(set = 0, binding = 22, rgba16f) uniform image2D rrNormalRoughnessImage;
+layout(set = 0, binding = 23, r32f) uniform image2D rrSpecularHitDistanceImage;
 layout(set = 1, binding = 0) uniform sampler2D materialTextures[];
 
 layout(location = 0) rayPayloadInEXT RadiancePayload payload;
 layout(location = 1) rayPayloadEXT float shadowVisibility;
 hitAttributeEXT vec2 hitBarycentrics;
+
+layout(push_constant) uniform PathTracePushConstants
+{
+    uint sampleIndex;
+    uint sampleInFrame;
+    uint samplesThisFrame;
+    uint fixedPrimarySample;
+} controls;
 
 const uint BASE_COLOR_TEXTURE_BIT = 1u << 0u;
 const uint METALLIC_ROUGHNESS_TEXTURE_BIT = 1u << 1u;
@@ -356,7 +371,7 @@ void writePathFirstHitAovs(vec3 objectPosition, TransformRecord transform,
 void writePathDirectRadianceAov(vec3 directRadiance)
 {
     ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
-    uint sampleIndex = frameData.temporalFlags.x;
+    uint sampleIndex = controls.sampleIndex;
     if (sampleIndex > 0u) {
         float count = float(sampleIndex);
         directRadiance =
@@ -370,6 +385,9 @@ void writePathDirectRadianceAov(vec3 directRadiance)
 void main()
 {
     uint currentDepth = payload.depth;
+    if (currentDepth == 1u) {
+        payload.firstLobeHitDistance = max(gl_HitTEXT, 0.0);
+    }
     InstanceRecord instance = instances[gl_InstanceCustomIndexEXT];
     MaterialRecord material = materials[instance.meshMaterial.y];
     uvec4 geometry = rayGeometryRanges[instance.meshMaterial.x];
@@ -462,17 +480,7 @@ void main()
         normal = dot(mappedNormal, geometricNormal) > 0.0 ? mappedNormal : geometricNormal;
     }
 
-    float ambientOcclusion = 1.0;
-    if ((textureMask & OCCLUSION_TEXTURE_BIT) != 0u) {
-        float sampledOcclusion = samplePathMaterialTexture(
-            material.textureIndices.w, OCCLUSION_TEXTURE_BIT, material,
-            surface, weights, rayConeWidth).r;
-        ambientOcclusion = mix(
-            1.0, sampledOcclusion,
-            clamp(material.metallicRoughnessOcclusionNormal.z, 0.0, 1.0));
-    }
-
-    if (currentDepth == 0u) {
+    if (currentDepth == 0u && controls.sampleInFrame + 1u == controls.samplesThisFrame) {
         writePathFirstHitAovs(objectPosition, transform, baseColor, roughness,
                               geometricNormal, normal);
     }
@@ -490,27 +498,36 @@ void main()
             emissiveMisWeight = pathPowerHeuristic(payload.bouncePdf, lightPdf);
         }
     }
-    vec3 directRadiance = emissive * emissiveMisWeight;
-    vec3 indirectRadiance = vec3(0.0);
+    vec3 directDiffuseRadiance = emissive * emissiveMisWeight;
+    vec3 directSpecularRadiance = vec3(0.0);
+    vec3 indirectDiffuseRadiance = vec3(0.0);
+    vec3 indirectSpecularRadiance = vec3(0.0);
     float rayBias = sceneScale * 5.0e-4;
     uint state = payload.seed;
     uint maxBounces = max(1u, uint(frameData.environmentParameters.z + 0.5));
     uint russianRouletteStartDepth =
         max(1u, uint(frameData.environmentParameters.w + 0.5));
     bool canContinue = currentDepth < maxBounces;
+    uint sampledContinuationLobe = 2u;
 
     vec3 lightDirection = normalize(-frameData.directionalDirectionIntensity.xyz);
     if (frameData.shadowCascadeSplits.w > 0.0 && dot(normal, lightDirection) > 0.0) {
         shadowVisibility = 0.0;
         traceRayEXT(sceneTlas,
-                    gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT |
-                        gl_RayFlagsSkipClosestHitShaderEXT,
+                    gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                     0xff, 1, 2, 1, position + geometricNormal * rayBias,
                     rayBias, lightDirection, 1.0e27, 1);
         vec3 incident = frameData.directionalColor.rgb *
                         max(frameData.directionalDirectionIntensity.w, 0.0);
-        directRadiance += shadowVisibility * evaluateDirectLight(
-            baseColor, metallic, roughness, normal, viewDirection, lightDirection, incident);
+        vec3 diffuseBrdf;
+        vec3 specularBrdf;
+        evaluateMetallicRoughnessBrdfLobes(
+            baseColor, metallic, roughness, normal, viewDirection, lightDirection,
+            diffuseBrdf, specularBrdf);
+        float noL = max(dot(normal, lightDirection), 0.0);
+        vec3 visibleIncident = shadowVisibility * max(incident, vec3(0.0)) * noL;
+        directDiffuseRadiance += visibleIncident * diffuseBrdf;
+        directSpecularRadiance += visibleIncident * specularBrdf;
     }
 
     PathEmissiveSample emissiveSample = samplePathEmissiveTriangle(
@@ -522,8 +539,7 @@ void main()
         any(greaterThan(emissiveSample.radiance, vec3(0.0)))) {
         shadowVisibility = 0.0;
         traceRayEXT(sceneTlas,
-                    gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT |
-                        gl_RayFlagsSkipClosestHitShaderEXT,
+                    gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                     0xff, 1, 2, 1, position + geometricNormal * rayBias,
                     rayBias, emissiveSample.direction,
                     emissiveSample.distance - rayBias, 1);
@@ -534,11 +550,15 @@ void main()
                 emissiveSample.direction);
             misWeight = pathPowerHeuristic(emissiveSample.pdf, bsdfPdf);
         }
-        vec3 emissiveBrdf = evaluateMetallicRoughnessBrdf(
+        vec3 emissiveDiffuseBrdf;
+        vec3 emissiveSpecularBrdf;
+        evaluateMetallicRoughnessBrdfLobes(
             baseColor, metallic, roughness, normal, viewDirection,
-            emissiveSample.direction);
-        directRadiance += shadowVisibility * emissiveSample.radiance * emissiveBrdf *
-                          (emissiveNoL * misWeight / emissiveSample.pdf);
+            emissiveSample.direction, emissiveDiffuseBrdf, emissiveSpecularBrdf);
+        vec3 emissiveScale = shadowVisibility * emissiveSample.radiance *
+                             (emissiveNoL * misWeight / emissiveSample.pdf);
+        directDiffuseRadiance += emissiveScale * emissiveDiffuseBrdf;
+        directSpecularRadiance += emissiveScale * emissiveSpecularBrdf;
     }
 
     PathEnvironmentSample environmentSample = samplePathEnvironment(
@@ -549,8 +569,7 @@ void main()
         dot(geometricNormal, environmentSample.direction) > 0.0) {
         shadowVisibility = 0.0;
         traceRayEXT(sceneTlas,
-                    gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT |
-                        gl_RayFlagsSkipClosestHitShaderEXT,
+                    gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                     0xff, 1, 2, 1, position + geometricNormal * rayBias,
                     rayBias, environmentSample.direction, 1.0e27, 1);
         float misWeight = 1.0;
@@ -560,12 +579,15 @@ void main()
                 environmentSample.direction);
             misWeight = pathPowerHeuristic(environmentSample.pdf, bsdfPdf);
         }
-        vec3 environmentBrdf = evaluateMetallicRoughnessBrdf(
+        vec3 environmentDiffuseBrdf;
+        vec3 environmentSpecularBrdf;
+        evaluateMetallicRoughnessBrdfLobes(
             baseColor, metallic, roughness, normal, viewDirection,
-            environmentSample.direction);
-        directRadiance += ambientOcclusion * shadowVisibility * environmentSample.radiance *
-                          environmentBrdf *
-                          (environmentNoL * misWeight / environmentSample.pdf);
+            environmentSample.direction, environmentDiffuseBrdf, environmentSpecularBrdf);
+        vec3 environmentScale = shadowVisibility * environmentSample.radiance *
+                                (environmentNoL * misWeight / environmentSample.pdf);
+        directDiffuseRadiance += environmentScale * environmentDiffuseBrdf;
+        directSpecularRadiance += environmentScale * environmentSpecularBrdf;
     }
     payload.seed = state;
 
@@ -574,8 +596,12 @@ void main()
             baseColor, metallic, roughness, normal, viewDirection, state);
         payload.seed = state;
         if (bounce.pdf > 0.0 && dot(bounce.direction, geometricNormal) > 0.0) {
+            sampledContinuationLobe = bounce.sampledSpecular;
             uint nextDepth = currentDepth + 1u;
-            vec3 continuationThroughput = ambientOcclusion * bounce.throughput;
+            // Ray visibility already accounts for occlusion. Multiplying a glTF
+            // baked AO approximation here would attenuate real light again at
+            // every bounce and bias the transport progressively darker.
+            vec3 continuationThroughput = bounce.throughput;
             vec3 nextPathThroughput = payload.pathThroughput * continuationThroughput;
             float survivalProbability = 1.0;
             bool survived = true;
@@ -595,23 +621,82 @@ void main()
                 payload.coneWidth = rayConeWidth;
                 payload.coneSpread = max(payload.coneSpread, bounce.coneSpread);
                 payload.bouncePdf = bounce.pdf;
-                traceRayEXT(sceneTlas, gl_RayFlagsOpaqueEXT, 0xff, 0, 2, 0,
+                traceRayEXT(sceneTlas, gl_RayFlagsNoneEXT, 0xff, 0, 2, 0,
                             position + geometricNormal * rayBias, rayBias,
                             bounce.direction, 1.0e27, 0);
                 if (pathTraceFinite(payload.radiance)) {
-                    indirectRadiance += continuationThroughput * payload.radiance;
+                    vec3 returnedRadiance = continuationThroughput * payload.radiance;
+                    if (bounce.sampledSpecular != 0u) {
+                        indirectSpecularRadiance += returnedRadiance;
+                    } else {
+                        indirectDiffuseRadiance += returnedRadiance;
+                    }
                 }
             }
         }
     }
-    directRadiance = pathTraceFinite(directRadiance)
-                         ? max(directRadiance, vec3(0.0))
-                         : vec3(0.0);
-    indirectRadiance = pathTraceFinite(indirectRadiance)
-                           ? max(indirectRadiance, vec3(0.0))
-                           : vec3(0.0);
+    // Use one energy regime during motion and stationary accumulation. The old
+    // 0.2 -> 12.0 sample-index switch made sunlit shadow boundaries pulse as
+    // the camera changed state. This stable realtime bound still rejects rare
+    // low-PDF HDR fireflies without changing the lighting estimator over time.
+    const float maximumSurfaceContributionLuminance = 4.0;
+    vec3 directRadiance = directDiffuseRadiance + directSpecularRadiance;
+    vec3 clampedDirectRadiance = clampPathRadianceContribution(
+        directRadiance, maximumSurfaceContributionLuminance);
+    float directLuminance = pathTraceLuminance(max(directRadiance, vec3(0.0)));
+    float directScale = directLuminance > 1.0e-7
+        ? pathTraceLuminance(clampedDirectRadiance) / directLuminance
+        : 0.0;
+    directDiffuseRadiance *= directScale;
+    directSpecularRadiance *= directScale;
+    directRadiance = clampedDirectRadiance;
+
+    vec3 indirectRadiance = indirectDiffuseRadiance + indirectSpecularRadiance;
+    vec3 clampedIndirectRadiance = clampPathRadianceContribution(
+        indirectRadiance, maximumSurfaceContributionLuminance);
+    float indirectLuminance = pathTraceLuminance(max(indirectRadiance, vec3(0.0)));
+    float indirectScale = indirectLuminance > 1.0e-7
+        ? pathTraceLuminance(clampedIndirectRadiance) / indirectLuminance
+        : 0.0;
+    indirectDiffuseRadiance *= indirectScale;
+    indirectSpecularRadiance *= indirectScale;
+    indirectRadiance = clampedIndirectRadiance;
     if (currentDepth == 0u) {
         writePathDirectRadianceAov(directRadiance);
+        vec3 diffuseFactor = max(baseColor * (1.0 - metallic), vec3(0.04));
+        vec3 specularFactor = max(mix(vec3(0.04), baseColor, metallic), vec3(0.04));
+        vec3 diffuseSignal = clamp(
+            (directDiffuseRadiance + indirectDiffuseRadiance) / diffuseFactor,
+            vec3(0.0), vec3(65504.0));
+        vec3 specularSignal = clamp(
+            (directSpecularRadiance + indirectSpecularRadiance) / specularFactor,
+            vec3(0.0), vec3(65504.0));
+        float lobeHitDistance = clamp(payload.firstLobeHitDistance, 0.0, 65504.0);
+        float diffuseHitDistance = sampledContinuationLobe == 0u ? lobeHitDistance : 0.0;
+        float specularHitDistance = sampledContinuationLobe == 1u ? lobeHitDistance : 0.0;
+        ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+        if (controls.sampleInFrame > 0u) {
+            float count = float(controls.sampleInFrame);
+            vec4 previousDiffuse = imageLoad(nrdDiffuseInputImage, pixel);
+            vec4 previousSpecular = imageLoad(nrdSpecularInputImage, pixel);
+            diffuseSignal = (previousDiffuse.rgb * count + diffuseSignal) / (count + 1.0);
+            specularSignal = (previousSpecular.rgb * count + specularSignal) / (count + 1.0);
+            diffuseHitDistance = max(previousDiffuse.a, diffuseHitDistance);
+            specularHitDistance = max(previousSpecular.a, specularHitDistance);
+        }
+        imageStore(nrdDiffuseInputImage, pixel,
+                   vec4(diffuseSignal, diffuseHitDistance));
+        imageStore(nrdSpecularInputImage, pixel,
+                   vec4(specularSignal, specularHitDistance));
+        imageStore(nrdMaterialImage, pixel, vec4(baseColor, metallic));
+        imageStore(rrDiffuseAlbedoImage, pixel,
+                   vec4(clamp(baseColor * (1.0 - metallic), vec3(0.0), vec3(1.0)), 1.0));
+        imageStore(rrSpecularAlbedoImage, pixel,
+                   vec4(clamp(mix(vec3(0.04), baseColor, metallic),
+                              vec3(0.0), vec3(1.0)), 1.0));
+        imageStore(rrNormalRoughnessImage, pixel,
+                   vec4(normalize(normal), roughness));
+        imageStore(rrSpecularHitDistanceImage, pixel, vec4(specularHitDistance));
     }
     payload.radiance = directRadiance + indirectRadiance;
 }

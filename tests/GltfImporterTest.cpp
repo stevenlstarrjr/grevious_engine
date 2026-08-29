@@ -83,8 +83,8 @@ void testMetallicRoughnessMaterialGrid() {
 }
 
 void testEmissiveStrength() {
-    const rs::Scene scene = ra::importGltf(
-        sample("Models/CompareEmissiveStrength/glTF/CompareEmissiveStrength.gltf"));
+    const rs::Scene scene =
+        ra::importGltf(sample("Models/CompareEmissiveStrength/glTF/CompareEmissiveStrength.gltf"));
     require(scene.validate().ok(), scene.validate().describe());
     require(scene.materials().size() == 2,
             "Emissive-strength comparison did not import both materials");
@@ -126,6 +126,15 @@ void testPolicyFailuresAreActionable() {
                             std::string_view::npos;
     }
     require(animationRejected, "Unsupported animation was not explicitly rejected");
+
+    ra::GltfImportOptions staticPose;
+    staticPose.allowAnimationStaticPose = true;
+    const rs::Scene animatedInitialPose =
+        ra::importGltf(sample("Models/BoxAnimated/glTF/BoxAnimated.gltf"), staticPose);
+    require(animatedInitialPose.validate().ok(),
+            "Explicit animation static-pose import did not produce a valid scene");
+    require(!rs::evaluate(animatedInitialPose).meshInstances.empty(),
+            "Explicit animation static-pose import lost the animated mesh instance");
 
     ra::GltfImportOptions invalidScene;
     invalidScene.sceneIndex = 99;

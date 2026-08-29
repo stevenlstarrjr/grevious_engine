@@ -14,6 +14,7 @@
 namespace renderer::vulkan {
 class Device;
 class MemoryAllocator;
+class Image;
 struct BufferCreateInfo;
 struct ImageCreateInfo;
 struct ImageViewCreateInfo;
@@ -117,6 +118,7 @@ class RenderGraph final {
 
     [[nodiscard]] VkImage image(ImageHandle handle) const;
     [[nodiscard]] VkImageView imageView(ImageHandle handle) const;
+    [[nodiscard]] const vulkan::Image* ownedImage(ImageHandle handle) const;
     [[nodiscard]] VkBuffer buffer(BufferHandle handle) const;
     [[nodiscard]] ResourceLifetime lifetime(ImageHandle handle) const;
     [[nodiscard]] ResourceLifetime lifetime(BufferHandle handle) const;

@@ -2,16 +2,39 @@ cmake_minimum_required(VERSION 3.25)
 
 project(GenesisRender VERSION 0.1.0 LANGUAGES C CXX)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "Genesis Render supports Linux only")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
+    message(FATAL_ERROR "Genesis Render supports Linux and Windows only")
 endif()
 
 option(RENDERER_VALIDATION_DEFAULT "Request Vulkan validation by default" ON)
+option(RENDERER_ENABLE_NRD "Build the NVIDIA Real-time Denoiser backend" ON)
+if(WIN32)
+    set(RENDERER_STREAMLINE_DEFAULT ON)
+else()
+    set(RENDERER_STREAMLINE_DEFAULT OFF)
+endif()
+option(RENDERER_ENABLE_STREAMLINE
+    "Build the NVIDIA Streamline DLSS integration"
+    ${RENDERER_STREAMLINE_DEFAULT})
+
+if(RENDERER_ENABLE_STREAMLINE AND NOT WIN32)
+    message(FATAL_ERROR "NVIDIA Streamline is currently supported by Genesis on Windows only")
+endif()
+if(RENDERER_ENABLE_STREAMLINE)
+    set(RENDERER_STREAMLINE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/Streamline")
+    if(NOT EXISTS "${RENDERER_STREAMLINE_ROOT}/include/sl.h" OR
+       NOT EXISTS "${RENDERER_STREAMLINE_ROOT}/bin/x64/sl.interposer.dll")
+        message(FATAL_ERROR
+            "Missing NVIDIA Streamline 2.12.0; run tools/setup_streamline.ps1")
+    endif()
+endif()
 
 find_package(Vulkan 1.3 REQUIRED)
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(RENDERER_LIBDECOR REQUIRED libdecor-0)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(RENDERER_LIBDECOR REQUIRED libdecor-0)
+endif()
 
 foreach(required_submodule SDL volk VMA glm fastgltf simdjson)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/${required_submodule}/CMakeLists.txt")
@@ -55,12 +78,43 @@ set(SDL_VULKAN ON CACHE BOOL "" FORCE)
 set(SDL_KMSDRM OFF CACHE BOOL "" FORCE)
 set(SDL_LIBTHAI OFF CACHE BOOL "" FORCE)
 set(SDL_FRIBIDI OFF CACHE BOOL "" FORCE)
-set(SDL_WAYLAND_LIBDECOR ON CACHE BOOL "" FORCE)
-set(SDL_WAYLAND_LIBDECOR_SHARED ON CACHE BOOL "" FORCE)
-set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
 set(SDL_X11 OFF CACHE BOOL "" FORCE)
 set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
 set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(SDL_WAYLAND_LIBDECOR ON CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND_LIBDECOR_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
+elseif(WIN32)
+    set(SDL_WAYLAND_LIBDECOR OFF CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND_LIBDECOR_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+    set(SDL_DIRECTX ON CACHE BOOL "" FORCE)
+endif()
+
+if(RENDERER_ENABLE_NRD)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/NRD/CMakeLists.txt")
+        message(FATAL_ERROR
+            "Missing thirdparty/NRD; run git submodule update --init --recursive")
+    endif()
+
+    # Genesis is Vulkan-only. Embed just the SPIR-V NRD shaders and keep the
+    # first Turing-compatible integration independent of NRI and quad
+    # intrinsics. Quad intrinsics can be enabled later together with the
+    # VK_KHR_compute_shader_derivatives device feature.
+    set(NRD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
+    set(NRD_NRI OFF CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_SPIRV_SHADERS ON CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_DXIL_SHADERS OFF CACHE BOOL "" FORCE)
+    set(NRD_EMBEDS_DXBC_SHADERS OFF CACHE BOOL "" FORCE)
+    set(NRD_SUPPORTS_QUAD_INTRINSICS OFF CACHE BOOL "" FORCE)
+    set(NRD_NORMAL_ENCODING "2" CACHE STRING "" FORCE)
+    set(NRD_ROUGHNESS_ENCODING "1" CACHE STRING "" FORCE)
+    find_program(DXC_SPIRV_PATH dxc
+        HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/Bin32"
+        REQUIRED)
+    add_subdirectory(thirdparty/NRD EXCLUDE_FROM_ALL SYSTEM)
+endif()
 add_subdirectory(thirdparty/SDL EXCLUDE_FROM_ALL SYSTEM)
 
 set(VOLK_INSTALL OFF CACHE BOOL "" FORCE)
@@ -115,6 +169,28 @@ endif()
 add_library(renderer_mikktspace STATIC thirdparty/MikkTSpace/mikktspace.c)
 target_include_directories(renderer_mikktspace PUBLIC thirdparty/MikkTSpace)
 set_target_properties(renderer_mikktspace PROPERTIES C_EXTENSIONS OFF)
+
+if(RENDERER_ENABLE_NRD)
+    add_library(renderer_nrd STATIC
+        src/nvidia/NrdContext.cpp
+        src/nvidia/NrdVulkan.cpp
+        src/nvidia/NrdVulkanDenoiser.cpp
+    )
+    target_compile_features(renderer_nrd PUBLIC cxx_std_20)
+    target_include_directories(renderer_nrd PUBLIC include)
+    target_link_libraries(renderer_nrd PUBLIC NRD volk::volk)
+    set_target_properties(renderer_nrd PROPERTIES CXX_EXTENSIONS OFF)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(renderer_nrd PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Wnon-virtual-dtor
+        )
+    endif()
+endif()
 
 add_library(renderer_gltf STATIC
     src/assets/GltfImporter.cpp
@@ -278,6 +354,7 @@ add_library(renderer_ray_tracing STATIC
 )
 target_compile_features(renderer_ray_tracing PUBLIC cxx_std_20)
 target_include_directories(renderer_ray_tracing PUBLIC include)
+target_link_libraries(renderer_ray_tracing PUBLIC renderer_gpu_scene)
 set_target_properties(renderer_ray_tracing PROPERTIES CXX_EXTENSIONS OFF)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(renderer_ray_tracing PRIVATE
@@ -320,6 +397,7 @@ set(RENDERER_SHADER_SOURCES
     shaders/bloom_blur_v.frag
     shaders/taa.frag
     shaders/upscale_spatial.frag
+    shaders/upscale_reactive.frag
     shaders/upscale_temporal.frag
     shaders/tonemap.vert
     shaders/tonemap.frag
@@ -327,9 +405,12 @@ set(RENDERER_SHADER_SOURCES
     shaders/path_trace.rmiss
     shaders/path_trace_shadow.rmiss
     shaders/path_trace.rchit
+    shaders/path_trace.rahit
     shaders/path_history.comp
     shaders/path_reconstruct.comp
     shaders/path_denoise.comp
+    shaders/path_nrd_prepare.comp
+    shaders/path_nrd_resolve.comp
 )
 set(RENDERER_SHADER_HEADERS
     shaders/include/pbr.glsl
@@ -402,10 +483,16 @@ add_executable(genesis_render
     src/render_graph/RenderGraph.cpp
     src/renderer/Renderer.cpp
 )
+if(RENDERER_ENABLE_STREAMLINE)
+    target_sources(genesis_render PRIVATE src/nvidia/StreamlineRuntime.cpp)
+endif()
 add_dependencies(genesis_render renderer_shaders)
 
 target_compile_features(genesis_render PRIVATE cxx_std_20)
 target_include_directories(genesis_render PRIVATE include)
+if(RENDERER_ENABLE_STREAMLINE)
+    target_include_directories(genesis_render PRIVATE "${RENDERER_STREAMLINE_ROOT}/include")
+endif()
 target_link_libraries(genesis_render PRIVATE
     SDL3::SDL3-static
     renderer_gltf
@@ -420,10 +507,38 @@ target_link_libraries(genesis_render PRIVATE
     volk::volk
     glm::glm
 )
+if(RENDERER_ENABLE_NRD)
+    target_link_libraries(genesis_render PRIVATE renderer_nrd)
+    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_NRD=1)
+else()
+    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_NRD=0)
+endif()
+if(RENDERER_ENABLE_STREAMLINE)
+    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_STREAMLINE=1)
+    set(RENDERER_STREAMLINE_RUNTIME_FILES
+        sl.interposer.dll
+        sl.common.dll
+        sl.dlss.dll
+        sl.dlss_d.dll
+        nvngx_dlss.dll
+        nvngx_dlssd.dll
+        nvngx_dlss.license.txt
+    )
+    foreach(streamline_runtime_file IN LISTS RENDERER_STREAMLINE_RUNTIME_FILES)
+        add_custom_command(TARGET genesis_render POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${RENDERER_STREAMLINE_ROOT}/bin/x64/${streamline_runtime_file}"
+                "$<TARGET_FILE_DIR:genesis_render>/${streamline_runtime_file}"
+            VERBATIM
+        )
+    endforeach()
+else()
+    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_STREAMLINE=0)
+endif()
 target_compile_definitions(genesis_render PRIVATE
     RENDERER_SHADER_DIR="${RENDERER_SHADER_OUTPUT_DIR}"
-    RENDERER_PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/cache/pipeline.bin"
-    RENDERER_BUILD_CONFIGURATION="${CMAKE_BUILD_TYPE}"
+    RENDERER_PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/cache/$<CONFIG>/pipeline.bin"
+    RENDERER_BUILD_CONFIGURATION="$<CONFIG>"
 )
 
 if(RENDERER_VALIDATION_DEFAULT)
@@ -753,6 +868,40 @@ if(BUILD_TESTING)
         )
     endif()
     add_test(NAME ray_tracing_policy COMMAND ray_tracing_policy_test)
+
+    add_executable(hardware_policy_test tests/HardwarePolicyTest.cpp)
+    target_compile_features(hardware_policy_test PRIVATE cxx_std_20)
+    target_include_directories(hardware_policy_test PRIVATE include)
+    set_target_properties(hardware_policy_test PROPERTIES CXX_EXTENSIONS OFF)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(hardware_policy_test PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Wnon-virtual-dtor
+        )
+    endif()
+    add_test(NAME hardware_policy COMMAND hardware_policy_test)
+
+    if(RENDERER_ENABLE_NRD)
+        add_executable(nrd_context_test tests/NrdContextTest.cpp)
+        target_compile_features(nrd_context_test PRIVATE cxx_std_20)
+        target_link_libraries(nrd_context_test PRIVATE renderer_nrd)
+        set_target_properties(nrd_context_test PROPERTIES CXX_EXTENSIONS OFF)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(nrd_context_test PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Wconversion
+                -Wshadow
+                -Wnon-virtual-dtor
+            )
+        endif()
+        add_test(NAME nrd_context COMMAND nrd_context_test)
+    endif()
 
     add_executable(acceleration_structure_plan_test tests/AccelerationStructurePlanTest.cpp)
     target_compile_features(acceleration_structure_plan_test PRIVATE cxx_std_20)

@@ -29,11 +29,10 @@ void validateFrameInput(const FrameInput& input, InputRequirements requirements)
     requireInput(input.jitterAvailable, requirements.jitter, "camera jitter");
     requireInput(input.exposureAvailable, requirements.exposure, "exposure");
     requireInput(input.reactiveMaskAvailable, requirements.reactiveMask, "a reactive mask");
-    if (input.jitterAvailable &&
-        (!std::isfinite(input.currentJitterPixels.x) ||
-         !std::isfinite(input.currentJitterPixels.y) ||
-         !std::isfinite(input.previousJitterPixels.x) ||
-         !std::isfinite(input.previousJitterPixels.y))) {
+    if (input.jitterAvailable && (!std::isfinite(input.currentJitterPixels.x) ||
+                                  !std::isfinite(input.currentJitterPixels.y) ||
+                                  !std::isfinite(input.previousJitterPixels.x) ||
+                                  !std::isfinite(input.previousJitterPixels.y))) {
         throw std::invalid_argument("Upscaler camera jitter must be finite");
     }
     if (input.exposureAvailable &&
@@ -180,7 +179,7 @@ class TemporalUpscaler final : public IUpscaler {
             .reconstruction = ReconstructionType::temporal,
             .historyOwnership = HistoryOwnership::backend,
             .outputOwnership = OutputOwnership::renderer,
-            .reactiveMask = false,
+            .reactiveMask = true,
             .sharpening = false,
             .dynamicResolution = false,
             .minimumRenderScale = minimumSpatialRenderScale,
@@ -188,7 +187,16 @@ class TemporalUpscaler final : public IUpscaler {
         };
     }
     [[nodiscard]] InputConventions inputConventions() const override { return {}; }
-    [[nodiscard]] InputRequirements inputRequirements() const override { return {}; }
+    [[nodiscard]] InputRequirements inputRequirements() const override {
+        return {
+            .color = true,
+            .depth = true,
+            .motionVectors = true,
+            .jitter = true,
+            .exposure = true,
+            .reactiveMask = true,
+        };
+    }
 
     [[nodiscard]] Extent renderExtent(Extent outputExtent) const override {
         requireExtent(outputExtent, "Temporal upscaler output extent");
@@ -228,6 +236,84 @@ class TemporalUpscaler final : public IUpscaler {
     float renderScale_ = defaultSpatialRenderScale;
 };
 
+class DlssUpscaler final : public IUpscaler {
+  public:
+    DlssUpscaler(QualityMode qualityMode, float renderScale)
+        : qualityMode_(qualityMode), renderScale_(renderScale) {
+        if (!std::isfinite(renderScale_) || renderScale_ < minimumSpatialRenderScale ||
+            renderScale_ > maximumSpatialRenderScale) {
+            throw std::invalid_argument("DLSS render scale must be finite and in [0.5, 1.0]");
+        }
+        if (qualityMode_ == QualityMode::native) {
+            throw std::invalid_argument("DLSS requires a scaled quality mode");
+        }
+    }
+
+    [[nodiscard]] Backend backend() const override { return Backend::dlss; }
+    [[nodiscard]] std::string_view name() const override { return "dlss"; }
+    [[nodiscard]] QualityMode qualityMode() const override { return qualityMode_; }
+    [[nodiscard]] float renderScale() const override { return renderScale_; }
+    [[nodiscard]] BackendCapabilities capabilities() const override {
+        return {
+            .reconstruction = ReconstructionType::temporal,
+            .historyOwnership = HistoryOwnership::backend,
+            .outputOwnership = OutputOwnership::backend,
+            .reactiveMask = false,
+            .sharpening = false,
+            .dynamicResolution = false,
+            .minimumRenderScale = minimumSpatialRenderScale,
+            .maximumRenderScale = maximumSpatialRenderScale,
+        };
+    }
+    [[nodiscard]] InputConventions inputConventions() const override { return {}; }
+    [[nodiscard]] InputRequirements inputRequirements() const override {
+        return {
+            .color = true,
+            .depth = true,
+            .motionVectors = true,
+            .jitter = true,
+            .exposure = true,
+            .reactiveMask = false,
+        };
+    }
+
+    [[nodiscard]] Extent renderExtent(Extent outputExtent) const override {
+        requireExtent(outputExtent, "DLSS output extent");
+        const auto scaledDimension = [this](std::uint32_t dimension) {
+            return std::max(
+                1U, static_cast<std::uint32_t>(
+                        std::lround(static_cast<float>(dimension) * renderScale_)));
+        };
+        return {.width = scaledDimension(outputExtent.width),
+                .height = scaledDimension(outputExtent.height)};
+    }
+
+    [[nodiscard]] FramePlan prepareFrame(const FrameInput& input) const override {
+        const InputRequirements requirements = inputRequirements();
+        validateFrameInput(input, requirements);
+        if (input.renderExtent != renderExtent(input.outputExtent)) {
+            throw std::invalid_argument(
+                "DLSS render extent does not match its configured quality scale");
+        }
+        return {
+            .backend = Backend::dlss,
+            .qualityMode = qualityMode_,
+            .renderExtent = input.renderExtent,
+            .outputExtent = input.outputExtent,
+            .inputs = requirements,
+            .currentJitterPixels = input.currentJitterPixels,
+            .previousJitterPixels = input.previousJitterPixels,
+            .exposureScale = input.exposureScale,
+            .resetHistory = input.resetHistory,
+            .dispatchRequired = true,
+        };
+    }
+
+  private:
+    QualityMode qualityMode_ = QualityMode::quality;
+    float renderScale_ = defaultSpatialRenderScale;
+};
+
 } // namespace
 
 std::string_view backendName(Backend backend) {
@@ -238,6 +324,8 @@ std::string_view backendName(Backend backend) {
         return "spatial";
     case Backend::temporal:
         return "temporal";
+    case Backend::dlss:
+        return "dlss";
     }
     return "unknown";
 }
@@ -251,6 +339,9 @@ std::optional<Backend> parseBackend(std::string_view name) {
     }
     if (name == "temporal") {
         return Backend::temporal;
+    }
+    if (name == "dlss") {
+        return Backend::dlss;
     }
     return std::nullopt;
 }
@@ -406,6 +497,14 @@ std::unique_ptr<IUpscaler> createUpscaler(BackendConfiguration configuration) {
                                       ? configuration.customRenderScale
                                       : qualityModeRenderScale(configuration.qualityMode);
         return std::make_unique<TemporalUpscaler>(configuration.qualityMode, renderScale);
+    }
+    case Backend::dlss: {
+        if (configuration.qualityMode == QualityMode::native ||
+            configuration.qualityMode == QualityMode::custom) {
+            throw std::invalid_argument("DLSS requires quality, balanced, or performance mode");
+        }
+        const float renderScale = qualityModeRenderScale(configuration.qualityMode);
+        return std::make_unique<DlssUpscaler>(configuration.qualityMode, renderScale);
     }
     }
     throw std::invalid_argument("Unknown upscaling backend");

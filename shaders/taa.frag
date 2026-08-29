@@ -55,6 +55,11 @@ vec3 decodeNormal(vec3 packed)
                                  : vec3(0.0, 0.0, 1.0);
 }
 
+float luminance(vec3 color)
+{
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
 void main()
 {
     ivec2 size = textureSize(currentColor, 0);
@@ -117,7 +122,18 @@ void main()
             } else {
                 history = clamp(history, neighborhoodMinimum, neighborhoodMaximum);
                 float motionPixels = length(motion.xy * vec2(size));
-                float historyWeight = clamp(0.92 - motionPixels * 0.08, 0.10, 0.92);
+                float currentLuminance = luminance(current);
+                float historyLuminance = luminance(history);
+                float relativeDifference =
+                    abs(currentLuminance - historyLuminance) /
+                    max(max(currentLuminance, historyLuminance), 0.05);
+                float response = mix(1.0, 0.55,
+                                     smoothstep(0.04, 0.35, relativeDifference));
+                // A 0.92 stationary history weight visibly softened the native
+                // image. Keep enough history for sub-pixel stability while
+                // responding faster to real shading and silhouette changes.
+                float historyWeight =
+                    clamp((0.86 - motionPixels * 0.10) * response, 0.08, 0.86);
                 accumulated = mix(current, history, historyWeight);
             }
         }

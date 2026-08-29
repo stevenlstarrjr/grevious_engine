@@ -32,9 +32,9 @@ namespace {
 namespace fs = std::filesystem;
 namespace rs = renderer::scene;
 
-constexpr auto supportedExtensions =
-    fastgltf::Extensions::KHR_mesh_quantization | fastgltf::Extensions::KHR_lights_punctual |
-    fastgltf::Extensions::KHR_materials_emissive_strength;
+constexpr auto supportedExtensions = fastgltf::Extensions::KHR_mesh_quantization |
+                                     fastgltf::Extensions::KHR_lights_punctual |
+                                     fastgltf::Extensions::KHR_materials_emissive_strength;
 constexpr std::array<std::string_view, 3> supportedExtensionNames = {
     "KHR_mesh_quantization",
     "KHR_lights_punctual",
@@ -163,8 +163,9 @@ void verifyExtensionPolicy(const fs::path& sourcePath, const fastgltf::Asset& as
     }
 }
 
-void verifyFeaturePolicy(const fs::path& sourcePath, const fastgltf::Asset& asset) {
-    if (!asset.animations.empty()) {
+void verifyFeaturePolicy(const fs::path& sourcePath, const fastgltf::Asset& asset,
+                         const GltfImportOptions& options) {
+    if (!asset.animations.empty() && !options.allowAnimationStaticPose) {
         fail(sourcePath, "animations are not supported by the source Scene IR yet");
     }
     if (!asset.skins.empty()) {
@@ -788,13 +789,13 @@ scene::Scene importGltf(const fs::path& sourcePath, const GltfImportOptions& opt
     // sizes can be checked before fastgltf allocates and loads them.
     fastgltf::Asset preflight = parseAsset(sourcePath, fastgltf::Options::None);
     verifyExtensionPolicy(sourcePath, preflight);
-    verifyFeaturePolicy(sourcePath, preflight);
+    verifyFeaturePolicy(sourcePath, preflight, options);
     verifyLimits(sourcePath, preflight, options, true);
 
     fastgltf::Asset asset = parseAsset(sourcePath, fastgltf::Options::LoadExternalBuffers |
                                                        fastgltf::Options::LoadExternalImages);
     verifyExtensionPolicy(sourcePath, asset);
-    verifyFeaturePolicy(sourcePath, asset);
+    verifyFeaturePolicy(sourcePath, asset, options);
     verifyLimits(sourcePath, asset, options, false);
 
     const SelectedNodes selected = selectNodes(sourcePath, asset, options);

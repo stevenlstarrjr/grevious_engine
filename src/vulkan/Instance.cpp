@@ -18,7 +18,13 @@ constexpr const char* validationLayer = "VK_LAYER_KHRONOS_validation";
 
 class VolkInitializationGuard final {
   public:
-    VolkInitializationGuard() { check(volkInitialize(), "volkInitialize"); }
+    explicit VolkInitializationGuard(PFN_vkGetInstanceProcAddr customGetInstanceProcAddr) {
+        if (customGetInstanceProcAddr != nullptr) {
+            volkInitializeCustom(customGetInstanceProcAddr);
+        } else {
+            check(volkInitialize(), "volkInitialize");
+        }
+    }
     ~VolkInitializationGuard() {
         if (active_) {
             volkFinalize();
@@ -93,9 +99,10 @@ VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo(void* userData) {
 
 } // namespace
 
-Instance::Instance(const platform::Window& window, ValidationMode validationMode)
+Instance::Instance(const platform::Window& window, ValidationMode validationMode,
+                   PFN_vkGetInstanceProcAddr customGetInstanceProcAddr)
     : window_(window) {
-    VolkInitializationGuard volkGuard;
+    VolkInitializationGuard volkGuard(customGetInstanceProcAddr);
     std::uint32_t loaderVersion = VK_API_VERSION_1_0;
     check(vkEnumerateInstanceVersion(&loaderVersion), "vkEnumerateInstanceVersion");
     if (loaderVersion < VK_API_VERSION_1_3) {

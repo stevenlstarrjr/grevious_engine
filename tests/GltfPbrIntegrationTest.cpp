@@ -209,6 +209,39 @@ void verifyTextureAndTangentCompatibilityAssets() {
                      packedHelmet.primitives.front().centerRadius.w) < 1.0e-5F,
             "Identity/TRS instance bounds were inflated instead of using exact basis scale");
 
+    std::vector<std::uint32_t> baseColorDescriptors(helmet.textures().size());
+    std::vector<std::uint32_t> metallicRoughnessDescriptors(helmet.textures().size());
+    std::vector<std::uint32_t> normalDescriptors(helmet.textures().size());
+    std::vector<std::uint32_t> occlusionDescriptors(helmet.textures().size());
+    std::vector<std::uint32_t> emissiveDescriptors(helmet.textures().size());
+    std::iota(baseColorDescriptors.begin(), baseColorDescriptors.end(), 10U);
+    std::iota(metallicRoughnessDescriptors.begin(), metallicRoughnessDescriptors.end(), 20U);
+    std::iota(normalDescriptors.begin(), normalDescriptors.end(), 30U);
+    std::iota(occlusionDescriptors.begin(), occlusionDescriptors.end(), 40U);
+    std::iota(emissiveDescriptors.begin(), emissiveDescriptors.end(), 50U);
+    const rg::PackedScene usageSpecificHelmet =
+        rg::packScene(helmet, rg::MaterialTextureDescriptorTable{
+                                  .baseColor = baseColorDescriptors,
+                                  .metallicRoughness = metallicRoughnessDescriptors,
+                                  .normal = normalDescriptors,
+                                  .occlusion = occlusionDescriptors,
+                                  .emissive = emissiveDescriptors,
+                              });
+    const rs::Material& helmetMaterial = helmet.materials().front();
+    const rg::MaterialRecord& packedHelmetMaterial = usageSpecificHelmet.materials.front();
+    require(packedHelmetMaterial.textureIndices.x ==
+                    baseColorDescriptors[helmetMaterial.baseColorTexture.texture.index()] &&
+                packedHelmetMaterial.textureIndices.y ==
+                    metallicRoughnessDescriptors[helmetMaterial.metallicRoughnessTexture.texture
+                                                     .index()] &&
+                packedHelmetMaterial.textureIndices.z ==
+                    normalDescriptors[helmetMaterial.normalTexture.texture.index()] &&
+                packedHelmetMaterial.textureIndices.w ==
+                    occlusionDescriptors[helmetMaterial.occlusionTexture.texture.index()] &&
+                packedHelmetMaterial.textureState.x ==
+                    emissiveDescriptors[helmetMaterial.emissiveTexture.texture.index()],
+            "GPU material packing did not preserve usage-specific texture descriptors");
+
     const rs::Scene texturedGrid =
         ra::importGltf(sample("Models/MetalRoughSpheres/glTF/MetalRoughSpheres.gltf"));
     require(texturedGrid.materials().size() == 1 &&

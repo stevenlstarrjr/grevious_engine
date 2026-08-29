@@ -1,0 +1,85 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D surfaceAov;
+layout(set = 0, binding = 1) uniform sampler2D normalAov;
+layout(set = 0, binding = 2) uniform sampler2D motionDepthAov;
+layout(set = 0, binding = 3) uniform sampler2D depthAov;
+layout(rgba16f, set = 0, binding = 4) uniform writeonly image2D outputMotion;
+layout(rgb10_a2, set = 0, binding = 5) uniform writeonly image2D outputNormalRoughness;
+layout(r32f, set = 0, binding = 6) uniform writeonly image2D outputViewZ;
+
+layout(push_constant) uniform NrdPreparePushConstants
+{
+    mat4 inverseProjection;
+} controls;
+
+bool finiteVector(vec4 value)
+{
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 decodeOctahedralNormal(vec2 encoded)
+{
+    vec2 value = encoded * 2.0 - 1.0;
+    vec3 normal = vec3(value, 1.0 - abs(value.x) - abs(value.y));
+    if (normal.z < 0.0) {
+        vec2 signs = vec2(normal.x >= 0.0 ? 1.0 : -1.0,
+                          normal.y >= 0.0 ? 1.0 : -1.0);
+        normal.xy = (vec2(1.0) - abs(normal.yx)) * signs;
+    }
+    return normalize(normal);
+}
+
+// Matches NRD_FrontEnd_PackNormalAndRoughness for
+// NRD_NORMAL_ENCODING_R10G10B10A2_UNORM and linear roughness.
+vec4 packNrdNormalRoughness(vec3 normal, float roughness)
+{
+    normal /= max(abs(normal.x) + abs(normal.y) + abs(normal.z), 1.0e-7);
+    vec3 packed;
+    packed.y = normal.y * 0.5 + 0.5;
+    packed.x = normal.x * 0.5 + packed.y;
+    packed.y -= normal.x * 0.5;
+    roughness = max(clamp(roughness, 0.0, 1.0), 1.5 / 512.0);
+    float signedRoughness = normal.z < 0.0 ? -roughness : roughness;
+    packed.z = signedRoughness * 0.5 + 0.5;
+    return vec4(clamp(packed, 0.0, 1.0), 0.0);
+}
+
+void main()
+{
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputMotion);
+    if (any(greaterThanEqual(coordinate, size))) {
+        return;
+    }
+
+    vec4 surface = texelFetch(surfaceAov, coordinate, 0);
+    vec4 packedNormals = texelFetch(normalAov, coordinate, 0);
+    vec4 motionDepth = texelFetch(motionDepthAov, coordinate, 0);
+    float deviceDepth = texelFetch(depthAov, coordinate, 0).r;
+    float roughness = finiteVector(surface) ? clamp(surface.a, 0.0, 1.0) : 1.0;
+    bool surfaceHit = finiteVector(motionDepth) && motionDepth.w > 0.0;
+    vec3 normal = surfaceHit && finiteVector(packedNormals)
+        ? decodeOctahedralNormal(packedNormals.zw)
+        : vec3(0.0, 0.0, 1.0);
+
+    // Genesis motion is current-minus-previous. NRD consumes previous-minus-current.
+    vec2 nrdMotion = finiteVector(motionDepth) ? -motionDepth.xy : vec2(0.0);
+    imageStore(outputMotion, coordinate, vec4(nrdMotion, 0.0, 0.0));
+    imageStore(outputNormalRoughness, coordinate,
+               packNrdNormalRoughness(normal, roughness));
+
+    vec2 pixelUv = (vec2(coordinate) + vec2(0.5)) / vec2(size);
+    vec4 viewPosition = controls.inverseProjection *
+                        vec4(pixelUv * 2.0 - 1.0, deviceDepth, 1.0);
+    float reconstructedViewZ = abs(viewPosition.w) > 1.0e-7
+        ? viewPosition.z / viewPosition.w
+        : -1000000.0;
+    float viewZ = surfaceHit && !isnan(reconstructedViewZ) && !isinf(reconstructedViewZ)
+        ? clamp(reconstructedViewZ, -500000.0, 500000.0)
+        : -1000000.0;
+    imageStore(outputViewZ, coordinate, vec4(viewZ));
+
+}

@@ -34,6 +34,10 @@ struct GltfImportOptions {
     std::optional<std::size_t> sceneIndex;
     GltfImportLimits limits;
     bool allowExternalFilesOutsideSourceDirectory = false;
+    // Explicit benchmark/editor opt-in: import authored node transforms and
+    // ignore animation tracks. Runtime callers otherwise reject animation so
+    // unsupported motion is never discarded silently.
+    bool allowAnimationStaticPose = false;
 };
 
 class GltfImportError final : public std::runtime_error {

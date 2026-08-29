@@ -77,7 +77,9 @@ VkCompositeAlphaFlagBitsKHR selectCompositeAlpha(const VkSurfaceCapabilitiesKHR&
 Swapchain::Swapchain(const Instance& instance, const Device& device, std::uint32_t width,
                      std::uint32_t height, bool transferSource)
     : instance_(instance), device_(device), transferSource_(transferSource) {
-    create(width, height, VK_NULL_HANDLE);
+    if (!create(width, height, VK_NULL_HANDLE)) {
+        throw std::runtime_error("Surface has no drawable extent for initial swapchain creation");
+    }
 }
 
 Swapchain::~Swapchain() {
@@ -87,18 +89,17 @@ Swapchain::~Swapchain() {
     }
 }
 
-void Swapchain::recreate(std::uint32_t width, std::uint32_t height) {
+bool Swapchain::recreate(std::uint32_t width, std::uint32_t height) {
     const VkSwapchainKHR oldSwapchain = swapchain_;
-    destroyViews();
-    images_.clear();
-    swapchain_ = VK_NULL_HANDLE;
-    try {
-        create(width, height, oldSwapchain);
-    } catch (...) {
-        vkDestroySwapchainKHR(device_.handle(), oldSwapchain, nullptr);
-        throw;
+    const std::vector<VkImageView> oldViews = views_;
+    if (!create(width, height, oldSwapchain)) {
+        return false;
+    }
+    for (VkImageView view : oldViews) {
+        vkDestroyImageView(device_.handle(), view, nullptr);
     }
     vkDestroySwapchainKHR(device_.handle(), oldSwapchain, nullptr);
+    return true;
 }
 
 VkResult Swapchain::acquire(VkSemaphore semaphore, std::uint32_t& imageIndex) const {
@@ -107,7 +108,7 @@ VkResult Swapchain::acquire(VkSemaphore semaphore, std::uint32_t& imageIndex) co
                                  VK_NULL_HANDLE, &imageIndex);
 }
 
-void Swapchain::create(std::uint32_t width, std::uint32_t height, VkSwapchainKHR oldSwapchain) {
+bool Swapchain::create(std::uint32_t width, std::uint32_t height, VkSwapchainKHR oldSwapchain) {
     VkSurfaceCapabilitiesKHR capabilities{};
     check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device_.physicalHandle(), instance_.surface(),
                                                     &capabilities),
@@ -144,6 +145,9 @@ void Swapchain::create(std::uint32_t width, std::uint32_t height, VkSwapchainKHR
     const VkSurfaceFormatKHR selectedFormat = selectFormat(formats);
     const VkPresentModeKHR presentMode = selectPresentMode(modes);
     const VkExtent2D selectedExtent = selectExtent(capabilities, width, height);
+    if (selectedExtent.width == 0U || selectedExtent.height == 0U) {
+        return false;
+    }
     std::uint32_t imageCount = capabilities.minImageCount + 1;
     if (capabilities.maxImageCount != 0) {
         imageCount = std::min(imageCount, capabilities.maxImageCount);
@@ -160,10 +164,10 @@ void Swapchain::create(std::uint32_t width, std::uint32_t height, VkSwapchainKHR
         .imageColorSpace = selectedFormat.colorSpace,
         .imageExtent = selectedExtent,
         .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                      (transferSource_ ? static_cast<VkImageUsageFlags>(
-                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-                                       : VkImageUsageFlags{0}),
+        .imageUsage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+            (transferSource_ ? static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                             : VkImageUsageFlags{0}),
         .imageSharingMode =
             separatePresentQueue ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = separatePresentQueue ? 2U : 0U,
@@ -234,6 +238,7 @@ void Swapchain::create(std::uint32_t width, std::uint32_t height, VkSwapchainKHR
     core::log(core::LogLevel::info, "Swapchain: ", extent_.width, 'x', extent_.height,
               ", images=", images_.size(), ", format=", static_cast<int>(format_),
               ", present mode=", static_cast<int>(presentMode));
+    return true;
 }
 
 void Swapchain::destroyViews() {

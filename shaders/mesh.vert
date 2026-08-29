@@ -68,10 +68,11 @@ layout(location = 4) out vec2 uv1;
 layout(location = 5) out flat uint materialIndex;
 layout(location = 6) out vec4 currentClipPosition;
 layout(location = 7) out vec4 previousClipPosition;
+layout(location = 8) out flat uint sceneInstanceIndex;
 
 void main()
 {
-    uint sceneInstanceIndex = visibleInstanceIndices[uint(gl_InstanceIndex)];
+    sceneInstanceIndex = visibleInstanceIndices[uint(gl_InstanceIndex)];
     InstanceRecord instance = instances[sceneInstanceIndex];
     TransformRecord transform = transforms[instance.meshMaterial.z];
     worldPosition = vec3(transform.world * vec4(inPosition, 1.0));

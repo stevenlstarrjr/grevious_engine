@@ -96,6 +96,7 @@ layout(location = 4) in vec2 uv1;
 layout(location = 5) in flat uint materialIndex;
 layout(location = 6) in vec4 currentClipPosition;
 layout(location = 7) in vec4 previousClipPosition;
+layout(location = 8) in flat uint sceneInstanceIndex;
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec4 outMotion;
 layout(location = 2) out vec4 outNormal;
@@ -155,6 +156,31 @@ bool rayCandidateBlocksLight(uint instanceIndex, uint primitiveIndex, vec2 baryc
                         candidateUv, 0.0).a;
     return alpha >= material.emissiveAlphaCutoff.a;
 }
+
+float offsetRayComponent(float position, float normal)
+{
+    // Move the origin by a fixed number of representable floats. Unlike a
+    // world-space epsilon, this remains effective both near and far from the
+    // origin and avoids precision-dependent self intersections.
+    const float originThreshold = 1.0 / 32.0;
+    const float nearOriginOffset = 1.0 / 65536.0;
+    const float integerOffsetScale = 256.0;
+    int integerOffset = int(integerOffsetScale * normal);
+    float integerPosition = intBitsToFloat(floatBitsToInt(position) +
+                                            (position < 0.0 ? -integerOffset
+                                                            : integerOffset));
+    return abs(position) < originThreshold
+               ? position + nearOriginOffset * normal
+               : integerPosition;
+}
+
+vec3 offsetRayOrigin(vec3 position, vec3 normal, float minimumOffset)
+{
+    vec3 representableOffset = vec3(offsetRayComponent(position.x, normal.x),
+                                    offsetRayComponent(position.y, normal.y),
+                                    offsetRayComponent(position.z, normal.z));
+    return representableOffset + normal * minimumOffset;
+}
 #endif
 
 float directionalShadowVisibility(vec3 position, vec3 normal, vec3 lightDirection)
@@ -173,22 +199,34 @@ float directionalShadowVisibility(vec3 position, vec3 normal, vec3 lightDirectio
                           ? geometricNormal * inversesqrt(geometricLengthSquared)
                           : normal;
     geometricNormal = dot(geometricNormal, normal) < 0.0 ? -geometricNormal : geometricNormal;
-    vec3 origin = position + geometricNormal * originBias + lightDirection * originBias;
+    // Always offset to the side of the triangle into which this shadow ray
+    // travels. The previous normal-only offset could remain below a neighboring
+    // triangle at grazing angles and produce the dotted self-shadow pattern.
+    vec3 outgoingNormal = dot(geometricNormal, lightDirection) >= 0.0
+                              ? geometricNormal
+                              : -geometricNormal;
+    vec3 origin = offsetRayOrigin(position, outgoingNormal, originBias);
+    float selfIntersectionLimit = originBias * 8.0;
     rayQueryEXT query;
     // Rays travel from the receiver toward the light, reversing the raster
     // shadow-map traversal direction. Front-face culling therefore matches the
     // raster pipeline's back-face culling convention.
     rayQueryInitializeEXT(query, sceneTlas,
                           gl_RayFlagsTerminateOnFirstHitEXT |
+                              gl_RayFlagsNoOpaqueEXT |
                               gl_RayFlagsCullFrontFacingTrianglesEXT,
                           0xff, origin, originBias, lightDirection, 1.0e27);
     while (rayQueryProceedEXT(query)) {
-        if (rayQueryGetIntersectionTypeEXT(query, false) ==
+        uint candidateInstance = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false);
+        bool nearSelfIntersection = candidateInstance == sceneInstanceIndex &&
+                                    rayQueryGetIntersectionTEXT(query, false) <=
+                                        selfIntersectionLimit;
+        if (!nearSelfIntersection &&
+            rayQueryGetIntersectionTypeEXT(query, false) ==
                 gl_RayQueryCandidateIntersectionTriangleEXT &&
-            rayCandidateBlocksLight(
-                rayQueryGetIntersectionInstanceCustomIndexEXT(query, false),
-                rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
-                rayQueryGetIntersectionBarycentricsEXT(query, false))) {
+            rayCandidateBlocksLight(candidateInstance,
+                                    rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
+                                    rayQueryGetIntersectionBarycentricsEXT(query, false))) {
             rayQueryConfirmIntersectionEXT(query);
         }
     }
@@ -359,5 +397,9 @@ void main()
                      previousValid ? 1.0 : 0.0);
     // World-space normals make the history independent of camera rotation.
     // Alpha distinguishes surface samples from the infinite environment.
-    outNormal = vec4(normal * 0.5 + 0.5, 1.0);
+    // UINT_MAX is never a valid resident scene instance (Vulkan custom indices
+    // are 24-bit). Keeping this invariant in the surface marker also preserves
+    // the vertex/fragment interface in the non-ray-query pipeline.
+    float surfaceMarker = sceneInstanceIndex != 0xffffffffu ? 1.0 : 0.0;
+    outNormal = vec4(normal * 0.5 + 0.5, surfaceMarker);
 }

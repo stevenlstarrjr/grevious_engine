@@ -10,7 +10,7 @@ the horizon.
 
 Genesis Render is being built for those moments.
 
-This is a from-scratch, real-time Vulkan renderer for Linux and Wayland. It is
+This is a from-scratch, real-time Vulkan renderer for Windows and Linux. It is
 not a game yet, and it is not a complete game-development suite. It is the
 visual foundation a game can stand on: the part responsible for turning a
 world, its materials, its lights, and its atmosphere into the image on your
@@ -44,8 +44,9 @@ real rendering pipeline rather than a collection of mockups. It includes:
 
 - physically based materials, normal maps, emissive surfaces, HDR environment
   lighting, exposure, tone mapping, and bloom;
-- temporal anti-aliasing with motion-aware history rejection, so the image can
-  remain stable as the camera moves;
+- temporal anti-aliasing with motion-aware history rejection, contrast-adaptive
+  history weighting, and presentation-only sharpening, so the image remains
+  stable without unnecessarily softening stationary detail;
 - a shadow-casting sun with live ray-query shadows for opaque and alpha-masked
   scenes on capable hardware, plus three filtered raster ranges as the portable
   and blended-material path;
@@ -63,28 +64,34 @@ real rendering pipeline rather than a collection of mockups. It includes:
   ray-cone mip selection, luminance/solid-angle HDR environment sampling with
   power-heuristic MIS, deterministic sample accumulation, and the same
   exposure/tone-mapping output as raster mode. Motion-validated temporal
-  radiance reconstruction now stabilizes the live one-sample moving-camera path
-  while preserving raw progressive accumulation for inspection. Temporal
-  luminance moments and one bounded depth/normal/material-guided 3x3 spatial
-  pass further reduce one-sample error and fade as progressive convergence grows;
+  radiance reconstruction now stabilizes three fresh moving-camera samples per
+  pixel by default while preserving raw progressive accumulation for inspection.
+  Temporal luminance moments and three bounded depth/normal/material-guided
+  atrous passes further reduce error and fade as progressive convergence grows;
   and
 - a renderer-owned upscaling boundary shared by raster and path modes. The
   default `native` backend preserves exact 1:1 output, while the portable
   `spatial` backend renders at 0.5-1.0 scale and reconstructs a distinct
   output-resolution linear-HDR target before tone mapping. The renderer-owned
   `temporal` reference backend adds output-resolution color/depth history,
-  jitter-corrected motion reprojection, neighborhood clipping, and bounded
-  depth/motion-aware history rejection. Quality, balanced, and performance
-  modes map to 2/3, 10/17, and 1/2 render scale; an explicit `--render-scale`
-  retains custom testing. The backend contract names history and output
-  ownership, reconstruction type, optional features, and exact
-  color/depth/motion/jitter/exposure conventions without vendor types.
+  jitter-corrected motion reprojection, neighborhood clipping, and an
+  output-resolution reactive mask that bounds reuse around changed or newly
+  visible content. Quality, balanced, and performance modes map to 2/3, 10/17,
+  and 1/2 render scale; an explicit `--render-scale` retains custom testing. The
+  backend contract names history and output ownership, reconstruction type,
+  optional features, and exact
+  color/depth/motion/jitter/exposure conventions without vendor types. Native
+  Windows builds add NVIDIA Streamline DLSS Super Resolution and a path-traced
+  DLSS Ray Reconstruction mode that consumes fresh noisy radiance plus depth,
+  motion, diffuse/specular albedo, normal/roughness, and specular-hit-distance
+  guides;
 
 Opaque and alpha-masked scenes now select ray-query sun shadows automatically
-when acceleration structures and ray queries are available. Unsupported devices
-and scenes with blended or additive geometry retain the proven raster path;
-explicit required mode reports either limitation instead of silently changing
-backends.
+when acceleration structures and ray queries are available. Scale-stable ray
+origins and near-source candidate rejection prevent receiver self-shadowing.
+Unsupported devices and scenes with blended or additive geometry retain the
+proven raster path; explicit required mode reports either limitation instead of
+silently changing backends.
 
 ## What Genesis Render is becoming
 
@@ -105,9 +112,13 @@ game that feels good to play.
 
 ## Try the current demo
 
-The demo currently requires Linux, a Wayland session, Vulkan 1.3, a C++20
-compiler, CMake 3.25+, Ninja, `glslc`, and the Wayland/libdecor development
-libraries.
+The demo supports native Windows and Linux. Both platforms require Vulkan 1.3,
+a C++20 compiler, CMake 3.25+, and `glslc`.
+
+- Windows requires Visual Studio with the Desktop development with C++ workload
+  and the Vulkan SDK. The Win32 window and Vulkan surface are provided by SDL.
+- Linux requires Ninja, a Wayland session, and the Wayland/libdecor development
+  libraries.
 
 After cloning the repository, initialize its runtime dependencies and test
 assets:
@@ -116,7 +127,25 @@ assets:
 git submodule update --init --recursive thirdparty reference/glTF-Sample-Assets
 ```
 
-Build, test, and launch:
+On Windows, open a Visual Studio Developer PowerShell and run:
+
+```powershell
+.\tools\setup_streamline.ps1
+cmake --preset windows
+cmake --build --preset windows-debug
+ctest --preset windows-debug
+.\build\windows\bin\Debug\genesis_render.exe
+```
+
+For an optimized Windows build, use `windows-release` and launch
+`.\build\windows\bin\Release\genesis_render.exe`.
+
+Smart App Control can block locally built executables that are not signed by a
+publisher it trusts. Production binaries should be signed with a trusted
+code-signing certificate; disabling Smart App Control is not a build step. See
+[Microsoft's explanation](https://support.microsoft.com/en-US/Windows/Security/Threat-Malware-Protection/smart-app-control-has-blocked-part-of-this-app).
+
+On Linux, build, test, and launch with:
 
 ```sh
 cmake --preset debug
@@ -145,7 +174,8 @@ Some useful ways to explore it:
 # Run the progressive path tracer on an opaque scene
 ./build/release/bin/genesis_render \
   --render-mode path-traced --ray-tracing required \
-  --demo directional-shadow --path-max-bounces 2 --taa off --bloom off
+  --demo directional-shadow --path-max-bounces 2 \
+  --path-interactive-samples 3 --taa off --bloom off
 
 # Run an opaque textured glTF scene through the same path
 ./build/release/bin/genesis_render \
@@ -197,6 +227,22 @@ Some useful ways to explore it:
   --demo directional-shadow --upscaler temporal \
   --upscaler-quality performance
 
+# Use native NVIDIA DLSS Super Resolution on Windows
+.\build\windows\bin\Release\genesis_render.exe --render-mode path-traced --ray-tracing required --demo directional-shadow --upscaler dlss --upscaler-quality quality
+
+# Feed one fresh path sample per frame into NVIDIA DLSS Ray Reconstruction
+.\build\windows\bin\Release\genesis_render.exe --render-mode path-traced --ray-tracing required --demo directional-shadow --upscaler dlss --upscaler-quality quality --path-denoiser ray-reconstruction
+
+# Adjust the subtle post-tone-map film grain (default 0.015; zero disables it)
+./build/release/bin/genesis_render \
+  --render-mode path-traced --ray-tracing required \
+  --demo directional-shadow --film-grain 0.015
+
+# Light the sphere grid and matte backdrop exclusively from an HDRI
+./build/release/bin/genesis_render \
+  --render-mode path-traced --ray-tracing required \
+  --demo hdri-backdrop --environment path/to/studio.hdr
+
 # Explicit render scale remains available as a custom diagnostic mode
 ./build/release/bin/genesis_render \
   --demo pbr-grid --upscaler spatial --render-scale 0.75
@@ -245,12 +291,24 @@ current/expected-previous device depth, world hit distance, and motion-aware
 history validity through `--path-debug`. One compute pass validates ping-ponged
 geometry history and disocclusions during stationary and moving-camera frames;
 a second reprojects accepted radiance, clamps it to the current 3x3 neighborhood,
-applies bounded motion/convergence weighting, and tracks luminance moments. A
-third applies one variance-, depth-, normal-, albedo-, roughness-, and
-hit-distance-guided 3x3 spatial filter whose strength fades with convergence.
-Raw, temporal, and final radiance plus weight and variance remain inspectable.
-This is the first bounded spatial reconstruction baseline, not a production
-multistage denoiser. `--aov-export` now exposes the shared renderer-owned output
+applies bounded motion/convergence weighting, and tracks luminance moments.
+Moving frames reset the current-view accumulator and trace three fresh samples
+per pixel by default, then feed back only depth/normal-validated, previously
+denoised radiance with a stronger motion-aware weight. The
+`--path-interactive-samples 1..8` option tunes that motion budget; stationary
+frames return to one new progressive sample and progressively reduce feedback so
+the fresh accumulator takes over. A
+three-scale variance-guided atrous stage separates direct and indirect light,
+then filters both at step widths 1, 2, and 4 using depth, normal, albedo,
+roughness, hit distance, luminance, and temporal variance. Direct lighting keeps
+tighter edge weights while indirect lighting receives the stronger filter, and
+both strengths fade as samples converge. Background/environment pixels remain
+unfiltered. Raw, temporal, and final radiance plus weight and variance remain
+inspectable. Same-size swapchain recovery, including minimize/restore, preserves
+the offscreen images and accumulated history. This is the vendor-neutral
+interactive multi-scale reconstruction baseline,
+not an adaptive or vendor-specific production denoiser. `--aov-export` now
+exposes the shared renderer-owned output
 contract through a Vulkan-independent `AovFrameSink`. The built-in v1 sink
 writes 15 linear float32 PFM planes plus a JSON manifest: final, raw, and
 temporal beauty; direct and derived indirect lighting; albedo; roughness;
@@ -274,9 +332,11 @@ at 2/3, 10/17, and 1/2 scale. Backend capabilities explicitly describe
 identity/spatial/temporal reconstruction, history and output ownership,
 reactive-mask, sharpening, dynamic-resolution support, and canonical temporal
 input conventions. Spatial establishes portable resource and scheduling
-semantics, not the image quality of a temporal upscaler. A renderer-owned
-temporal reference backend, reactive inputs, and FSR/XeSS/DLSS implementations
-remain future work.
+semantics, not the image quality of a temporal upscaler. The renderer-owned
+temporal reference and reactive-mask input are live. Windows additionally has
+signed-runtime NVIDIA Streamline DLSS Super Resolution and DLSS Ray
+Reconstruction adapters; FSR/XeSS and backend-provided sharpening remain future
+work.
 
 Production animation ingestion, alpha/transmission path
 materials, more complete transport, RT scene scaling, skinning, morph targets,

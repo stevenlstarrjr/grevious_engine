@@ -66,14 +66,17 @@ vec3 fresnelSchlick(float viewDotHalf, vec3 f0)
     return f0 + (vec3(1.0) - f0) * weight;
 }
 
-vec3 evaluateMetallicRoughnessBrdf(vec3 baseColor, float metallic,
-                                   float perceptualRoughness, vec3 normal,
-                                   vec3 viewDirection, vec3 lightDirection)
+void evaluateMetallicRoughnessBrdfLobes(vec3 baseColor, float metallic,
+                                        float perceptualRoughness, vec3 normal,
+                                        vec3 viewDirection, vec3 lightDirection,
+                                        out vec3 diffuse, out vec3 specular)
 {
     float noV = clamp(dot(normal, viewDirection), 0.0, 1.0);
     float noL = clamp(dot(normal, lightDirection), 0.0, 1.0);
     if (noV <= 0.0 || noL <= 0.0) {
-        return vec3(0.0);
+        diffuse = vec3(0.0);
+        specular = vec3(0.0);
+        return;
     }
     vec3 halfVector = normalize(viewDirection + lightDirection);
     float noH = clamp(dot(normal, halfVector), 0.0, 1.0);
@@ -83,9 +86,20 @@ vec3 evaluateMetallicRoughnessBrdf(vec3 baseColor, float metallic,
     vec3 fresnel = fresnelSchlick(voH, f0);
     float distribution = trowbridgeReitzD(noH, alpha);
     float geometry = smithMaskingShadowing(noV, noL, alpha);
-    vec3 specular = fresnel * distribution * geometry / max(4.0 * noV * noL, 1.0e-7);
+    specular = fresnel * distribution * geometry / max(4.0 * noV * noL, 1.0e-7);
     vec3 diffuseWeight = (vec3(1.0) - fresnel) * (1.0 - clamp(metallic, 0.0, 1.0));
-    vec3 diffuse = diffuseWeight * clamp(baseColor, 0.0, 1.0) / PBR_PI;
+    diffuse = diffuseWeight * clamp(baseColor, 0.0, 1.0) / PBR_PI;
+}
+
+vec3 evaluateMetallicRoughnessBrdf(vec3 baseColor, float metallic,
+                                   float perceptualRoughness, vec3 normal,
+                                   vec3 viewDirection, vec3 lightDirection)
+{
+    vec3 diffuse;
+    vec3 specular;
+    evaluateMetallicRoughnessBrdfLobes(baseColor, metallic, perceptualRoughness,
+                                       normal, viewDirection, lightDirection,
+                                       diffuse, specular);
     return diffuse + specular;
 }
 

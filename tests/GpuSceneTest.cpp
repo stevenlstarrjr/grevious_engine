@@ -1,4 +1,5 @@
 #include "renderer/gpu_scene/GpuScene.hpp"
+#include "renderer/scene/Scene.hpp"
 
 #include <array>
 #include <cmath>
@@ -87,8 +88,7 @@ void testEmissiveTriangleDistribution() {
         VertexRecord{.position = {0.0F, 1.0F, 0.0F}},
     };
     const std::array indices{0U, 1U, 2U};
-    const std::array primitives{
-        PrimitiveRecord{.indexCount = 3U, .materialIndex = 0U}};
+    const std::array primitives{PrimitiveRecord{.indexCount = 3U, .materialIndex = 0U}};
     const std::array ranges{PrimitiveLodRange{.firstLod = 0U, .lodCount = 1U}};
     const std::array sources{
         LodSourceRecord{.primitiveIndex = 0U, .minimumProjectedDiameter = 0.0F}};
@@ -128,6 +128,38 @@ void testEmissiveTriangleDistribution() {
             "Emissive instance lookup metadata is incorrect");
 }
 
+renderer::scene::Scene makeScaledTriangleScene(const glm::vec3& scale) {
+    namespace rs = renderer::scene;
+    rs::Scene source("scaled triangle");
+    rs::MeshPrimitive primitive;
+    primitive.positions = {{-1.0F, -1.0F, 0.0F}, {1.0F, -1.0F, 0.0F}, {0.0F, 1.0F, 0.0F}};
+    primitive.normals = {{0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F}};
+    primitive.indices = {0U, 1U, 2U};
+    const rs::PrimitiveHandle primitiveHandle = source.addPrimitive(std::move(primitive));
+    const rs::MeshHandle meshHandle = source.addMesh(rs::Mesh{.primitives = {primitiveHandle}});
+    const rs::NodeHandle node = source.addNode(
+        rs::Node{.localTransform = glm::scale(glm::mat4(1.0F), scale), .mesh = meshHandle});
+    source.addRoot(node);
+    return source;
+}
+
+void testScaleRelativeTransformValidation() {
+    using namespace renderer::gpu_scene;
+    const PackedScene tiny = packScene(makeScaledTriangleScene(glm::vec3(1.0e-4F)));
+    require(tiny.instances.size() == 1U && tiny.transforms.size() == 1U &&
+                tiny.instances.front().centerRadius.w > 0.0F,
+            "GPU scene packing rejected a small but invertible mesh transform");
+
+    bool collapsedRejected = false;
+    try {
+        (void)packScene(makeScaledTriangleScene(glm::vec3(1.0F, 0.0F, 1.0F)));
+    } catch (const std::runtime_error& error) {
+        collapsedRejected =
+            std::string_view(error.what()).find("singular") != std::string_view::npos;
+    }
+    require(collapsedRejected, "GPU scene packing accepted a collapsed mesh transform");
+}
+
 } // namespace
 
 int main() {
@@ -161,6 +193,7 @@ int main() {
         testMeshletLodWorkGeneration();
         testMeshletVertexCapacity();
         testEmissiveTriangleDistribution();
+        testScaleRelativeTransformValidation();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

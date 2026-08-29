@@ -13,9 +13,8 @@ RayShadowMaterialMode classifyRayShadowMaterial(const gpu_scene::MaterialRecord&
     if ((flags & (gpu_scene::alphaBlendMaterial | gpu_scene::additiveMaterial)) != 0U) {
         return RayShadowMaterialMode::unsupported;
     }
-    return (flags & gpu_scene::alphaMaskMaterial) != 0U
-               ? RayShadowMaterialMode::alphaMasked
-               : RayShadowMaterialMode::opaque;
+    return (flags & gpu_scene::alphaMaskMaterial) != 0U ? RayShadowMaterialMode::alphaMasked
+                                                        : RayShadowMaterialMode::opaque;
 }
 
 } // namespace
@@ -44,17 +43,21 @@ resolveInstanceTransform3x4(const TlasInstancePlan& instance,
 }
 
 bool supportsRayQueryShadows(const SceneBuildPlan& plan) {
-    return std::ranges::all_of(
-        plan.topLevelInstances, [](const TlasInstancePlan& instance) {
-            return instance.rayShadowMaterialMode != RayShadowMaterialMode::unsupported;
-        });
+    return std::ranges::all_of(plan.topLevelInstances, [](const TlasInstancePlan& instance) {
+        return instance.rayShadowMaterialMode != RayShadowMaterialMode::unsupported;
+    });
 }
 
 bool supportsOpaquePathTracing(const SceneBuildPlan& plan) {
-    return std::ranges::all_of(
-        plan.topLevelInstances, [](const TlasInstancePlan& instance) {
-            return instance.rayShadowMaterialMode == RayShadowMaterialMode::opaque;
-        });
+    return std::ranges::all_of(plan.topLevelInstances, [](const TlasInstancePlan& instance) {
+        return instance.rayShadowMaterialMode == RayShadowMaterialMode::opaque;
+    });
+}
+
+bool supportsPathTracing(const SceneBuildPlan& plan) {
+    return std::ranges::all_of(plan.topLevelInstances, [](const TlasInstancePlan& instance) {
+        return instance.rayShadowMaterialMode != RayShadowMaterialMode::unsupported;
+    });
 }
 
 SceneBuildPlan makeSceneBuildPlan(std::size_t vertexCount, std::span<const std::uint32_t> indices,

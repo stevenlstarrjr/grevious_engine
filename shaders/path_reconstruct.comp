@@ -15,6 +15,7 @@ layout(rg16f, set = 0, binding = 6) uniform writeonly image2D outputMoments;
 layout(push_constant) uniform PathReconstructionControls
 {
     uint sampleIndex;
+    uint samplesThisFrame;
 } controls;
 
 bool finiteVector(vec4 value)
@@ -33,6 +34,50 @@ float luminance(vec3 color)
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
+vec3 clampRadianceLuminance(vec3 radiance, float maximumLuminance)
+{
+    float valueLuminance = luminance(radiance);
+    return valueLuminance > maximumLuminance && maximumLuminance > 0.0
+        ? radiance * (maximumLuminance / valueLuminance)
+        : radiance;
+}
+
+vec3 motionWinsorizedRadiance(ivec2 coordinate, ivec2 size)
+{
+    vec3 current = sanitizedRadiance(coordinate);
+    if (controls.sampleIndex != 0u) {
+        return current;
+    }
+
+    vec4 motionDepth = texelFetch(currentMotionDepth, coordinate, 0);
+    float confidence = texelFetch(historyConfidence, coordinate, 0).r;
+    float motionPixels = length(motionDepth.xy * vec2(size));
+    if (!finiteVector(motionDepth) || confidence <= 0.0 || motionPixels <= 0.05) {
+        return current;
+    }
+
+    vec2 uv = (vec2(coordinate) + 0.5) / vec2(size);
+    vec2 historyUv = uv - motionDepth.xy;
+    if (any(lessThanEqual(historyUv, vec2(0.0))) ||
+        any(greaterThanEqual(historyUv, vec2(1.0)))) {
+        return current;
+    }
+
+    vec4 previous = texture(previousRadiance, historyUv);
+    if (!finiteVector(previous)) {
+        return current;
+    }
+
+    // Reprojected geometry validation has established that this is the same
+    // surface. Limit a single moving-frame Monte Carlo sample to a generous
+    // change around the previous denoised signal before it reaches temporal
+    // neighborhood clipping. This removes HDR fireflies while still allowing
+    // view-dependent lighting to evolve over several realtime frames.
+    float previousLuminance = luminance(max(previous.rgb, vec3(0.0)));
+    float maximumLuminance = max(0.05, previousLuminance * 2.0 + 0.05);
+    return clampRadianceLuminance(current, maximumLuminance);
+}
+
 void main()
 {
     ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
@@ -41,13 +86,13 @@ void main()
         return;
     }
 
-    vec3 current = sanitizedRadiance(coordinate);
+    vec3 current = motionWinsorizedRadiance(coordinate, size);
     vec3 neighborhoodMinimum = current;
     vec3 neighborhoodMaximum = current;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             ivec2 neighbor = clamp(coordinate + ivec2(x, y), ivec2(0), size - 1);
-            vec3 radiance = sanitizedRadiance(neighbor);
+            vec3 radiance = motionWinsorizedRadiance(neighbor, size);
             neighborhoodMinimum = min(neighborhoodMinimum, radiance);
             neighborhoodMaximum = max(neighborhoodMaximum, radiance);
         }
@@ -64,9 +109,19 @@ void main()
     vec3 history = clamp(max(historySample.rgb, vec3(0.0)),
                          neighborhoodMinimum, neighborhoodMaximum);
     float motionPixels = length(motionDepth.xy * vec2(size));
-    float motionWeight = clamp(0.92 - motionPixels * 0.08, 0.10, 0.92);
-    // Treat accepted temporal history as at most four equivalent fresh samples.
-    float convergenceWeight = 4.0 / (float(controls.sampleIndex) + 5.0);
+    // A zero sample index with nonzero motion marks an interactive multi-sample frame.
+    // Geometry validation and neighborhood clipping have already rejected stale
+    // surfaces, so retain substantially more of the previously denoised result.
+    // Large teleports invalidate history on the host and never reach this path.
+    bool interactiveMotion = controls.sampleIndex == 0u && motionPixels > 0.05;
+    float motionWeight = interactiveMotion
+        ? clamp(0.97 - motionPixels * 0.012, 0.72, 0.97)
+        : clamp(0.92 - motionPixels * 0.08, 0.10, 0.92);
+    // During progressive refinement, accepted history remains bounded to four
+    // equivalent samples so the current unbiased accumulator takes over.
+    float convergenceWeight = interactiveMotion
+        ? 0.95
+        : 4.0 / (float(controls.sampleIndex + controls.samplesThisFrame) + 4.0);
     float historyWeight = confidence * min(motionWeight, convergenceWeight);
     vec3 reconstructed = mix(current, history, historyWeight);
 

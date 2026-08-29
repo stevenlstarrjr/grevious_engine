@@ -1,4 +1,7 @@
 #include "renderer/core/Log.hpp"
+#if RENDERER_ENABLE_STREAMLINE
+#include "renderer/nvidia/StreamlineRuntime.hpp"
+#endif
 #include "renderer/output/AovExport.hpp"
 #include "renderer/platform/Window.hpp"
 #include "renderer/renderer/Renderer.hpp"
@@ -25,9 +28,30 @@ namespace {
 
 enum class ResizeScript { none, standard, odd, stress };
 
+#if RENDERER_ENABLE_STREAMLINE
+class StreamlineShutdownGuard final {
+  public:
+    explicit StreamlineShutdownGuard(renderer::nvidia::StreamlineRuntime* runtime)
+        : runtime_(runtime) {}
+
+    ~StreamlineShutdownGuard() {
+        if (runtime_ != nullptr) {
+            runtime_->shutdown();
+        }
+    }
+
+    StreamlineShutdownGuard(const StreamlineShutdownGuard&) = delete;
+    StreamlineShutdownGuard& operator=(const StreamlineShutdownGuard&) = delete;
+
+  private:
+    renderer::nvidia::StreamlineRuntime* runtime_ = nullptr;
+};
+#endif
+
 struct Options {
     std::optional<std::uint64_t> frameLimit;
     std::filesystem::path scenePath;
+    bool sceneAnimationStaticPose = false;
     std::filesystem::path environmentPath;
     float exposureCompensationEv = 0.0F;
     float environmentRotationDegrees = 0.0F;
@@ -41,16 +65,19 @@ struct Options {
     bool bloomEnabled = true;
     float bloomIntensity = renderer::post::bloomIntensity;
     float bloomRadius = 1.0F;
+    float filmGrainIntensity = 0.015F;
     bool emissiveSphereDemo = false;
     bool directionalShadowDemo = false;
+    bool hdriBackdropDemo = false;
     bool alphaShadowDemo = false;
     bool shadowsEnabled = true;
     renderer::ray_tracing::Request rayTracingRequest = renderer::ray_tracing::Request::automatic;
+    renderer::vulkan::HardwarePolicy hardwarePolicy =
+        renderer::vulkan::HardwarePolicy::nvidiaRtx;
     renderer::RayTracingTransformScript rayTracingTransformScript =
         renderer::RayTracingTransformScript::none;
     renderer::RenderMode renderMode = renderer::RenderMode::rasterized;
-    renderer::upscaling::Backend upscalingBackend =
-        renderer::upscaling::Backend::native;
+    renderer::upscaling::Backend upscalingBackend = renderer::upscaling::Backend::native;
     renderer::upscaling::QualityMode upscalingQualityMode =
         renderer::upscaling::QualityMode::native;
     bool upscalingQualityModeSpecified = false;
@@ -59,6 +86,8 @@ struct Options {
     bool pathEnvironmentImportanceSampling = true;
     bool pathEmissiveTriangleSampling = true;
     std::uint32_t pathMaxBounces = renderer::defaultPathBounceCount;
+    std::uint32_t pathInteractiveSamples = renderer::defaultPathInteractiveSampleCount;
+    renderer::PathDenoiser pathDenoiser = renderer::PathDenoiser::nrd;
     renderer::PathDebugView pathDebugView = renderer::PathDebugView::final;
     bool occlusionCullingEnabled = true;
     renderer::post::TestPattern postTestPattern = renderer::post::TestPattern::none;
@@ -68,6 +97,7 @@ struct Options {
     std::uint32_t height = 720;
     renderer::TemporalDebugView temporalDebugView = renderer::TemporalDebugView::none;
     renderer::TemporalCameraScript temporalCameraScript = renderer::TemporalCameraScript::none;
+    renderer::CameraStartView cameraStartView = renderer::CameraStartView::front;
     bool interactiveCameraInput = true;
     ResizeScript resizeScript = ResizeScript::none;
     bool captureFrameSpecified = false;
@@ -120,6 +150,16 @@ float parseBloomRadius(std::string_view text) {
     return value;
 }
 
+float parseFilmGrainIntensity(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.0F || value > 0.1F) {
+        throw std::runtime_error("--film-grain requires a finite value in [0, 0.1]");
+    }
+    return value;
+}
+
 float parseRenderScale(std::string_view text) {
     float value = 0.0F;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -156,6 +196,16 @@ std::uint32_t parsePathBounceCount(std::string_view text) {
     if (error != std::errc{} || end != text.data() + text.size() || value == 0U ||
         value > renderer::maximumPathBounceCount) {
         throw std::runtime_error("--path-max-bounces requires an integer in [1, 4]");
+    }
+    return value;
+}
+
+std::uint32_t parsePathInteractiveSampleCount(std::string_view text) {
+    std::uint32_t value = 0U;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0U ||
+        value > renderer::maximumPathInteractiveSampleCount) {
+        throw std::runtime_error("--path-interactive-samples requires an integer in [1, 8]");
     }
     return value;
 }
@@ -237,7 +287,7 @@ Options parseOptions(int argc, char** argv) {
         if (argument == "--help") {
             std::cout << "Usage: genesis_render [--frames N] "
                          "[--validation off|available|required] "
-                         "[--scene PATH] "
+                         "[--scene PATH] [--scene-animation reject|static-pose] "
                          "[--environment PATH] [--environment-rotation DEGREES] "
                          "[--exposure-ev STOPS] [--capture PATH] "
                          "[--timing-output PATH] "
@@ -245,26 +295,32 @@ Options parseOptions(int argc, char** argv) {
                          "[--aov-export DIRECTORY] [--aov-frame N] "
                          "[--taa on|off] [--bloom on|off] [--bloom-intensity VALUE] "
                          "[--bloom-radius VALUE] "
+                         "[--film-grain 0.0..0.1] "
+                         "[--gpu-policy nvidia-rtx|portable] "
                          "[--shadows on|off] [--ray-tracing off|auto|required] "
                          "[--render-mode rasterized|path-traced] "
-                         "[--upscaler native|spatial|temporal] "
+                         "[--upscaler native|spatial|temporal|dlss] "
                          "[--upscaler-quality quality|balanced|performance] "
                          "[--render-scale 0.5..1.0] "
                          "[--path-environment-sampling importance|uniform] "
                          "[--path-emissive-sampling on|off] "
                          "[--path-max-bounces 1|2|3|4] "
+                         "[--path-interactive-samples 1..8] "
+                         "[--path-denoiser nrd|ray-reconstruction] "
                          "[--path-debug final|direct|indirect|albedo|roughness|"
                          "geometric-normal|shading-normal|motion|depth|hit-distance|"
                          "lighting-residual|history-validity|raw-radiance|"
                          "reconstruction-weight|temporal-radiance|variance] "
                          "[--rt-transform-script none|oscillate] "
                          "[--occlusion-culling on|off] "
-                         "[--demo pbr-grid|emissive-sphere|directional-shadow|alpha-shadow] "
-                         "[--debug-view final|motion|history-validity|bloom|hdr] "
+                         "[--demo pbr-grid|emissive-sphere|directional-shadow|hdri-backdrop|"
+                         "alpha-shadow] "
+                         "[--debug-view final|motion|history-validity|bloom|hdr|reactive-mask] "
                          "[--post-test PATTERN] [--post-value LINEAR_HDR] "
                          "[--post-position X Y] "
                          "[--resolution WIDTH HEIGHT] "
                          "[--camera-script none|translate|teleport|rotate|approach] "
+                         "[--camera-start front|side|interior] "
                          "[--camera-input on|off] "
                          "[--resize-script [standard|odd|stress]]\n";
             std::exit(0);
@@ -286,6 +342,17 @@ Options parseOptions(int argc, char** argv) {
             }
             continue;
         }
+        if (argument == "--gpu-policy" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "nvidia-rtx") {
+                options.hardwarePolicy = renderer::vulkan::HardwarePolicy::nvidiaRtx;
+            } else if (value == "portable") {
+                options.hardwarePolicy = renderer::vulkan::HardwarePolicy::portable;
+            } else {
+                throw std::runtime_error("--gpu-policy requires nvidia-rtx or portable");
+            }
+            continue;
+        }
         if (argument == "--environment" && index + 1 < argc) {
             options.environmentPath = argv[++index];
             if (options.environmentPath.empty()) {
@@ -297,6 +364,17 @@ Options parseOptions(int argc, char** argv) {
             options.scenePath = argv[++index];
             if (options.scenePath.empty()) {
                 throw std::runtime_error("--scene requires a non-empty path");
+            }
+            continue;
+        }
+        if (argument == "--scene-animation" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "reject") {
+                options.sceneAnimationStaticPose = false;
+            } else if (value == "static-pose") {
+                options.sceneAnimationStaticPose = true;
+            } else {
+                throw std::runtime_error("--scene-animation requires reject or static-pose");
             }
             continue;
         }
@@ -373,6 +451,10 @@ Options parseOptions(int argc, char** argv) {
             options.bloomRadius = parseBloomRadius(argv[++index]);
             continue;
         }
+        if (argument == "--film-grain" && index + 1 < argc) {
+            options.filmGrainIntensity = parseFilmGrainIntensity(argv[++index]);
+            continue;
+        }
         if (argument == "--shadows" && index + 1 < argc) {
             const std::string_view value(argv[++index]);
             if (value == "on") {
@@ -413,7 +495,8 @@ Options parseOptions(int argc, char** argv) {
             const std::optional<renderer::upscaling::Backend> backend =
                 renderer::upscaling::parseBackend(value);
             if (!backend) {
-                throw std::runtime_error("--upscaler requires native, spatial, or temporal");
+                throw std::runtime_error(
+                    "--upscaler requires native, spatial, temporal, or dlss");
             }
             options.upscalingBackend = *backend;
             continue;
@@ -505,6 +588,22 @@ Options parseOptions(int argc, char** argv) {
             options.pathMaxBounces = parsePathBounceCount(argv[++index]);
             continue;
         }
+        if (argument == "--path-interactive-samples" && index + 1 < argc) {
+            options.pathInteractiveSamples = parsePathInteractiveSampleCount(argv[++index]);
+            continue;
+        }
+        if (argument == "--path-denoiser" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "nrd") {
+                options.pathDenoiser = renderer::PathDenoiser::nrd;
+            } else if (value == "ray-reconstruction") {
+                options.pathDenoiser = renderer::PathDenoiser::rayReconstruction;
+            } else {
+                throw std::runtime_error(
+                    "--path-denoiser requires nrd or ray-reconstruction");
+            }
+            continue;
+        }
         if (argument == "--rt-transform-script" && index + 1 < argc) {
             const std::string_view value(argv[++index]);
             if (value == "none") {
@@ -538,28 +637,50 @@ Options parseOptions(int argc, char** argv) {
             }
             continue;
         }
+        if (argument == "--camera-start" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "front") {
+                options.cameraStartView = renderer::CameraStartView::front;
+            } else if (value == "side") {
+                options.cameraStartView = renderer::CameraStartView::side;
+            } else if (value == "interior") {
+                options.cameraStartView = renderer::CameraStartView::interior;
+            } else {
+                throw std::runtime_error("--camera-start requires front, side, or interior");
+            }
+            continue;
+        }
         if (argument == "--demo" && index + 1 < argc) {
             const std::string_view value(argv[++index]);
             if (value == "pbr-grid") {
                 options.emissiveSphereDemo = false;
                 options.directionalShadowDemo = false;
+                options.hdriBackdropDemo = false;
                 options.alphaShadowDemo = false;
             } else if (value == "emissive-sphere") {
                 options.emissiveSphereDemo = true;
                 options.directionalShadowDemo = false;
+                options.hdriBackdropDemo = false;
                 options.alphaShadowDemo = false;
             } else if (value == "directional-shadow") {
                 options.emissiveSphereDemo = false;
                 options.directionalShadowDemo = true;
+                options.hdriBackdropDemo = false;
+                options.alphaShadowDemo = false;
+            } else if (value == "hdri-backdrop") {
+                options.emissiveSphereDemo = false;
+                options.directionalShadowDemo = false;
+                options.hdriBackdropDemo = true;
                 options.alphaShadowDemo = false;
             } else if (value == "alpha-shadow") {
                 options.emissiveSphereDemo = false;
                 options.directionalShadowDemo = false;
+                options.hdriBackdropDemo = false;
                 options.alphaShadowDemo = true;
             } else {
                 throw std::runtime_error(
-                    "--demo requires pbr-grid, emissive-sphere, directional-shadow, or "
-                    "alpha-shadow");
+                    "--demo requires pbr-grid, emissive-sphere, directional-shadow, "
+                    "hdri-backdrop, or alpha-shadow");
             }
             continue;
         }
@@ -593,9 +714,12 @@ Options parseOptions(int argc, char** argv) {
                 options.temporalDebugView = renderer::TemporalDebugView::bloom;
             } else if (value == "hdr") {
                 options.temporalDebugView = renderer::TemporalDebugView::hdr;
+            } else if (value == "reactive-mask") {
+                options.temporalDebugView = renderer::TemporalDebugView::reactiveMask;
             } else {
                 throw std::runtime_error(
-                    "--debug-view requires final, motion, history-validity, bloom, or hdr");
+                    "--debug-view requires final, motion, history-validity, bloom, hdr, or "
+                    "reactive-mask");
             }
             continue;
         }
@@ -653,6 +777,10 @@ Options parseOptions(int argc, char** argv) {
     if (!options.bloomEnabled && options.temporalDebugView == renderer::TemporalDebugView::bloom) {
         throw std::runtime_error("bloom debug view requires --bloom on");
     }
+    if (options.temporalDebugView == renderer::TemporalDebugView::reactiveMask &&
+        options.upscalingBackend != renderer::upscaling::Backend::temporal) {
+        throw std::runtime_error("reactive-mask debug view requires --upscaler temporal");
+    }
     if (options.renderMode == renderer::RenderMode::pathTraced) {
         if (options.rayTracingRequest == renderer::ray_tracing::Request::disabled) {
             throw std::runtime_error("--render-mode path-traced cannot use --ray-tracing off");
@@ -665,16 +793,39 @@ Options parseOptions(int argc, char** argv) {
     } else if (options.pathDebugView != renderer::PathDebugView::final) {
         throw std::runtime_error("--path-debug requires --render-mode path-traced");
     }
+    if (options.pathDenoiser == renderer::PathDenoiser::rayReconstruction) {
+        if (options.renderMode != renderer::RenderMode::pathTraced) {
+            throw std::runtime_error(
+                "--path-denoiser ray-reconstruction requires --render-mode path-traced");
+        }
+        if (options.upscalingBackend != renderer::upscaling::Backend::dlss) {
+            throw std::runtime_error(
+                "--path-denoiser ray-reconstruction requires --upscaler dlss");
+        }
+        if (options.pathDebugView != renderer::PathDebugView::final) {
+            throw std::runtime_error(
+                "--path-denoiser ray-reconstruction requires --path-debug final");
+        }
+        if (!options.aovExportDirectory.empty()) {
+            throw std::runtime_error(
+                "--path-denoiser ray-reconstruction cannot currently export NRD AOVs");
+        }
+    }
     if (!options.aovExportDirectory.empty() &&
         options.renderMode != renderer::RenderMode::pathTraced) {
         throw std::runtime_error("--aov-export requires --render-mode path-traced");
     }
     if (options.upscalingQualityModeSpecified && options.upscalingRenderScaleSpecified) {
+        throw std::runtime_error("--upscaler-quality and --render-scale are mutually exclusive");
+    }
+    if (options.upscalingBackend == renderer::upscaling::Backend::dlss &&
+        options.upscalingRenderScaleSpecified) {
         throw std::runtime_error(
-            "--upscaler-quality and --render-scale are mutually exclusive");
+            "--upscaler dlss requires a named --upscaler-quality mode");
     }
     if (options.upscalingBackend == renderer::upscaling::Backend::spatial ||
-        options.upscalingBackend == renderer::upscaling::Backend::temporal) {
+        options.upscalingBackend == renderer::upscaling::Backend::temporal ||
+        options.upscalingBackend == renderer::upscaling::Backend::dlss) {
         if (options.upscalingRenderScaleSpecified) {
             options.upscalingQualityMode = renderer::upscaling::QualityMode::custom;
         } else {
@@ -687,7 +838,7 @@ Options parseOptions(int argc, char** argv) {
     } else {
         if (options.upscalingQualityModeSpecified) {
             throw std::runtime_error(
-                "--upscaler-quality requires --upscaler spatial or temporal");
+                "--upscaler-quality requires --upscaler spatial, temporal, or dlss");
         }
         if (options.upscalingRenderScaleSpecified &&
             std::abs(options.upscalingRenderScale - 1.0F) > 1.0e-6F) {
@@ -695,20 +846,59 @@ Options parseOptions(int argc, char** argv) {
         }
         options.upscalingQualityMode = renderer::upscaling::QualityMode::native;
     }
-    if ((options.emissiveSphereDemo || options.directionalShadowDemo || options.alphaShadowDemo) &&
+    if ((options.emissiveSphereDemo || options.directionalShadowDemo || options.hdriBackdropDemo ||
+         options.alphaShadowDemo) &&
         !options.scenePath.empty()) {
         throw std::runtime_error("Procedural --demo modes cannot be combined with --scene");
+    }
+    if (options.sceneAnimationStaticPose && options.scenePath.empty()) {
+        throw std::runtime_error("--scene-animation static-pose requires --scene");
     }
     return options;
 }
 
 int run(const Options& options) {
-    renderer::platform::Window window(options.width, options.height,
-                                      "Genesis Render — Vulkan 1.3");
-    renderer::vulkan::Instance instance(window, options.validation);
+#if RENDERER_ENABLE_STREAMLINE
+    std::unique_ptr<renderer::nvidia::StreamlineRuntime> streamline;
+    if (options.upscalingBackend == renderer::upscaling::Backend::dlss) {
+        streamline = std::make_unique<renderer::nvidia::StreamlineRuntime>(
+            std::filesystem::path{});
+    }
+#else
+    if (options.upscalingBackend == renderer::upscaling::Backend::dlss) {
+        throw std::runtime_error("This Genesis build does not include NVIDIA Streamline");
+    }
+#endif
+    renderer::platform::Window window(options.width, options.height, "Genesis Render — Vulkan 1.3");
+    renderer::vulkan::Instance instance(
+        window, options.validation,
+#if RENDERER_ENABLE_STREAMLINE
+        streamline ? streamline->vulkanGetInstanceProcAddr() : nullptr
+#else
+        nullptr
+#endif
+    );
     std::uint64_t frameCount = 0;
     {
-        renderer::vulkan::Device device(instance);
+        renderer::vulkan::Device device(instance, options.hardwarePolicy);
+#if RENDERER_ENABLE_STREAMLINE
+        StreamlineShutdownGuard streamlineShutdown(streamline.get());
+        if (streamline &&
+            !streamline->featureSupported(
+                renderer::nvidia::StreamlineFeature::dlssSuperResolution,
+                device.physicalHandle())) {
+            throw std::runtime_error(
+                "DLSS Super Resolution is unavailable on the selected GPU or driver");
+        }
+        if (streamline &&
+            options.pathDenoiser == renderer::PathDenoiser::rayReconstruction &&
+            !streamline->featureSupported(
+                renderer::nvidia::StreamlineFeature::dlssRayReconstruction,
+                device.physicalHandle())) {
+            throw std::runtime_error(
+                "DLSS Ray Reconstruction is unavailable on the selected GPU or driver");
+        }
+#endif
         {
             std::shared_ptr<renderer::output::AovFrameSink> aovFrameSink;
             if (!options.aovExportDirectory.empty()) {
@@ -718,6 +908,7 @@ int run(const Options& options) {
             renderer::Renderer renderer(
                 window, instance, device,
                 {.scenePath = options.scenePath,
+                 .sceneAnimationStaticPose = options.sceneAnimationStaticPose,
                  .environmentPath = options.environmentPath,
                  .exposureCompensationEv = options.exposureCompensationEv,
                  .environmentRotationRadians =
@@ -732,8 +923,10 @@ int run(const Options& options) {
                  .bloomEnabled = options.bloomEnabled,
                  .bloomIntensity = options.bloomIntensity,
                  .bloomRadius = options.bloomRadius,
+                 .filmGrainIntensity = options.filmGrainIntensity,
                  .emissiveSphereDemo = options.emissiveSphereDemo,
                  .directionalShadowDemo = options.directionalShadowDemo,
+                 .hdriBackdropDemo = options.hdriBackdropDemo,
                  .alphaShadowDemo = options.alphaShadowDemo,
                  .shadowsEnabled = options.shadowsEnabled,
                  .rayTracingRequest = options.rayTracingRequest,
@@ -742,10 +935,17 @@ int run(const Options& options) {
                  .upscalingBackend = options.upscalingBackend,
                  .upscalingQualityMode = options.upscalingQualityMode,
                  .upscalingRenderScale = options.upscalingRenderScale,
-                 .pathEnvironmentImportanceSampling =
-                     options.pathEnvironmentImportanceSampling,
+                 .streamlineRuntime =
+#if RENDERER_ENABLE_STREAMLINE
+                     streamline.get(),
+#else
+                     nullptr,
+#endif
+                 .pathEnvironmentImportanceSampling = options.pathEnvironmentImportanceSampling,
                  .pathEmissiveTriangleSampling = options.pathEmissiveTriangleSampling,
                  .pathMaxBounces = options.pathMaxBounces,
+                 .pathInteractiveSamples = options.pathInteractiveSamples,
+                 .pathDenoiser = options.pathDenoiser,
                  .pathDebugView = options.pathDebugView,
                  .occlusionCullingEnabled = options.occlusionCullingEnabled,
                  .postTestPattern = options.postTestPattern,
@@ -753,10 +953,14 @@ int run(const Options& options) {
                  .postTestPosition = options.postTestPosition,
                  .temporalDebugView = options.temporalDebugView,
                  .temporalCameraScript = options.temporalCameraScript,
+                 .cameraStartView = options.cameraStartView,
                  .interactiveCameraInput = options.interactiveCameraInput});
             while (!window.shouldClose() &&
                    (!options.frameLimit.has_value() || frameCount < *options.frameLimit)) {
                 window.pollEvents();
+                if (window.shouldClose()) {
+                    break;
+                }
                 if (options.resizeScript == ResizeScript::standard && frameCount == 2U) {
                     window.resize(960, 540);
                 } else if (options.resizeScript == ResizeScript::standard && frameCount == 6U) {

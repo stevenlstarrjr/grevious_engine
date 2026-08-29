@@ -7,7 +7,7 @@
 
 namespace renderer::upscaling {
 
-enum class Backend { native, spatial, temporal };
+enum class Backend { native, spatial, temporal, dlss };
 enum class QualityMode { native, quality, balanced, performance, custom };
 enum class ReconstructionType { identity, spatial, temporal };
 enum class HistoryOwnership { none, renderer, backend };

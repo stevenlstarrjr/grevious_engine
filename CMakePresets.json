@@ -11,6 +11,11 @@
       "displayName": "Debug",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
       "environment": {
         "CCACHE_DIR": "${sourceDir}/build/.ccache",
         "CCACHE_TEMPDIR": "${sourceDir}/build/.ccache/tmp"
@@ -26,6 +31,11 @@
       "displayName": "Release",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
       "environment": {
         "CCACHE_DIR": "${sourceDir}/build/.ccache",
         "CCACHE_TEMPDIR": "${sourceDir}/build/.ccache/tmp"
@@ -33,6 +43,20 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "RENDERER_VALIDATION_DEFAULT": "OFF"
+      }
+    },
+    {
+      "name": "windows",
+      "displayName": "Windows (Visual Studio)",
+      "binaryDir": "${sourceDir}/build/windows",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "RENDERER_VALIDATION_DEFAULT": "ON"
       }
     }
   ],
@@ -44,6 +68,34 @@
     {
       "name": "release",
       "configurePreset": "release"
+    },
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows",
+      "configuration": "Debug"
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "windows-release",
+      "configurePreset": "windows",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

@@ -32,7 +32,11 @@ void writeLog(LogLevel level, std::string_view message) {
         std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
     std::tm localTime{};
+#if defined(_WIN32)
+    localtime_s(&localTime, &time);
+#else
     localtime_r(&time, &localTime);
+#endif
 
     std::scoped_lock lock(logMutex);
     auto& output = level == LogLevel::error ? std::cerr : std::clog;

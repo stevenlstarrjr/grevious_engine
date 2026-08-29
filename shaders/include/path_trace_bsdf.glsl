@@ -7,6 +7,7 @@ struct PathBsdfSample
     vec3 throughput;
     float pdf;
     float coneSpread;
+    uint sampledSpecular;
 };
 
 bool pathTraceFinite(vec3 value)
@@ -17,6 +18,19 @@ bool pathTraceFinite(vec3 value)
 float pathTraceLuminance(vec3 value)
 {
     return dot(value, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 clampPathRadianceContribution(vec3 value, float maximumLuminance)
+{
+    if (!pathTraceFinite(value)) {
+        return vec3(0.0);
+    }
+    value = max(value, vec3(0.0));
+    float luminance = pathTraceLuminance(value);
+    if (luminance > maximumLuminance && maximumLuminance > 0.0) {
+        value *= maximumLuminance / luminance;
+    }
+    return value;
 }
 
 void pathTraceBasis(vec3 normal, out vec3 tangent, out vec3 bitangent)
@@ -111,6 +125,7 @@ PathBsdfSample emptyPathBsdfSample()
     result.throughput = vec3(0.0);
     result.pdf = 0.0;
     result.coneSpread = 0.0;
+    result.sampledSpecular = 0u;
     return result;
 }
 
@@ -164,6 +179,7 @@ PathBsdfSample samplePathBsdf(vec3 baseColor, float metallic, float roughness,
     result.coneSpread = sampledSpecular
                             ? max(1.0e-4, 0.5 * perceptualRoughnessToAlpha(roughness))
                             : 0.5;
+    result.sampledSpecular = sampledSpecular ? 1u : 0u;
     return result;
 }
 

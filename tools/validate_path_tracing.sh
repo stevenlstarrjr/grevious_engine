@@ -5,6 +5,7 @@ renderer_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${1:-${renderer_root}/build/release}"
 output_dir="${2:-${renderer_root}/captures/current/path_tracing}"
 maximum_path_ms="${PATH_TRACING_MAX_MS:-5.0}"
+maximum_interactive_path_ms="${PATH_INTERACTIVE_MAX_MS:-10.0}"
 maximum_textured_path_ms="${PATH_TRACING_TEXTURED_MAX_MS:-5.0}"
 maximum_importance_rmse_ratio="${PATH_TRACING_IMPORTANCE_MAX_RMSE_RATIO:-0.90}"
 maximum_emissive_rmse_ratio="${PATH_TRACING_EMISSIVE_MAX_RMSE_RATIO:-0.90}"
@@ -12,7 +13,7 @@ maximum_emissive_path_ms="${PATH_TRACING_EMISSIVE_MAX_MS:-1.0}"
 maximum_history_ms="${PATH_HISTORY_MAX_MS:-0.25}"
 maximum_reconstruction_ms="${PATH_RECONSTRUCTION_MAX_MS:-0.25}"
 maximum_reconstructed_motion_ratio="${PATH_RECONSTRUCTION_MAX_MOTION_RATIO:-0.90}"
-maximum_denoising_ms="${PATH_DENOISING_MAX_MS:-0.50}"
+maximum_denoising_ms="${PATH_DENOISING_MAX_MS:-1.25}"
 maximum_spatial_reference_ratio="${PATH_DENOISING_MAX_REFERENCE_RATIO:-0.85}"
 maximum_spatial_motion_ratio="${PATH_DENOISING_MAX_MOTION_RATIO:-0.95}"
 genesis_render="${build_dir}/bin/genesis_render"
@@ -40,6 +41,7 @@ capture() {
         --bloom off \
         --occlusion-culling off \
         --camera-input off \
+        --path-interactive-samples 1 \
         --resolution 1280 720 \
         --frames "${frames}" \
         --capture "${output_dir}/${name}.png" \
@@ -71,6 +73,7 @@ quality_capture() {
         --bloom off \
         --occlusion-culling off \
         --camera-input off \
+        --path-interactive-samples 1 \
         --path-environment-sampling "${sampling}" \
         --resolution 640 360 \
         --frames "${frames}" \
@@ -102,6 +105,7 @@ emissive_capture() {
         --bloom off \
         --occlusion-culling off \
         --camera-input off \
+        --path-interactive-samples 1 \
         --path-emissive-sampling "${sampling}" \
         --path-max-bounces 2 \
         --resolution 640 360 \
@@ -132,6 +136,7 @@ aov_capture() {
         --bloom off \
         --occlusion-culling off \
         --camera-input off \
+        --path-interactive-samples 1 \
         --path-debug "${view}" \
         --resolution 640 360 \
         --frames "${frames}" \
@@ -179,6 +184,7 @@ env SDL_VIDEODRIVER=wayland "${genesis_render}" \
     --bloom off \
     --occlusion-culling off \
     --camera-input off \
+    --path-interactive-samples 1 \
     --resolution 1280 720 \
     --frames 32 \
     --capture "${output_dir}/textured.png" \
@@ -195,6 +201,7 @@ env SDL_VIDEODRIVER=wayland "${genesis_render}" \
     --bloom off \
     --occlusion-culling off \
     --camera-input off \
+    --path-interactive-samples 1 \
     --resolution 1280 720 \
     --resize-script standard \
     --frames 20 2>&1 | tee "${output_dir}/resize.log"
@@ -210,10 +217,12 @@ env SDL_VIDEODRIVER=wayland "${genesis_render}" \
     --camera-input off \
     --camera-script translate \
     --resolution 1280 720 \
+    --timing-output "${output_dir}/interactive_timing.txt" \
     --frames 8 2>&1 | tee "${output_dir}/camera_reset.log"
 
 for log in one_sample converged converged_repeat; do
-    grep -F "Render mode: progressive path tracing" "${output_dir}/${log}.log" >/dev/null
+    grep -F "Render mode: interactive progressive path tracing" \
+        "${output_dir}/${log}.log" >/dev/null
     grep -F "Path-tracing ray pipeline:" "${output_dir}/${log}.log" >/dev/null
     grep -F "Shadow traversal: ray-pipeline visibility rays" \
         "${output_dir}/${log}.log" >/dev/null
@@ -285,13 +294,15 @@ grep -F "Temporal history reset for deterministic camera teleport" \
 grep -F "Path-tracing accumulation reset after swapchain recreation" \
     "${output_dir}/resize.log" >/dev/null
 grep -F "across 2 reset(s)" "${output_dir}/resize.log" >/dev/null
-grep -F "Path tracing accumulated 1 sample(s) since the last reset across 7 reset(s)" \
+grep -F "Path tracing accumulated 3 sample(s) since the last reset across 7 reset(s)" \
     "${output_dir}/camera_reset.log" >/dev/null
 grep -F "Render mode: path traced" "${output_dir}/timing.txt" >/dev/null
 grep -F "Directional shadow backend: ray pipeline" "${output_dir}/timing.txt" >/dev/null
 grep -F "Ray-query shadow traversal: disabled" "${output_dir}/timing.txt" >/dev/null
 grep -F "Path-tracing accumulated samples: 32" "${output_dir}/timing.txt" >/dev/null
 grep -F "Path maximum bounces: 2" "${output_dir}/timing.txt" >/dev/null
+grep -F "Path interactive samples: 1" "${output_dir}/timing.txt" >/dev/null
+grep -F "Path interactive samples: 3" "${output_dir}/interactive_timing.txt" >/dev/null
 grep -F "Path emissive-triangle sampling: enabled" \
     "${output_dir}/emissive_timing.txt" >/dev/null
 
@@ -419,11 +430,13 @@ converged_mean="$(field "${converged_stats}" mean)"
 convergence_rmse="$(field "${convergence_compare}" rmse)"
 repeat_rmse="$(field "${repeat_compare}" rmse)"
 path_ms="$(sed -n 's/^path tracing: \([^ ]*\) ms.*/\1/p' "${output_dir}/timing.txt")"
+interactive_path_ms="$(sed -n 's/^path tracing: \([^ ]*\) ms.*/\1/p' \
+    "${output_dir}/interactive_timing.txt")"
 history_ms="$(sed -n 's/^path history validation: \([^ ]*\) ms.*/\1/p' \
     "${output_dir}/timing.txt")"
 reconstruction_ms="$(sed -n 's/^path temporal reconstruction: \([^ ]*\) ms.*/\1/p' \
     "${output_dir}/timing.txt")"
-denoising_ms="$(sed -n 's/^path spatial denoising: \([^ ]*\) ms.*/\1/p' \
+denoising_ms="$(sed -n 's/^path multi-scale denoising: \([^ ]*\) ms.*/\1/p' \
     "${output_dir}/timing.txt")"
 textured_path_ms="$(sed -n 's/^path tracing: \([^ ]*\) ms.*/\1/p' \
     "${output_dir}/textured_timing.txt")"
@@ -534,6 +547,12 @@ if [[ -z "${path_ms}" ]] ||
     echo "Path-tracing GPU time ${path_ms:-missing} ms exceeds ${maximum_path_ms} ms" >&2
     exit 1
 fi
+if [[ -z "${interactive_path_ms}" ]] ||
+   ! awk -v actual="${interactive_path_ms}" -v maximum="${maximum_interactive_path_ms}" \
+       'BEGIN { if (actual != actual || actual <= 0.0 || actual > maximum) exit 1 }'; then
+    echo "Interactive path-tracing GPU time ${interactive_path_ms:-missing} ms exceeds ${maximum_interactive_path_ms} ms" >&2
+    exit 1
+fi
 if [[ -z "${history_ms}" ]] ||
    ! awk -v actual="${history_ms}" -v maximum="${maximum_history_ms}" \
        'BEGIN { if (actual != actual || actual <= 0.0 || actual > maximum) exit 1 }'; then
@@ -600,6 +619,7 @@ fi
     echo "  RTX 2060 SUPER path-denoising dispatch: ${denoising_ms} ms (maximum ${maximum_denoising_ms} ms)"
     echo "  mean luminance: one sample ${one_mean}, 32 samples ${converged_mean}"
     echo "  RTX 2060 SUPER path dispatch: ${path_ms} ms (maximum ${maximum_path_ms} ms)"
+    echo "  RTX 2060 SUPER three-sample interactive path dispatch: ${interactive_path_ms} ms (maximum ${maximum_interactive_path_ms} ms)"
     echo "  textured glTF mean luminance: ${textured_mean}"
     echo "  textured RTX path dispatch: ${textured_path_ms} ms (maximum ${maximum_textured_path_ms} ms)"
     echo "  resize and moving-camera scripts produced deterministic accumulation resets"

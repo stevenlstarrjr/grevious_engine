@@ -1,6 +1,6 @@
 # Genesis Render Handoff
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
 
 Repository: <https://github.com/stevenlstarrjr/grevious_engine>
 
@@ -8,7 +8,7 @@ Branch: `main`
 
 ## Scope
 
-This is a Linux/Wayland-only, real-time-first C++20 Vulkan renderer, not a
+This is a native Windows/Linux, real-time-first C++20 Vulkan renderer, not a
 complete game engine. Its shared rendering core is intended to support both a
 frame-budgeted game profile and a later converged VFX/animation profile; do not
 fork separate scene/material/lighting implementations. PBRT-v4 and the PBRT
@@ -32,8 +32,9 @@ fallback contracts.
   exposure, ACES-fit tone mapping, and certified single-level bloom.
 - GPU-driven projected-size LOD, meshlets, frustum culling, previous-frame Hi-Z
   occlusion, and indirect-count rendering.
-- TAA, motion vectors, history rejection/reset, resize handling, and scripted
-  temporal regressions.
+- TAA, motion vectors, contrast-adaptive history weighting, presentation-only
+  sharpening, history rejection/reset, resize handling, and scripted temporal
+  regressions.
 - One shadow-casting sun with three GPU-culled 2048x2048 cascades, 3x3 PCF,
   stable centers, and alpha-cutout shadows.
 - Honest Vulkan RT capability/device policy, a deterministic RT scene planner,
@@ -41,7 +42,8 @@ fallback contracts.
   updates validated on RTX hardware.
 - Opaque and alpha-masked directional-light ray-query shadows with reflected
   TLAS/geometry descriptors, explicit update-to-fragment barriers, full-width
-  renderer-layer filtering, and raster fallback for blended/additive scenes.
+  renderer-layer filtering, scale-stable origin offsets, near-source candidate
+  rejection, and raster fallback for blended/additive scenes.
 - A separate progressive path-traced render mode with ray-pipeline/SBT
   ownership, direct-light visibility at every hit, one-to-four sampled
   diffuse/visible-GGX bounces (default two), throughput-based Russian roulette
@@ -80,6 +82,19 @@ fallback contracts.
   explicitly declares reconstruction type, history/output ownership, optional
   features, and canonical temporal input conventions without vendor or Vulkan
   types.
+- Native Windows NVIDIA support through the signed Streamline 2.12 runtime:
+  DLSS Super Resolution owns temporal reconstruction/output at the selected
+  quality extent, while DLSS Ray Reconstruction consumes one fresh noisy path
+  sample per frame plus renderer-authored depth, motion, diffuse/specular
+  albedo, world-normal/roughness, and specular-hit-distance guides. The RTX 2060
+  SUPER reports both features supported and executes the graph as `TLAS update
+  -> noisy path tracing -> NVIDIA DLSS Ray Reconstruction -> tone mapping ->
+  Present`.
+- NVIDIA NRD RELAX remains the portable path-denoiser mode. Ray Reconstruction
+  bypasses the local temporal, spatial, and NRD stack so histories have one
+  owner. Path-traced presentation preserves additional shadow latitude without
+  changing the linear transport buffers, and recursive transport no longer
+  multiplies baked glTF AO into traced visibility.
 
 ## Concrete Progress Numbers
 
@@ -129,7 +144,12 @@ These are tested examples, not final engine maximums:
 | History invalid/teleport validity RMSE | 0 |
 | RTX 1280x720 path-history validation, 32-frame mean | 0.120671 ms |
 | RTX 1280x720 path temporal reconstruction, 32-frame mean | 0.18209 ms |
-| RTX 1280x720 path spatial denoising, 32-frame mean | 0.333075 ms |
+| RTX 1280x720 previous single-pass spatial denoising, 32-frame mean | 0.333075 ms |
+| RTX 1280x720 three-scale denoising, 16 moving frames | 0.530902 ms |
+| RTX 1280x720 one-sample interactive path stack, 16 moving frames | 3.022354 ms |
+| RTX 1280x720 three-sample path tracing, 32 moving frames | 7.78731 ms |
+| RTX 1280x720 three-sample interactive path stack, 32 moving frames | 8.722215 ms |
+| Same-size minimize/restore | 1421 accumulated samples, 0 path resets |
 | RTX 640x360 one-frame path AOV readback | 1.73222-2.88858 ms |
 | Path-animation moving pixels at 320x180 | 125, maximum motion 0.00283263 UV |
 | Path-animation accepted moving-history mean | 0.952 |
@@ -349,6 +369,13 @@ Implemented and hardware-validated:
 - Deterministic per-pixel/per-sample random sequences, incremental averaging,
   finite-value guards, and accumulation resets for camera/view/environment and
   swapchain changes.
+- `--demo hdri-backdrop` adds the sphere-grid receiver plane while disabling the
+  procedural sun, point light, and directional shadows, isolating HDRI lighting
+  and reflections in both raster and path modes.
+- Path surface contributions use a bounded scene-linear luminance outlier clamp
+  before accumulation. Primary camera rays retain the full HDR environment
+  range; the biased realtime bound suppresses persistent low-PDF fireflies on
+  glossy materials without altering the visible HDRI background.
 - Opaque factor and texture evaluation using the resident instance, material,
   transform, vertex, index, geometry-range, and bindless texture records. Hit
   shaders reconstruct UV0/UV1 and tangent frames, sample base-color,
@@ -377,20 +404,33 @@ Implemented and hardware-validated:
   depth, current device depth, and world hit distance. A renderer-owned compute
   pass ping-pongs depth/geometric-normal/surface metadata and emits a validated
   confidence mask. A second pass reprojects, clips, and blends temporal radiance.
-  It also tracks first/second luminance moments. A third pass applies one
-  variance-, depth-, normal-, albedo-, roughness-, and hit-distance-guided 3x3
-  spatial filter. `--path-debug` makes every channel, the lighting residual,
+  It also tracks first/second luminance moments. Moving frames trace three fresh
+  samples per pixel by default and feed back the previous validated denoised
+  radiance at a motion-aware weight; `--path-interactive-samples 1..8` exposes
+  the quality/performance control. Progressive stationary samples return to one
+  fresh sample and reduce that reuse so the accumulator takes over. Three atrous
+  passes split and independently filter direct and
+  indirect light at step widths 1, 2, and 4.
+  They use variance, depth, normal, albedo, roughness, hit distance, and
+  luminance edge weights; direct filtering is deliberately tighter, indirect
+  filtering is stronger, and environment pixels remain untouched. `--path-debug`
+  makes every channel, the lighting residual,
   history validity, raw/temporal/final radiance, applied reconstruction weight,
-  and variance capturable without creating a second rendering path.
+  and variance capturable without creating a second rendering path. Same-size
+  swapchain recovery preserves these offscreen images and history across a
+  minimize/restore cycle. The replacement passes shader reflection, SPIR-V,
+  render-graph, scripted-motion, core, synchronization, and best-practices
+  validation on the RTX 2060 SUPER.
 - `tools/validate_path_tracing.sh`, including convergence, bit-exact repeat,
   depth-1/depth-4 transport and depth-4 repeat checks, fixed-budget
   environment and emissive RMSE comparisons, emissive repeat/timing checks, a
   deterministic albedo, normal/motion separation, every inspectable AOV, a
   beauty/direct/indirect residual check, stationary/moving/teleport history
   rejection checks, raw/temporal/spatial stability and reference checks, 5 ms
-  path, 0.25 ms history/reconstruction, and 0.50 ms spatial RTX 2060 Super
-  budgets, resize resets, sample/TLAS counts, ignored live camera input, and
-  clean Vulkan validation.
+  stationary path, 10 ms three-sample interactive path, 0.25 ms
+  history/reconstruction, and 1.25 ms multi-scale RTX 2060 Super budgets,
+  resize resets, sample/TLAS counts, ignored live camera input, and clean Vulkan
+  validation.
 - `tools/validate_aov_export.sh` writes all 15 linear float32 PFM planes and the
   v1 manifest at frame 8 while simultaneously capturing a PNG. The binary
   checker validates dimensions, channels, finite/range rules, surface/sky
@@ -406,12 +446,11 @@ Implemented and hardware-validated:
 
 Not working yet:
 
-- Alpha/transmission or production multistage denoising.
-- Direct/indirect-specific filtering, reactive masks, adaptive kernels, vendor
-  denoiser backends, production EXR/color-management output, and render-job
-  scheduling. Geometry validation, disocclusion rejection, bounded temporal
-  reuse, moments/variance, the first edge-aware spatial filter, and the neutral
-  float AOV sink are implemented.
+- Alpha/transmission-aware denoising.
+- Adaptive kernels, vendor denoiser backends, production EXR/color-management
+  output, and render-job scheduling. Geometry validation, disocclusion
+  rejection, bounded temporal reuse, moments/variance, direct/indirect-specific
+  multi-scale filtering, and the neutral float AOV sink are implemented.
 - Host-facing animation ingestion, runtime instance handles, skinning/morph
   deformation, and deforming BLAS updates. One deterministic rigid-instance
   path now resets accumulation and reprojects validated history correctly.
@@ -448,6 +487,10 @@ Implemented and hardware-validated:
 - Temporal reprojects with jitter-corrected canonical motion, clips history to
   the current 3x3 color neighborhood, and bounds reuse using depth variation,
   disocclusion, motion, and explicit resets.
+- Raster and path graphs generate an output-resolution `R8_UNORM` reactive mask
+  from current HDR/depth/motion and reprojected color/depth history before the
+  temporal dispatch. The mask reduces history contribution around changed or
+  newly visible content; `--debug-view reactive-mask` exposes it directly.
 - Bloom reads the render-resolution HDR result before scaled upscaling and
   is composited during output-resolution tone mapping.
 - `tools/validate_upscaling.sh` certifies exact implicit/explicit native output,
@@ -458,32 +501,60 @@ Implemented and hardware-validated:
   teleport rejection, stationary history acceptance, finite output, odd resize,
   bloom, animated path/TLAS updates, history memory, timestamp budgets, and
   warning-free Vulkan validation.
+- Windows Release validation on an RTX 2060 SUPER measured the 1280x720 mask at
+  0.878906 MiB transient and 0.089 ms average. Temporal reconstruction averaged
+  0.144 ms for the raster moving-content gate and 0.267 ms for a 16-sample path
+  capture. A 20-frame stress run recreated temporal history and masks across
+  eight even and odd output sizes with clean core, synchronization, and
+  best-practices validation.
+- Swapchain recreation now preserves the live swapchain when Win32 temporarily
+  reports a zero surface extent, and the event loop does not submit one extra
+  frame after a close request is polled.
 
 Not working yet:
 
 - Spatial remains bilinear and spatial-only. The temporal reference establishes
   portable correctness and integration behavior, not production vendor-upscaler
   image quality.
-- Reactive-mask generation and sharpening are not live.
-- FSR, XeSS, and DLSS remain future implementations behind `IUpscaler`.
+- Backend-provided sharpening is not live. Raster TAA applies bounded
+  presentation-only sharpening without feeding sharpened pixels back into
+  history.
+- FSR and XeSS remain future implementations behind `IUpscaler`; DLSS Super
+  Resolution and DLSS Ray Reconstruction are live on Windows/NVIDIA.
 
 ## Safest Next Steps
 
-1. Define and certify reactive-mask generation and optional sharpening without
-   weakening the existing temporal validity and timing gates.
+1. Define and certify backend-level optional sharpening without weakening the
+   existing temporal validity, reactive-mask, and timing gates.
 2. Add the first vendor-neutral production adapter, with FSR as the practical
    initial candidate, behind the existing resource and capability contract.
-3. Evaluate XeSS and DLSS adapters against the same deterministic captures,
-   capability negotiation, and timing gates.
+3. Extend deterministic capture and motion-quality gates around the live DLSS
+   adapters, then evaluate XeSS against the same contract.
 
 The ray-query timing, bounded transport, emissive-light, reconstruction-output,
-geometry-history validation, temporal-radiance, luminance-moment, and first
-bounded spatial-denoising slices are complete. Keep reuse bounded; production
-animation, alpha LOD, multistage denoising, reflections
+geometry-history validation, temporal-radiance, luminance-moment, and
+direct/indirect multi-scale denoising implementation slices are complete. The
+new spatial stage still needs its Windows hardware timing/image gates after a
+signed launch. Keep reuse bounded; production animation, alpha LOD,
+adaptive denoising, reflections
 as a separate hybrid effect, terrain, cinematic bloom replacement, and vendor
-upscalers remain separate milestones.
+upscalers beyond the live NVIDIA backend remain separate milestones.
 
 ## Clone, Build, and Test
+
+Windows (from a Visual Studio Developer PowerShell with the Vulkan SDK installed):
+
+```powershell
+.\tools\setup_streamline.ps1
+cmake --preset windows
+cmake --build --preset windows-debug
+ctest --preset windows-debug
+
+cmake --build --preset windows-release
+ctest --preset windows-release
+```
+
+Linux:
 
 ```bash
 git clone https://github.com/stevenlstarrjr/grevious_engine.git

@@ -140,6 +140,7 @@ bool requiredFeaturesAvailable(const DeviceFeatures& features) {
     const auto& v12 = features.vulkan12;
     const auto& v13 = features.vulkan13;
     return base.multiDrawIndirect == VK_TRUE && base.samplerAnisotropy == VK_TRUE &&
+           base.shaderStorageImageExtendedFormats == VK_TRUE &&
            v12.drawIndirectCount == VK_TRUE && v12.descriptorIndexing == VK_TRUE &&
            v12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
            v12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE &&
@@ -225,7 +226,8 @@ int deviceScore(const VkPhysicalDeviceProperties& properties, const QueueFamilie
     return score;
 }
 
-std::optional<Candidate> inspectCandidate(VkPhysicalDevice device, VkSurfaceKHR surface) {
+std::optional<Candidate> inspectCandidate(VkPhysicalDevice device, VkSurfaceKHR surface,
+                                          HardwarePolicy hardwarePolicy) {
     Candidate candidate{.handle = device};
     vkGetPhysicalDeviceProperties(device, &candidate.properties);
     if (candidate.properties.apiVersion < VK_API_VERSION_1_3) {
@@ -250,13 +252,20 @@ std::optional<Candidate> inspectCandidate(VkPhysicalDevice device, VkSurfaceKHR 
     candidate.queues = *queues;
     candidate.optional = optionalCapabilities(features, extensions);
     queryOptionalProperties(device, candidate.optional);
+    if (!acceptsHardware(hardwarePolicy,
+                         {.vendorId = candidate.properties.vendorID,
+                          .accelerationStructure = candidate.optional.accelerationStructure,
+                          .rayTracingPipeline = candidate.optional.rayTracingPipeline})) {
+        return std::nullopt;
+    }
     candidate.score = deviceScore(candidate.properties, candidate.queues);
     return candidate;
 }
 
 } // namespace
 
-Device::Device(const Instance& instance) {
+Device::Device(const Instance& instance, HardwarePolicy hardwarePolicy)
+    : hardwarePolicy_(hardwarePolicy) {
     instanceHandle_ = instance.handle();
     std::uint32_t count = 0;
     check(vkEnumeratePhysicalDevices(instance.handle(), &count, nullptr),
@@ -272,7 +281,7 @@ Device::Device(const Instance& instance) {
     for (VkPhysicalDevice device : devices) {
         VkPhysicalDeviceProperties properties{};
         vkGetPhysicalDeviceProperties(device, &properties);
-        const auto candidate = inspectCandidate(device, instance.surface());
+        const auto candidate = inspectCandidate(device, instance.surface(), hardwarePolicy_);
         if (!candidate.has_value()) {
             core::log(core::LogLevel::warning,
                       "Skipping incompatible Vulkan device: ", properties.deviceName);
@@ -283,11 +292,13 @@ Device::Device(const Instance& instance) {
         }
     }
     if (!selected.has_value()) {
-        throw std::runtime_error(
-            "No device satisfies the Vulkan 1.3, swapchain, queue, and required feature policy");
+        throw std::runtime_error("No device satisfies the " +
+                                 std::string(hardwarePolicyName(hardwarePolicy_)) +
+                                 " Vulkan 1.3 hardware policy");
     }
 
     physicalDevice_ = selected->handle;
+    properties_ = selected->properties;
     queueFamilies_ = selected->queues;
     supportedOptionalCapabilities_ = selected->optional;
     enabledOptionalCapabilities_ = supportedOptionalCapabilities_;
@@ -359,6 +370,7 @@ Device::Device(const Instance& instance) {
             {
                 .multiDrawIndirect = VK_TRUE,
                 .samplerAnisotropy = VK_TRUE,
+                .shaderStorageImageExtendedFormats = VK_TRUE,
             },
     };
     std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -388,7 +400,8 @@ Device::Device(const Instance& instance) {
     vkGetDeviceQueue(device_, queueFamilies_.compute, 0, &computeQueue_);
     vkGetDeviceQueue(device_, queueFamilies_.transfer, 0, &transferQueue_);
 
-    const auto& properties = selected->properties;
+    const auto& properties = properties_;
+    core::log(core::LogLevel::info, "Hardware policy: ", hardwarePolicyName(hardwarePolicy_));
     core::log(core::LogLevel::info, "Selected GPU: ", properties.deviceName, " (Vulkan ",
               VK_API_VERSION_MAJOR(properties.apiVersion), '.',
               VK_API_VERSION_MINOR(properties.apiVersion), '.',

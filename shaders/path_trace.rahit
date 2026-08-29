@@ -1,0 +1,83 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(std430, set = 0, binding = 3) readonly buffer Vertices
+{
+    float vertexData[];
+};
+layout(std430, set = 0, binding = 4) readonly buffer Indices
+{
+    uint indices[];
+};
+
+struct InstanceRecord
+{
+    vec4 centerRadius;
+    uvec4 meshMaterial;
+    uvec4 visibilityLayer;
+};
+layout(std430, set = 0, binding = 5) readonly buffer Instances
+{
+    InstanceRecord instances[];
+};
+
+struct MaterialRecord
+{
+    vec4 baseColorFactor;
+    vec4 emissiveAlphaCutoff;
+    vec4 metallicRoughnessOcclusionNormal;
+    uvec4 textureIndices;
+    uvec4 textureState;
+};
+layout(std430, set = 0, binding = 6) readonly buffer Materials
+{
+    MaterialRecord materials[];
+};
+layout(std430, set = 0, binding = 8) readonly buffer RayGeometries
+{
+    uvec4 rayGeometryRanges[];
+};
+layout(set = 1, binding = 0) uniform sampler2D materialTextures[];
+
+hitAttributeEXT vec2 hitBarycentrics;
+
+const uint BASE_COLOR_TEXTURE_BIT = 1u << 0u;
+const uint ALPHA_MASK_MATERIAL_BIT = 1u << 0u;
+
+vec2 vertexUv(uint vertexIndex, bool useUv1)
+{
+    uint firstComponent = vertexIndex * 14u + (useUv1 ? 12u : 6u);
+    return vec2(vertexData[firstComponent], vertexData[firstComponent + 1u]);
+}
+
+void main()
+{
+    InstanceRecord instance = instances[gl_InstanceCustomIndexEXT];
+    MaterialRecord material = materials[instance.meshMaterial.y];
+    if ((material.textureState.z & ALPHA_MASK_MATERIAL_BIT) == 0u) {
+        return;
+    }
+
+    float alpha = material.baseColorFactor.a;
+    if ((material.textureState.y & BASE_COLOR_TEXTURE_BIT) != 0u) {
+        uvec4 geometry = rayGeometryRanges[instance.meshMaterial.x];
+        uint triangleFirstIndex = geometry.x + gl_PrimitiveID * 3u;
+        uvec3 triangle =
+            uvec3(indices[triangleFirstIndex], indices[triangleFirstIndex + 1u],
+                  indices[triangleFirstIndex + 2u]) + geometry.y;
+        vec3 weights = vec3(1.0 - hitBarycentrics.x - hitBarycentrics.y,
+                            hitBarycentrics);
+        bool useUv1 = (material.textureState.w & BASE_COLOR_TEXTURE_BIT) != 0u;
+        vec2 uv = vertexUv(triangle.x, useUv1) * weights.x +
+                  vertexUv(triangle.y, useUv1) * weights.y +
+                  vertexUv(triangle.z, useUv1) * weights.z;
+        // Candidate rays do not have screen-space derivatives. Base-level
+        // alpha is deterministic; ray-cone alpha LOD is a later quality pass.
+        alpha *= textureLod(materialTextures[nonuniformEXT(material.textureIndices.x)],
+                            uv, 0.0).a;
+    }
+    if (alpha < material.emissiveAlphaCutoff.a) {
+        ignoreIntersectionEXT;
+    }
+}

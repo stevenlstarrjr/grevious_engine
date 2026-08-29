@@ -21,19 +21,26 @@ Window::Window(std::uint32_t width, std::uint32_t height, std::string_view title
         height > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("SDL window dimensions exceed the platform range");
     }
+#if defined(__linux__)
     if (!SDL_SetHintWithPriority(SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR, "1", SDL_HINT_OVERRIDE) ||
         !SDL_SetHintWithPriority(SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR, "1", SDL_HINT_OVERRIDE)) {
         throw sdlError("SDL Wayland decoration policy");
     }
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         throw sdlError("SDL_Init(video)");
     }
     const char* videoDriver = SDL_GetCurrentVideoDriver();
-    if (videoDriver == nullptr || std::string_view(videoDriver) != "wayland") {
+#if defined(_WIN32)
+    constexpr std::string_view requiredVideoDriver = "windows";
+#else
+    constexpr std::string_view requiredVideoDriver = "wayland";
+#endif
+    if (videoDriver == nullptr || std::string_view(videoDriver) != requiredVideoDriver) {
         const std::string selected = videoDriver == nullptr ? "none" : videoDriver;
         SDL_Quit();
-        throw std::runtime_error("Renderer requires SDL's Wayland video driver; selected: " +
-                                 selected);
+        throw std::runtime_error("Renderer requires SDL's " + std::string(requiredVideoDriver) +
+                                 " video driver; selected: " + selected);
     }
 
     const std::string ownedTitle(title);

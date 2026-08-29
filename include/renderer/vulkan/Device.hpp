@@ -1,5 +1,7 @@
 #pragma once
 
+#include "renderer/vulkan/HardwarePolicy.hpp"
+
 #include <volk.h>
 
 #include <cstdint>
@@ -33,7 +35,8 @@ struct OptionalCapabilities {
 
 class Device final {
   public:
-    explicit Device(const Instance& instance);
+    explicit Device(const Instance& instance,
+                    HardwarePolicy hardwarePolicy = HardwarePolicy::nvidiaRtx);
     ~Device();
 
     Device(const Device&) = delete;
@@ -42,6 +45,8 @@ class Device final {
     [[nodiscard]] VkPhysicalDevice physicalHandle() const { return physicalDevice_; }
     [[nodiscard]] VkInstance instanceHandle() const { return instanceHandle_; }
     [[nodiscard]] VkDevice handle() const { return device_; }
+    [[nodiscard]] HardwarePolicy hardwarePolicy() const { return hardwarePolicy_; }
+    [[nodiscard]] const VkPhysicalDeviceProperties& properties() const { return properties_; }
     [[nodiscard]] VkQueue graphicsQueue() const { return graphicsQueue_; }
     [[nodiscard]] VkQueue presentQueue() const { return presentQueue_; }
     [[nodiscard]] VkQueue computeQueue() const { return computeQueue_; }
@@ -58,6 +63,8 @@ class Device final {
     VkInstance instanceHandle_ = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
+    HardwarePolicy hardwarePolicy_ = HardwarePolicy::nvidiaRtx;
+    VkPhysicalDeviceProperties properties_{};
     QueueFamilies queueFamilies_{};
     OptionalCapabilities supportedOptionalCapabilities_{};
     OptionalCapabilities enabledOptionalCapabilities_{};

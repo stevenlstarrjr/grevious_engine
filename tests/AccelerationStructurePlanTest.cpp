@@ -46,8 +46,7 @@ void testFinestLodAndSharedInstances() {
         5U,
         renderer::gpu_scene::baseColorTextureBit |
             renderer::gpu_scene::metallicRoughnessTextureBit |
-            renderer::gpu_scene::normalTextureBit |
-            renderer::gpu_scene::occlusionTextureBit |
+            renderer::gpu_scene::normalTextureBit | renderer::gpu_scene::occlusionTextureBit |
             renderer::gpu_scene::emissiveTextureBit,
         0U,
         renderer::gpu_scene::normalTextureBit,
@@ -175,6 +174,8 @@ void testMaterialAndTransformFlags() {
             "alpha-tested material should be supported by ray-query shadows");
     require(!renderer::ray_tracing::supportsOpaquePathTracing(plan),
             "alpha-tested material must be rejected by the initial path tracer");
+    require(renderer::ray_tracing::supportsPathTracing(plan),
+            "alpha-tested material should be supported by path any-hit evaluation");
     require(plan.topLevelInstances[0].doubleSided, "double-sided state was not propagated");
     require(plan.topLevelInstances[0].mirrored, "mirrored transform state was not propagated");
     require(plan.topLevelInstances[0].renderLayerMask == (1ULL << 47U),
@@ -207,8 +208,8 @@ void testUnsupportedMaterialRequiresRasterFallback() {
         material.textureState.z = flag;
         const std::array<MaterialRecord, 1> materials{material};
         const renderer::ray_tracing::SceneBuildPlan plan =
-            renderer::ray_tracing::makeSceneBuildPlan(
-                3U, indices, primitives, primitiveLods, lodSources, instances, materials, 1U);
+            renderer::ray_tracing::makeSceneBuildPlan(3U, indices, primitives, primitiveLods,
+                                                      lodSources, instances, materials, 1U);
         require(plan.topLevelInstances[0].rayShadowMaterialMode ==
                     renderer::ray_tracing::RayShadowMaterialMode::unsupported,
                 "blended/additive material was not classified as unsupported");
@@ -216,6 +217,8 @@ void testUnsupportedMaterialRequiresRasterFallback() {
                 "blended/additive material must retain the raster shadow fallback");
         require(!renderer::ray_tracing::supportsOpaquePathTracing(plan),
                 "blended/additive material must be rejected by the initial path tracer");
+        require(!renderer::ray_tracing::supportsPathTracing(plan),
+                "blended/additive material must remain unsupported by path tracing");
     }
 }
 

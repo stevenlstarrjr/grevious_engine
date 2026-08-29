@@ -243,7 +243,7 @@ ShaderReflection reflectSpirv(std::span<const std::uint32_t> words) {
                 .binding = *id.binding,
                 .type = type,
                 .count = count,
-                .stages = reflection.stage,
+                .stages = static_cast<VkShaderStageFlags>(reflection.stage),
             });
         }
     }
@@ -270,10 +270,22 @@ ShaderModule::ShaderModule(const Device& device, const std::filesystem::path& pa
     if (!input) {
         throw std::runtime_error("Unable to read SPIR-V shader: " + path.string());
     }
+    create(words);
+}
+
+ShaderModule::ShaderModule(const Device& device, std::span<const std::uint32_t> words)
+    : device_(device) {
+    create(words);
+}
+
+void ShaderModule::create(std::span<const std::uint32_t> words) {
+    if (words.empty()) {
+        throw std::runtime_error("Cannot create an empty SPIR-V shader module");
+    }
     reflection_ = reflectSpirv(words);
     const VkShaderModuleCreateInfo createInfo{
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = static_cast<std::size_t>(byteCount),
+        .codeSize = words.size_bytes(),
         .pCode = words.data(),
     };
     check(vkCreateShaderModule(device_.handle(), &createInfo, nullptr, &module_),

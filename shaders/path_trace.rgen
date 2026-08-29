@@ -33,7 +33,10 @@ layout(set = 0, binding = 2) uniform FrameData
 layout(push_constant) uniform PathTracePushConstants
 {
     uint sampleIndex;
-} pushConstants;
+    uint sampleInFrame;
+    uint samplesThisFrame;
+    uint fixedPrimarySample;
+} controls;
 
 layout(location = 0) rayPayloadEXT RadiancePayload payload;
 
@@ -48,8 +51,14 @@ void main()
     uvec2 pixel = gl_LaunchIDEXT.xy;
     uvec2 extent = gl_LaunchSizeEXT.xy;
     uint linearPixel = pixel.y * extent.x + pixel.x;
-    uint state = pathTraceHash(linearPixel ^ pathTraceHash(pushConstants.sampleIndex));
-    vec2 jitter = vec2(pathTraceRandom(state), pathTraceRandom(state));
+    uint state = pathTraceHash(linearPixel ^ pathTraceHash(controls.sampleIndex));
+    // Temporal path tracing keeps primary geometry at a fixed pixel center.
+    // Shifting either the projection or this sample would make accumulated
+    // radiance disagree with the current first-hit AOVs and cause shimmer.
+    // Native/spatial rendering retains stochastic progressive antialiasing.
+    vec2 jitter = controls.fixedPrimarySample != 0u
+        ? vec2(0.5)
+        : vec2(pathTraceRandom(state), pathTraceRandom(state));
     vec2 ndc = ((vec2(pixel) + jitter) / vec2(extent)) * 2.0 - 1.0;
     vec3 origin = frameData.cameraPositionExposure.xyz;
     vec3 direction = cameraRayDirection(ndc);
@@ -67,8 +76,9 @@ void main()
     payload.coneSpread = max(length(direction - directionX),
                              length(direction - directionY));
     payload.bouncePdf = 0.0;
+    payload.firstLobeHitDistance = 0.0;
     float sceneScale = max(frameData.shadowCascadeDepthRadii.w, 1.0);
-    traceRayEXT(sceneTlas, gl_RayFlagsOpaqueEXT, 0xff, 0, 2, 0,
+    traceRayEXT(sceneTlas, gl_RayFlagsNoneEXT, 0xff, 0, 2, 0,
                 origin, sceneScale * 1.0e-5, direction, 1.0e27, 0);
 
     vec3 sampleColor = payload.radiance;
@@ -76,9 +86,11 @@ void main()
         sampleColor = vec3(0.0);
     }
     vec3 accumulated = sampleColor;
-    if (pushConstants.sampleIndex > 0u) {
+    // fixedPrimarySample == 2 is the DLSS Ray Reconstruction mode: preserve
+    // frame-varying random seeds while presenting only this frame's noisy sample.
+    if (controls.fixedPrimarySample < 2u && controls.sampleIndex > 0u) {
         vec3 previous = imageLoad(accumulationImage, ivec2(pixel)).rgb;
-        float count = float(pushConstants.sampleIndex);
+        float count = float(controls.sampleIndex);
         accumulated = (previous * count + sampleColor) / (count + 1.0);
     }
     imageStore(accumulationImage, ivec2(pixel), vec4(max(accumulated, vec3(0.0)), 1.0));

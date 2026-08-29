@@ -242,7 +242,8 @@ GraphicsPipeline::~GraphicsPipeline() {
 ComputePipeline::ComputePipeline(const Device& device, const ComputePipelineCreateInfo& createInfo)
     : device_(device) {
     if (createInfo.shader == nullptr ||
-        createInfo.shader->reflection().stage != VK_SHADER_STAGE_COMPUTE_BIT) {
+        createInfo.shader->reflection().stage != VK_SHADER_STAGE_COMPUTE_BIT ||
+        createInfo.entryPoint == nullptr || createInfo.entryPoint[0] == '\0') {
         throw std::runtime_error("Compute pipeline requires a compute shader");
     }
     const VkPipelineLayoutCreateInfo layoutInfo{
@@ -261,7 +262,7 @@ ComputePipeline::ComputePipeline(const Device& device, const ComputePipelineCrea
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                 .module = createInfo.shader->handle(),
-                .pName = "main",
+                .pName = createInfo.entryPoint,
             },
         .layout = layout_,
     };
@@ -292,17 +293,26 @@ RayTracingPipeline::RayTracingPipeline(const Device& device, MemoryAllocator& al
         createInfo.closestHitShaders.empty() || createInfo.maxRecursionDepth == 0) {
         throw std::runtime_error("Ray-tracing pipeline create info is incomplete");
     }
-    if (createInfo.rayGenerationShader->reflection().stage !=
-        VK_SHADER_STAGE_RAYGEN_BIT_KHR) {
+    if (!createInfo.anyHitShaders.empty() &&
+        createInfo.anyHitShaders.size() != createInfo.closestHitShaders.size()) {
+        throw std::runtime_error("Ray-tracing any-hit groups do not match closest-hit groups");
+    }
+    if (createInfo.rayGenerationShader->reflection().stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR) {
         throw std::runtime_error("Ray-tracing pipeline requires a ray-generation shader");
     }
-    if (std::ranges::any_of(createInfo.missShaders, [](const ShaderModule* shader) {
-            return shader == nullptr ||
-                   shader->reflection().stage != VK_SHADER_STAGE_MISS_BIT_KHR;
-        }) ||
-        std::ranges::any_of(createInfo.closestHitShaders, [](const ShaderModule* shader) {
+    if (std::ranges::any_of(createInfo.missShaders,
+                            [](const ShaderModule* shader) {
+                                return shader == nullptr ||
+                                       shader->reflection().stage != VK_SHADER_STAGE_MISS_BIT_KHR;
+                            }) ||
+        std::ranges::any_of(createInfo.closestHitShaders,
+                            [](const ShaderModule* shader) {
+                                return shader != nullptr && shader->reflection().stage !=
+                                                                VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+                            }) ||
+        std::ranges::any_of(createInfo.anyHitShaders, [](const ShaderModule* shader) {
             return shader != nullptr &&
-                   shader->reflection().stage != VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+                   shader->reflection().stage != VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
         })) {
         throw std::runtime_error("Ray-tracing shader stage does not match its group");
     }
@@ -324,7 +334,8 @@ RayTracingPipeline::RayTracingPipeline(const Device& device, MemoryAllocator& al
           "vkCreatePipelineLayout(ray tracing)");
 
     std::vector<VkPipelineShaderStageCreateInfo> stages;
-    stages.reserve(1U + createInfo.missShaders.size() + createInfo.closestHitShaders.size());
+    stages.reserve(1U + createInfo.missShaders.size() + createInfo.closestHitShaders.size() +
+                   createInfo.anyHitShaders.size());
     const auto addStage = [&stages](const ShaderModule& shader, VkShaderStageFlagBits stage) {
         const std::uint32_t index = static_cast<std::uint32_t>(stages.size());
         stages.push_back({
@@ -353,16 +364,24 @@ RayTracingPipeline::RayTracingPipeline(const Device& device, MemoryAllocator& al
     for (const ShaderModule* shader : createInfo.missShaders) {
         addGeneralGroup(addStage(*shader, VK_SHADER_STAGE_MISS_BIT_KHR));
     }
-    for (const ShaderModule* shader : createInfo.closestHitShaders) {
-        const std::uint32_t shaderIndex =
-            shader != nullptr ? addStage(*shader, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR)
-                              : VK_SHADER_UNUSED_KHR;
+    for (std::size_t groupIndex = 0U; groupIndex < createInfo.closestHitShaders.size();
+         ++groupIndex) {
+        const ShaderModule* closestHitShader = createInfo.closestHitShaders[groupIndex];
+        const ShaderModule* anyHitShader =
+            createInfo.anyHitShaders.empty() ? nullptr : createInfo.anyHitShaders[groupIndex];
+        const std::uint32_t closestHitShaderIndex =
+            closestHitShader != nullptr
+                ? addStage(*closestHitShader, VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR)
+                : VK_SHADER_UNUSED_KHR;
+        const std::uint32_t anyHitShaderIndex =
+            anyHitShader != nullptr ? addStage(*anyHitShader, VK_SHADER_STAGE_ANY_HIT_BIT_KHR)
+                                    : VK_SHADER_UNUSED_KHR;
         groups.push_back({
             .sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR,
             .type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR,
             .generalShader = VK_SHADER_UNUSED_KHR,
-            .closestHitShader = shaderIndex,
-            .anyHitShader = VK_SHADER_UNUSED_KHR,
+            .closestHitShader = closestHitShaderIndex,
+            .anyHitShader = anyHitShaderIndex,
             .intersectionShader = VK_SHADER_UNUSED_KHR,
         });
     }
@@ -382,7 +401,8 @@ RayTracingPipeline::RayTracingPipeline(const Device& device, MemoryAllocator& al
               "vkCreateRayTracingPipelinesKHR");
 
         const VkDeviceSize handleSize = capabilities.shaderGroupHandleSize;
-        const VkDeviceSize recordStride = alignUp(handleSize, capabilities.shaderGroupHandleAlignment);
+        const VkDeviceSize recordStride =
+            alignUp(handleSize, capabilities.shaderGroupHandleAlignment);
         if (recordStride > capabilities.maxShaderGroupStride) {
             throw std::runtime_error("Aligned shader-group record exceeds the device stride limit");
         }
@@ -394,15 +414,15 @@ RayTracingPipeline::RayTracingPipeline(const Device& device, MemoryAllocator& al
         const VkDeviceSize hitSize = recordStride * createInfo.closestHitShaders.size();
         const VkDeviceSize tableSize = hitOffset + hitSize;
 
-        shaderBindingTable_ = std::make_unique<Buffer>(
-            device_, allocator,
-            BufferCreateInfo{
-                .size = tableSize,
-                .usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
-                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                .requiredMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                .preferredMemory = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            });
+        shaderBindingTable_ =
+            std::make_unique<Buffer>(device_, allocator,
+                                     BufferCreateInfo{
+                                         .size = tableSize,
+                                         .usage = VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
+                                                  VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                         .requiredMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                         .preferredMemory = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                     });
         std::vector<std::byte> handles(handleSize * groups.size());
         check(vkGetRayTracingShaderGroupHandlesKHR(device_.handle(), pipeline_, 0,
                                                    static_cast<std::uint32_t>(groups.size()),

@@ -19,7 +19,7 @@ class Swapchain final {
     Swapchain(const Swapchain&) = delete;
     Swapchain& operator=(const Swapchain&) = delete;
 
-    void recreate(std::uint32_t width, std::uint32_t height);
+    [[nodiscard]] bool recreate(std::uint32_t width, std::uint32_t height);
     [[nodiscard]] VkResult acquire(VkSemaphore semaphore, std::uint32_t& imageIndex) const;
 
     [[nodiscard]] VkSwapchainKHR handle() const { return swapchain_; }
@@ -32,7 +32,8 @@ class Swapchain final {
     [[nodiscard]] VkImageView imageView(std::uint32_t index) const { return views_.at(index); }
 
   private:
-    void create(std::uint32_t width, std::uint32_t height, VkSwapchainKHR oldSwapchain);
+    [[nodiscard]] bool create(std::uint32_t width, std::uint32_t height,
+                              VkSwapchainKHR oldSwapchain);
     void destroyViews();
 
     const Instance& instance_;

@@ -71,14 +71,15 @@ resolveInstanceTransform3x4(const TlasInstancePlan& instance,
 
 // Vulkan exposes only an 8-bit instance mask. Resolve the renderer's complete
 // 64-bit layer intersection first, then use Vulkan's mask as a binary gate.
-[[nodiscard]] constexpr std::uint8_t
-resolveInstanceVisibilityMask(const TlasInstancePlan& instance, RenderLayerMask viewMask) {
+[[nodiscard]] constexpr std::uint8_t resolveInstanceVisibilityMask(const TlasInstancePlan& instance,
+                                                                   RenderLayerMask viewMask) {
     return renderLayersIntersect(instance.renderLayerMask, viewMask) ? defaultRayVisibilityMask
                                                                      : std::uint8_t{0};
 }
 
 [[nodiscard]] bool supportsRayQueryShadows(const SceneBuildPlan& plan);
 [[nodiscard]] bool supportsOpaquePathTracing(const SceneBuildPlan& plan);
+[[nodiscard]] bool supportsPathTracing(const SceneBuildPlan& plan);
 
 // The current static foundation selects the finest resident LOD for each
 // primitive group. This is intentionally a planner boundary: later GPU-driven

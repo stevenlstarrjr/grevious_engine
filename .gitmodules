@@ -40,3 +40,6 @@
 [submodule "reference/pbrt-v4-scenes"]
 	path = reference/pbrt-v4-scenes
 	url = https://github.com/mmp/pbrt-v4-scenes.git
+[submodule "thirdparty/NRD"]
+	path = thirdparty/NRD
+	url = https://github.com/NVIDIA-RTX/NRD.git

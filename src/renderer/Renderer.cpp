@@ -1,5 +1,12 @@
 #include "renderer/renderer/Renderer.hpp"
 
+#if RENDERER_ENABLE_NRD
+#include "renderer/nvidia/NrdVulkanDenoiser.hpp"
+#endif
+#if RENDERER_ENABLE_STREAMLINE
+#include "renderer/nvidia/StreamlineRuntime.hpp"
+#endif
+
 #include "renderer/assets/GltfImporter.hpp"
 #include "renderer/assets/ImageDecoder.hpp"
 #include "renderer/assets/ImageWriter.hpp"
@@ -21,11 +28,12 @@
 #include "renderer/vulkan/UploadContext.hpp"
 #include "renderer/vulkan/VulkanError.hpp"
 
+#include <glm/common.hpp>
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/ext/matrix_transform.hpp>
-#include <glm/common.hpp>
 #include <glm/geometric.hpp>
 #include <glm/gtc/packing.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <glm/matrix.hpp>
 
 #include <algorithm>
@@ -53,7 +61,52 @@ namespace {
 constexpr VkFormat iblColorFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
 constexpr VkFormat brdfLutFormat = VK_FORMAT_R32G32_SFLOAT;
 constexpr VkFormat hiZFormat = VK_FORMAT_R32_SFLOAT;
+constexpr VkFormat nrdNormalRoughnessFormat = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
 constexpr bool rayQueryShadowBackendImplemented = true;
+
+#if RENDERER_ENABLE_STREAMLINE
+std::array<float, 16> streamlineMatrix(const glm::mat4& value) {
+    std::array<float, 16> result{};
+    for (std::size_t row = 0U; row < 4U; ++row) {
+        for (std::size_t column = 0U; column < 4U; ++column) {
+            result[row * 4U + column] = value[column][row];
+        }
+    }
+    return result;
+}
+
+nvidia::StreamlineImage streamlineImage(const vulkan::Image& image, VkImageView view,
+                                         VkImageLayout layout) {
+    const VkExtent3D extent = image.extent();
+    return {
+        .image = image.handle(),
+        .memory = image.memory(),
+        .view = view,
+        .layout = layout,
+        .extent = {extent.width, extent.height},
+        .format = image.format(),
+        .mipLevels = image.mipLevels(),
+        .arrayLayers = image.arrayLayers(),
+        .flags = image.flags(),
+        .usage = image.usage(),
+    };
+}
+
+nvidia::DlssQuality streamlineQuality(upscaling::QualityMode quality) {
+    switch (quality) {
+    case upscaling::QualityMode::quality:
+        return nvidia::DlssQuality::quality;
+    case upscaling::QualityMode::balanced:
+        return nvidia::DlssQuality::balanced;
+    case upscaling::QualityMode::performance:
+        return nvidia::DlssQuality::performance;
+    case upscaling::QualityMode::native:
+    case upscaling::QualityMode::custom:
+        break;
+    }
+    throw std::runtime_error("DLSS requires a named NVIDIA quality mode");
+}
+#endif
 
 std::string_view pathDebugViewName(PathDebugView view) {
     switch (view) {
@@ -303,7 +356,7 @@ CpuScenePayload makeAlphaShadowScenePayload() {
 }
 
 CpuScenePayload makeProceduralScenePayload(bool emissiveSphereDemo, bool directionalShadowDemo,
-                                           bool alphaShadowDemo) {
+                                           bool hdriBackdropDemo, bool alphaShadowDemo) {
     if (alphaShadowDemo) {
         return makeAlphaShadowScenePayload();
     }
@@ -365,7 +418,7 @@ CpuScenePayload makeProceduralScenePayload(bool emissiveSphereDemo, bool directi
         gpu_scene::LodSourceRecord{.primitiveIndex = 0U, .minimumProjectedDiameter = 96.0F},
         gpu_scene::LodSourceRecord{.primitiveIndex = 1U, .minimumProjectedDiameter = 0.0F},
     };
-    if (directionalShadowDemo || emissiveSphereDemo) {
+    if (directionalShadowDemo || hdriBackdropDemo || emissiveSphereDemo) {
         const std::uint32_t planeFirstIndex = static_cast<std::uint32_t>(indices.size());
         const std::int32_t planeVertexOffset = static_cast<std::int32_t>(vertices.size());
         constexpr std::array<glm::vec3, 4> planePositions{
@@ -416,18 +469,24 @@ CpuScenePayload makeProceduralScenePayload(bool emissiveSphereDemo, bool directi
         .lodSources = std::move(lodSources),
         .label = emissiveSphereDemo
                      ? "procedural HDR emissive sphere"
-                     : (directionalShadowDemo ? "procedural directional-shadow demo"
-                                              : "procedural PBRT-checked sphere grid"),
+                     : (directionalShadowDemo
+                            ? "procedural directional-shadow demo"
+                            : (hdriBackdropDemo ? "procedural HDRI backdrop demo"
+                                                : "procedural PBRT-checked sphere grid")),
     };
     payload.meshletWork = gpu_scene::makeMeshletWorkRecords(hierarchy.primitiveLods, hierarchy.lods,
                                                             hierarchy.meshlets, payload.instances);
     return payload;
 }
 
-CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath) {
-    scene::Scene source = assets::importGltf(scenePath);
-    enum class TextureUsage : std::uint8_t { unused, linearData, srgbColor, normal };
-    std::vector<TextureUsage> usages(source.textures().size(), TextureUsage::unused);
+CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath,
+                                     bool allowAnimationStaticPose) {
+    assets::GltfImportOptions importOptions;
+    importOptions.allowAnimationStaticPose = allowAnimationStaticPose;
+    scene::Scene source = assets::importGltf(scenePath, importOptions);
+    enum class TextureUsage : std::uint8_t { linearData, srgbColor, normal, count };
+    constexpr std::size_t textureUsageCount = static_cast<std::size_t>(TextureUsage::count);
+    std::vector<std::array<bool, textureUsageCount>> usages(source.textures().size());
     const auto markTexture = [&](const scene::TextureBinding& binding, TextureUsage usage) {
         if (!binding.texture.valid()) {
             return;
@@ -436,11 +495,7 @@ CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath) {
         if (index >= usages.size()) {
             throw std::runtime_error("glTF material references an invalid texture");
         }
-        if (usages[index] != TextureUsage::unused && usages[index] != usage) {
-            throw std::runtime_error(
-                "One glTF texture is shared by incompatible color, data, or normal slots");
-        }
-        usages[index] = usage;
+        usages[index][static_cast<std::size_t>(usage)] = true;
     };
     for (const scene::Material& material : source.materials()) {
         markTexture(material.baseColorTexture, TextureUsage::srgbColor);
@@ -450,39 +505,67 @@ CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath) {
         markTexture(material.occlusionTexture, TextureUsage::linearData);
     }
 
-    std::vector<std::uint32_t> textureDescriptors(source.textures().size(),
-                                                  gpu_scene::invalidTextureDescriptor);
+    std::array<std::vector<std::uint32_t>, textureUsageCount> textureDescriptors;
+    for (std::vector<std::uint32_t>& descriptors : textureDescriptors) {
+        descriptors.assign(source.textures().size(), gpu_scene::invalidTextureDescriptor);
+    }
     std::vector<CpuScenePayload::Texture> textures;
-    textures.reserve(source.textures().size());
+    textures.reserve(std::min(source.textures().size() * textureUsageCount,
+                              static_cast<std::size_t>(maximumBindlessTextureCount - 1U)));
     for (std::size_t textureIndex = 0; textureIndex < source.textures().size(); ++textureIndex) {
-        if (usages[textureIndex] == TextureUsage::unused) {
-            continue;
-        }
         const scene::Texture& texture = source.textures()[textureIndex];
         const scene::Image& image = source.image(texture.image);
-        if (image.encodedData.empty()) {
-            throw std::runtime_error("glTF importer did not materialize texture image data");
+        for (std::size_t usageIndex = 0U; usageIndex < textureUsageCount; ++usageIndex) {
+            if (!usages[textureIndex][usageIndex]) {
+                continue;
+            }
+            if (image.encodedData.empty()) {
+                throw std::runtime_error("glTF importer did not materialize texture image data");
+            }
+            if (textures.size() + 1U >= maximumBindlessTextureCount) {
+                throw std::runtime_error("glTF scene exceeds the " +
+                                         std::to_string(maximumBindlessTextureCount - 1U) +
+                                         " usage-specific material-texture limit");
+            }
+            const TextureUsage usage = static_cast<TextureUsage>(usageIndex);
+            textureDescriptors[usageIndex][textureIndex] =
+                static_cast<std::uint32_t>(textures.size() + 1U);
+            assets::DecodedImage decoded =
+                assets::decodeImage(image.encodedData, usage == TextureUsage::srgbColor
+                                                           ? assets::ImageColorSpace::srgb
+                                                           : assets::ImageColorSpace::linear);
+            const std::string baseLabel =
+                !texture.name.empty() ? texture.name
+                                      : (!image.name.empty() ? image.name : image.sourceUri);
+            const std::string usageLabel = usage == TextureUsage::srgbColor ? " [sRGB]"
+                                           : usage == TextureUsage::normal  ? " [normal]"
+                                                                            : " [linear]";
+            textures.push_back({
+                .mips = assets::generateMipChain(std::move(decoded),
+                                                 usage == TextureUsage::normal
+                                                     ? assets::ImageMipSemantic::tangentSpaceNormal
+                                                     : assets::ImageMipSemantic::colorOrData),
+                .sampler =
+                    texture.sampler.valid() ? source.sampler(texture.sampler) : scene::Sampler{},
+                .label = baseLabel + usageLabel,
+            });
         }
-        if (textures.size() + 1U >= 64U) {
-            throw std::runtime_error("glTF scene exceeds the 63 resident material-texture limit");
-        }
-        textureDescriptors[textureIndex] = static_cast<std::uint32_t>(textures.size() + 1U);
-        assets::DecodedImage decoded =
-            assets::decodeImage(image.encodedData, usages[textureIndex] == TextureUsage::srgbColor
-                                                       ? assets::ImageColorSpace::srgb
-                                                       : assets::ImageColorSpace::linear);
-        textures.push_back({
-            .mips = assets::generateMipChain(std::move(decoded),
-                                             usages[textureIndex] == TextureUsage::normal
-                                                 ? assets::ImageMipSemantic::tangentSpaceNormal
-                                                 : assets::ImageMipSemantic::colorOrData),
-            .sampler = texture.sampler.valid() ? source.sampler(texture.sampler) : scene::Sampler{},
-            .label = !texture.name.empty() ? texture.name
-                                           : (!image.name.empty() ? image.name : image.sourceUri),
-        });
     }
 
-    gpu_scene::PackedScene packed = gpu_scene::packScene(source, textureDescriptors);
+    const auto& linearDescriptors =
+        textureDescriptors[static_cast<std::size_t>(TextureUsage::linearData)];
+    const auto& srgbDescriptors =
+        textureDescriptors[static_cast<std::size_t>(TextureUsage::srgbColor)];
+    const auto& normalDescriptors =
+        textureDescriptors[static_cast<std::size_t>(TextureUsage::normal)];
+    gpu_scene::PackedScene packed =
+        gpu_scene::packScene(source, gpu_scene::MaterialTextureDescriptorTable{
+                                         .baseColor = srgbDescriptors,
+                                         .metallicRoughness = linearDescriptors,
+                                         .normal = normalDescriptors,
+                                         .occlusion = linearDescriptors,
+                                         .emissive = srgbDescriptors,
+                                     });
     CpuScenePayload payload{
         .vertices = std::move(packed.vertices),
         .indices = std::move(packed.indices),
@@ -569,39 +652,68 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
           .qualityMode = config_.upscalingQualityMode,
           .customRenderScale = config_.upscalingRenderScale,
       })),
+      streamlineRuntime_(config_.streamlineRuntime),
       mainView_(config_.view),
       swapchain_(createInitialSwapchain(instance, device, window, !config_.capturePath.empty())),
       memoryAllocator_(device), pipelineCache_(device, RENDERER_PIPELINE_CACHE_PATH),
       uploadContext_(device, memoryAllocator_),
       environmentRotationRadians_(config_.environmentRotationRadians) {
     try {
+        if (config_.hdriBackdropDemo) {
+            config_.shadowsEnabled = false;
+            core::log(core::LogLevel::info,
+                      "HDRI backdrop mode: procedural sun, point light, and directional "
+                      "shadows disabled");
+        }
         if (pathTracingEnabled()) {
             if (config_.rayTracingRequest == ray_tracing::Request::disabled) {
                 throw std::runtime_error(
                     "Path tracing cannot run with the ray-tracing foundation disabled");
             }
-            if (config_.pathMaxBounces == 0U ||
-                config_.pathMaxBounces > maximumPathBounceCount) {
+            if (config_.pathMaxBounces == 0U || config_.pathMaxBounces > maximumPathBounceCount) {
+                throw std::runtime_error("Path tracing requires a maximum bounce count in [1, " +
+                                         std::to_string(maximumPathBounceCount) + "]");
+            }
+            if (config_.pathInteractiveSamples == 0U ||
+                config_.pathInteractiveSamples > maximumPathInteractiveSampleCount) {
                 throw std::runtime_error(
-                    "Path tracing requires a maximum bounce count in [1, " +
-                    std::to_string(maximumPathBounceCount) + "]");
+                    "Path tracing requires an interactive sample count in [1, " +
+                    std::to_string(maximumPathInteractiveSampleCount) + "]");
             }
             config_.taaEnabled = false;
             config_.bloomEnabled = false;
             config_.occlusionCullingEnabled = false;
+            if (rayReconstructionEnabled()) {
+                core::log(core::LogLevel::info,
+                          "Render mode: realtime noisy path tracing (raster TAA, bloom, Hi-Z, "
+                          "local temporal filtering, and NRD disabled; one fresh sample per "
+                          "frame feeds NVIDIA DLSS Ray Reconstruction)");
+            } else {
+                core::log(core::LogLevel::info,
+                          "Render mode: interactive progressive path tracing (raster TAA, bloom, "
+                          "and Hi-Z culling disabled; path history validation, motion-stabilized "
+                          "denoised feedback, ",
+                          config_.pathInteractiveSamples,
+                          " fresh sample(s) on motion, variance-guided multi-scale denoising, and "
+#if RENDERER_ENABLE_NRD
+                          "NVIDIA NRD RELAX enabled)");
+#else
+                          "the portable denoiser enabled)");
+#endif
+            }
             core::log(core::LogLevel::info,
-                      "Render mode: progressive path tracing (raster TAA, bloom, and Hi-Z "
-                      "culling disabled; path history validation and temporal radiance "
-                      "reconstruction plus AOV-guided spatial denoising enabled)");
-            core::log(core::LogLevel::info, "Path reconstruction view: ",
-                      pathDebugViewName(config_.pathDebugView));
+                      "Path reconstruction view: ", pathDebugViewName(config_.pathDebugView));
         } else {
             core::log(core::LogLevel::info, "Render mode: rasterized");
         }
-        if (temporalUpscalingEnabled() && config_.taaEnabled) {
+        if (dlssUpscalingEnabled() && streamlineRuntime_ == nullptr) {
+            throw std::runtime_error(
+                "DLSS upscaling requires an initialized NVIDIA Streamline runtime");
+        }
+        if ((temporalUpscalingEnabled() || dlssUpscalingEnabled()) && config_.taaEnabled) {
             config_.taaEnabled = false;
             core::log(core::LogLevel::info,
-                      "Raster TAA bypassed because the temporal upscaler owns output history");
+                      "Raster TAA bypassed because the selected upscaler owns output history");
         }
         if (!config_.capturePath.empty() && config_.captureFrame == 0) {
             throw std::runtime_error("Capture frame must be greater than zero");
@@ -617,46 +729,50 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
             config_.bloomRadius < 0.25F || config_.bloomRadius > 16.0F) {
             throw std::runtime_error("Bloom intensity or radius is outside the supported range");
         }
+        if (!std::isfinite(config_.filmGrainIntensity) || config_.filmGrainIntensity < 0.0F ||
+            config_.filmGrainIntensity > 0.1F) {
+            throw std::runtime_error("Film grain intensity is outside the supported range");
+        }
+        core::log(core::LogLevel::info, "Film grain: ",
+                  config_.filmGrainIntensity > 0.0F ? "enabled" : "disabled", "; intensity ",
+                  config_.filmGrainIntensity);
         const VkExtent2D initialRenderExtent = renderExtent();
         const VkExtent2D initialOutputExtent = swapchain_.extent();
         core::log(core::LogLevel::info, "Upscaler: ", upscaler_->name(), ", quality ",
                   upscaling::qualityModeName(upscaler_->qualityMode()), ", render ",
                   initialRenderExtent.width, "x", initialRenderExtent.height, " -> output ",
-                  initialOutputExtent.width, "x", initialOutputExtent.height,
-                  "; configured scale ", upscaler_->renderScale(),
-                  spatialUpscalingEnabled()
-                      ? "; spatial linear-HDR dispatch enabled"
-                  : temporalUpscalingEnabled()
-                      ? "; temporal linear-HDR reconstruction enabled"
-                      : "; identity dispatch skipped");
-        const upscaling::BackendCapabilities upscalingCapabilities =
-            upscaler_->capabilities();
-        core::log(core::LogLevel::info, "Upscaler capabilities: reconstruction=",
-                  upscaling::reconstructionTypeName(upscalingCapabilities.reconstruction),
-                  ", history=",
-                  upscaling::historyOwnershipName(upscalingCapabilities.historyOwnership),
-                  ", output=",
-                  upscaling::outputOwnershipName(upscalingCapabilities.outputOwnership),
-                  ", reactive-mask=", upscalingCapabilities.reactiveMask,
-                  ", sharpening=", upscalingCapabilities.sharpening,
-                  ", dynamic-resolution=", upscalingCapabilities.dynamicResolution);
-        const upscaling::InputConventions upscalingConventions =
-            upscaler_->inputConventions();
-        core::log(core::LogLevel::info, "Upscaler input conventions: color=",
-                  upscaling::colorConventionName(upscalingConventions.color), ", depth=",
-                  upscaling::depthConventionName(upscalingConventions.depth), ", motion=",
-                  upscaling::motionVectorConventionName(upscalingConventions.motionVectors),
-                  ", jitter=", upscaling::jitterConventionName(upscalingConventions.jitter),
-                  ", exposure=",
-                  upscaling::exposureConventionName(upscalingConventions.exposure),
-                  ", motion-excludes-jitter=", upscalingConventions.motionVectorsExcludeJitter);
+                  initialOutputExtent.width, "x", initialOutputExtent.height, "; configured scale ",
+                  upscaler_->renderScale(),
+                  spatialUpscalingEnabled()    ? "; spatial linear-HDR dispatch enabled"
+                  : temporalUpscalingEnabled() ? "; temporal linear-HDR reconstruction enabled"
+                  : dlssUpscalingEnabled()     ? (rayReconstructionEnabled()
+                                                       ? "; NVIDIA DLSS Ray Reconstruction enabled"
+                                                       : "; NVIDIA DLSS Super Resolution enabled")
+                                               : "; identity dispatch skipped");
+        const upscaling::BackendCapabilities upscalingCapabilities = upscaler_->capabilities();
+        core::log(
+            core::LogLevel::info, "Upscaler capabilities: reconstruction=",
+            upscaling::reconstructionTypeName(upscalingCapabilities.reconstruction),
+            ", history=", upscaling::historyOwnershipName(upscalingCapabilities.historyOwnership),
+            ", output=", upscaling::outputOwnershipName(upscalingCapabilities.outputOwnership),
+            ", reactive-mask=", upscalingCapabilities.reactiveMask,
+            ", sharpening=", upscalingCapabilities.sharpening,
+            ", dynamic-resolution=", upscalingCapabilities.dynamicResolution);
+        const upscaling::InputConventions upscalingConventions = upscaler_->inputConventions();
+        core::log(
+            core::LogLevel::info, "Upscaler input conventions: color=",
+            upscaling::colorConventionName(upscalingConventions.color),
+            ", depth=", upscaling::depthConventionName(upscalingConventions.depth),
+            ", motion=", upscaling::motionVectorConventionName(upscalingConventions.motionVectors),
+            ", jitter=", upscaling::jitterConventionName(upscalingConventions.jitter),
+            ", exposure=", upscaling::exposureConventionName(upscalingConventions.exposure),
+            ", motion-excludes-jitter=", upscalingConventions.motionVectorsExcludeJitter);
         const vulkan::OptionalCapabilities& optional = device_.optionalCapabilities();
         const std::uint32_t requiredPathRecursionDepth = config_.pathMaxBounces + 2U;
         if (pathTracingEnabled() &&
             (!optional.accelerationStructure || !optional.rayTracingPipeline ||
              optional.maxRayRecursionDepth < requiredPathRecursionDepth ||
-             vkCmdTraceRaysKHR == nullptr ||
-             vkCreateRayTracingPipelinesKHR == nullptr ||
+             vkCmdTraceRaysKHR == nullptr || vkCreateRayTracingPipelinesKHR == nullptr ||
              vkGetRayTracingShaderGroupHandlesKHR == nullptr)) {
             throw std::runtime_error(
                 "--render-mode path-traced requires acceleration structures, the Vulkan "
@@ -665,8 +781,7 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         }
         const ray_tracing::ShadowBackendSelection rayTracingSelection =
             ray_tracing::selectShadowBackend(
-                pathTracingEnabled() ? ray_tracing::Request::automatic
-                                     : config_.rayTracingRequest,
+                pathTracingEnabled() ? ray_tracing::Request::automatic : config_.rayTracingRequest,
                 {.accelerationStructure = optional.accelerationStructure,
                  .rayQuery = optional.rayQuery,
                  .rayTracingPipeline = optional.rayTracingPipeline},
@@ -679,8 +794,7 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         rayTracingShadowBackend_ = rayTracingSelection.backend;
         rayTracingSelectionReason_ = rayTracingSelection.reason;
         rayTracingFoundationEnabled_ =
-            (pathTracingEnabled() ||
-             config_.rayTracingRequest != ray_tracing::Request::disabled) &&
+            (pathTracingEnabled() || config_.rayTracingRequest != ray_tracing::Request::disabled) &&
             optional.accelerationStructure && (optional.rayQuery || optional.rayTracingPipeline);
         if (config_.rayTracingTransformScript != RayTracingTransformScript::none &&
             !rayTracingFoundationEnabled_) {
@@ -709,12 +823,20 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
             throw std::runtime_error(
                 "RGBA16F is unavailable for path-reconstruction storage and sampling");
         }
+#if RENDERER_ENABLE_NRD
+        if (pathTracingEnabled() &&
+            !supportsOptimalFormat(device_, nrdNormalRoughnessFormat,
+                                   VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+            throw std::runtime_error(
+                "RGB10_A2 UNORM is unavailable for NVIDIA NRD normal/roughness guides");
+        }
+#endif
         if (pathTracingEnabled() &&
             !supportsOptimalFormat(device_, pathMomentFormat_,
                                    VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
-            throw std::runtime_error(
-                "RG16F is unavailable for path-reconstruction moments");
+            throw std::runtime_error("RG16F is unavailable for path-reconstruction moments");
         }
         if (!supportsOptimalFormat(device_, motionFormat_,
                                    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
@@ -726,6 +848,13 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
                                    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
             throw std::runtime_error("R32F is unavailable for persistent temporal depth");
+        }
+        if (temporalUpscalingEnabled() &&
+            !supportsOptimalFormat(device_, reactiveMaskFormat_,
+                                   VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+            throw std::runtime_error(
+                "R8 UNORM is unavailable for temporal-upscaling reactive masks");
         }
         if (!supportsOptimalFormat(device_, hiZFormat,
                                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
@@ -751,6 +880,11 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
             updatePathHistoryDescriptors();
             updatePathReconstructionDescriptors();
             updatePathDenoisingDescriptors();
+#if RENDERER_ENABLE_NRD
+            if (!rayReconstructionEnabled()) {
+                updateNrdDescriptors();
+            }
+#endif
         } else {
             updateShadowDescriptor();
         }
@@ -774,6 +908,11 @@ Renderer::~Renderer() {
         }
         writeGpuTimingReport();
     }
+#if RENDERER_ENABLE_STREAMLINE
+    if (dlssUpscalingEnabled() && streamlineRuntime_ != nullptr) {
+        streamlineRuntime_->releaseDlssResources();
+    }
+#endif
     destroyFrameResources();
 }
 
@@ -789,11 +928,14 @@ VkExtent2D Renderer::renderExtent() const {
 
 void Renderer::drawFrame() {
     updateCamera();
-    const bool animatedPathScene =
-        pathTracingEnabled() &&
-        config_.rayTracingTransformScript != RayTracingTransformScript::none;
-    if (pathTracingEnabled() &&
-        (cameraMovedThisFrame_ || pathTracingResetPending_ || animatedPathScene)) {
+    const bool animatedPathScene = pathTracingEnabled() && config_.rayTracingTransformScript !=
+                                                               RayTracingTransformScript::none;
+    const bool interactivePathFrame =
+        pathTracingEnabled() && (cameraMovedThisFrame_ || animatedPathScene);
+    pathSamplesThisFrame_ = rayReconstructionEnabled()
+                                ? 1U
+                                : (interactivePathFrame ? config_.pathInteractiveSamples : 1U);
+    if (pathTracingEnabled() && (interactivePathFrame || pathTracingResetPending_)) {
         if (pathTracingImageInitialized_ || pathTracingSampleIndex_ > 0U) {
             ++pathTracingResetCount_;
         }
@@ -893,12 +1035,16 @@ void Renderer::drawFrame() {
     temporalState_.commitFrame();
     temporalImageLayoutsInitialized_ = config_.taaEnabled;
     upscalingHistoryLayoutsInitialized_ = temporalUpscalingEnabled();
+    dlssOutputLayoutInitialized_ = dlssUpscalingEnabled();
     if (pathTracingEnabled()) {
         pathTracingImageInitialized_ = true;
         pathHistoryLayoutsInitialized_ = true;
-        if (pathTracingSampleIndex_ < std::numeric_limits<std::uint32_t>::max()) {
-            ++pathTracingSampleIndex_;
-        }
+#if RENDERER_ENABLE_NRD
+        nrdExternalLayoutsInitialized_ = true;
+#endif
+        const std::uint32_t remainingSamples =
+            std::numeric_limits<std::uint32_t>::max() - pathTracingSampleIndex_;
+        pathTracingSampleIndex_ += std::min(pathSamplesThisFrame_, remainingSamples);
     }
 
     if (capture || exportAovs) {
@@ -957,8 +1103,7 @@ void Renderer::waitIdle() {
     }
     if (pathTracingEnabled() && !pathTracingReportWritten_) {
         core::log(core::LogLevel::info, "Path tracing accumulated ", pathTracingSampleIndex_,
-                  " sample(s) since the last reset across ", pathTracingResetCount_,
-                  " reset(s)");
+                  " sample(s) since the last reset across ", pathTracingResetCount_, " reset(s)");
         pathTracingReportWritten_ = true;
     }
 }
@@ -979,13 +1124,15 @@ void Renderer::writeGpuTimestamp(VkCommandBuffer commandBuffer, std::size_t fram
         stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     } else if (pass == GpuTimingPass::pathTracing) {
         stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-    } else if (pass == GpuTimingPass::pathHistory ||
-               pass == GpuTimingPass::pathReconstruction ||
-               pass == GpuTimingPass::pathDenoising) {
+    } else if (pass == GpuTimingPass::pathHistory || pass == GpuTimingPass::pathReconstruction ||
+               pass == GpuTimingPass::pathDenoising || pass == GpuTimingPass::nrdPrepare ||
+               pass == GpuTimingPass::nrdDenoising || pass == GpuTimingPass::nrdResolve) {
         stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     } else if (pass == GpuTimingPass::pathAovReadback) {
         stage = VK_PIPELINE_STAGE_2_COPY_BIT;
-    } else if (pass == GpuTimingPass::upscaling) {
+    } else if (pass == GpuTimingPass::upscaling && dlssUpscalingEnabled()) {
+        stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    } else if (pass == GpuTimingPass::reactiveMask || pass == GpuTimingPass::upscaling) {
         stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     }
     vkCmdWriteTimestamp2(commandBuffer, stage, timestampQueryPool_, query);
@@ -1024,20 +1171,26 @@ void Renderer::writeGpuTimingReport() {
         return;
     }
     timingReportWritten_ = true;
-    constexpr std::array names{"TLAS update",
-                               "directional shadow culling",
-                               "directional shadow map",
-                               "PBR geometry draw",
-                               "path tracing",
-                               "path history validation",
-                               "path temporal reconstruction",
-                               "path spatial denoising",
-                               "path AOV readback",
-                               "bloom extraction/downsample",
-                               "bloom horizontal blur",
-                               "bloom vertical blur",
-                               "upscaling",
-                               "composite/exposure/tone mapping"};
+    std::array<std::string_view, gpuTimingPassCount> names{
+        "TLAS update",
+        "directional shadow culling",
+        "directional shadow map",
+        "PBR geometry draw",
+        "path tracing",
+        "path history validation",
+        "path temporal reconstruction",
+        "path multi-scale denoising",
+        "NVIDIA NRD guide preparation",
+        "NVIDIA NRD RELAX denoising",
+        "NVIDIA NRD radiance resolve",
+        "path AOV readback",
+        "bloom extraction/downsample",
+        "bloom horizontal blur",
+        "bloom vertical blur",
+        "reactive-mask generation",
+        rayReconstructionEnabled() ? "NVIDIA DLSS Ray Reconstruction" : "upscaling",
+        "composite/exposure/tone mapping",
+    };
     static_assert(names.size() == gpuTimingPassCount);
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(device_.physicalHandle(), &properties);
@@ -1098,14 +1251,21 @@ void Renderer::writeGpuTimingReport() {
            << "Bloom: " << (config_.bloomEnabled ? "on" : "off") << '\n'
            << "Bloom intensity: " << config_.bloomIntensity << '\n'
            << "Bloom radius: " << config_.bloomRadius << '\n'
+           << "Film grain intensity: " << config_.filmGrainIntensity << '\n'
            << "Path environment sampling: "
            << (config_.pathEnvironmentImportanceSampling ? "importance" : "uniform") << '\n'
            << "Path emissive-triangle sampling: "
            << (pathTracingEnabled() && config_.pathEmissiveTriangleSampling ? "enabled"
                                                                             : "disabled")
            << '\n'
-           << "Path maximum bounces: "
-           << (pathTracingEnabled() ? config_.pathMaxBounces : 0U) << '\n'
+           << "Path maximum bounces: " << (pathTracingEnabled() ? config_.pathMaxBounces : 0U)
+           << '\n'
+           << "Path interactive samples: "
+           << (pathTracingEnabled() ? config_.pathInteractiveSamples : 0U) << '\n'
+           << "Path denoiser: "
+           << (rayReconstructionEnabled() ? "NVIDIA DLSS Ray Reconstruction"
+                                          : "NVIDIA NRD RELAX")
+           << '\n'
            << "Path-tracing accumulated samples: "
            << (pathTracingEnabled() ? pathTracingSampleIndex_ : 0U) << '\n';
     for (std::size_t index = 0; index < names.size(); ++index) {
@@ -1284,6 +1444,9 @@ void Renderer::createTemporalResources() {
 }
 
 void Renderer::createUpscalingHistoryResources() {
+    dlssOutputView_.reset();
+    dlssOutputImage_.reset();
+    dlssOutputLayoutInitialized_ = false;
     for (auto& view : upscalingHistoryColorViews_) {
         view.reset();
     }
@@ -1297,6 +1460,22 @@ void Renderer::createUpscalingHistoryResources() {
         image.reset();
     }
     upscalingHistoryLayoutsInitialized_ = false;
+    if (dlssUpscalingEnabled()) {
+        const VkExtent2D extent = swapchain_.extent();
+        dlssOutputImage_ = std::make_unique<vulkan::Image>(
+            device_, memoryAllocator_,
+            vulkan::ImageCreateInfo{
+                .extent = {extent.width, extent.height, 1U},
+                .format = hdrFormat_,
+                .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            });
+        dlssOutputView_ = std::make_unique<vulkan::ImageView>(device_, *dlssOutputImage_);
+        const double sizeMiB = static_cast<double>(extent.width) * extent.height * 8.0 /
+                               (1024.0 * 1024.0);
+        core::log(core::LogLevel::info, "DLSS output at ", extent.width, "x", extent.height,
+                  ": ", sizeMiB, " MiB persistent HDR storage");
+        return;
+    }
     if (!temporalUpscalingEnabled()) {
         return;
     }
@@ -1311,8 +1490,8 @@ void Renderer::createUpscalingHistoryResources() {
                 .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             });
-        upscalingHistoryColorViews_[index] = std::make_unique<vulkan::ImageView>(
-            device_, *upscalingHistoryColorImages_[index]);
+        upscalingHistoryColorViews_[index] =
+            std::make_unique<vulkan::ImageView>(device_, *upscalingHistoryColorImages_[index]);
         upscalingHistoryDepthImages_[index] = std::make_unique<vulkan::Image>(
             device_, memoryAllocator_,
             vulkan::ImageCreateInfo{
@@ -1321,8 +1500,8 @@ void Renderer::createUpscalingHistoryResources() {
                 .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             });
-        upscalingHistoryDepthViews_[index] = std::make_unique<vulkan::ImageView>(
-            device_, *upscalingHistoryDepthImages_[index]);
+        upscalingHistoryDepthViews_[index] =
+            std::make_unique<vulkan::ImageView>(device_, *upscalingHistoryDepthImages_[index]);
     }
 
     const std::uint64_t pixelCount = static_cast<std::uint64_t>(extent.width) * extent.height;
@@ -1330,17 +1509,42 @@ void Renderer::createUpscalingHistoryResources() {
     const std::uint64_t depthBytes = pixelCount * 4U * framesInFlight;
     constexpr double bytesPerMiB = 1024.0 * 1024.0;
     core::log(core::LogLevel::info, "Temporal upscaling history at ", extent.width, "x",
-              extent.height, ": HDR color ",
-              static_cast<double>(colorBytes) / bytesPerMiB, " MiB, depth ",
-              static_cast<double>(depthBytes) / bytesPerMiB, " MiB; persistent total ",
-              static_cast<double>(colorBytes + depthBytes) / bytesPerMiB, " MiB");
+              extent.height, ": HDR color ", static_cast<double>(colorBytes) / bytesPerMiB,
+              " MiB, depth ", static_cast<double>(depthBytes) / bytesPerMiB,
+              " MiB; persistent total ", static_cast<double>(colorBytes + depthBytes) / bytesPerMiB,
+              " MiB");
 }
 
 void Renderer::createPathTracingResources() {
+#if RENDERER_ENABLE_NRD
+    nrdDenoiser_.reset();
+#endif
+    nrdSpecularOutputView_.reset();
+    nrdSpecularOutputImage_.reset();
+    nrdDiffuseOutputView_.reset();
+    nrdDiffuseOutputImage_.reset();
+    nrdSpecularInputView_.reset();
+    nrdSpecularInputImage_.reset();
+    nrdMaterialView_.reset();
+    nrdMaterialImage_.reset();
+    nrdDiffuseInputView_.reset();
+    nrdDiffuseInputImage_.reset();
+    nrdViewZView_.reset();
+    nrdViewZImage_.reset();
+    nrdNormalRoughnessView_.reset();
+    nrdNormalRoughnessImage_.reset();
+    nrdMotionView_.reset();
+    nrdMotionImage_.reset();
     pathAovReadbackBuffer_.reset();
     pathAovReadbackOffsets_.fill(0U);
     pathDenoisedView_.reset();
     pathDenoisedImage_.reset();
+    for (std::size_t index = 0U; index < pathDenoisingDirectImages_.size(); ++index) {
+        pathDenoisingIndirectViews_[index].reset();
+        pathDenoisingIndirectImages_[index].reset();
+        pathDenoisingDirectViews_[index].reset();
+        pathDenoisingDirectImages_[index].reset();
+    }
     for (std::size_t index = 0; index < pathMomentImages_.size(); ++index) {
         pathMomentViews_[index].reset();
         pathMomentImages_[index].reset();
@@ -1359,6 +1563,14 @@ void Renderer::createPathTracingResources() {
     }
     pathTracingDepthView_.reset();
     pathTracingDepthImage_.reset();
+    rayReconstructionSpecularHitDistanceView_.reset();
+    rayReconstructionSpecularHitDistanceImage_.reset();
+    rayReconstructionNormalRoughnessView_.reset();
+    rayReconstructionNormalRoughnessImage_.reset();
+    rayReconstructionSpecularAlbedoView_.reset();
+    rayReconstructionSpecularAlbedoImage_.reset();
+    rayReconstructionDiffuseAlbedoView_.reset();
+    rayReconstructionDiffuseAlbedoImage_.reset();
     pathTracingMotionDepthView_.reset();
     pathTracingMotionDepthImage_.reset();
     pathTracingNormalView_.reset();
@@ -1372,6 +1584,7 @@ void Renderer::createPathTracingResources() {
     pathTracingSampleIndex_ = 0U;
     pathTracingImageInitialized_ = false;
     pathHistoryLayoutsInitialized_ = false;
+    nrdExternalLayoutsInitialized_ = false;
     pathTracingResetPending_ = false;
     if (!pathTracingEnabled()) {
         return;
@@ -1385,36 +1598,44 @@ void Renderer::createPathTracingResources() {
         vulkan::ImageCreateInfo{
             .extent = {extent.width, extent.height, 1U},
             .format = pathTracingFormat_,
-            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                     pathTransferUsage,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | pathTransferUsage,
         });
     pathTracingAccumulationView_ =
         std::make_unique<vulkan::ImageView>(device_, *pathTracingAccumulationImage_);
     const auto createPathImage = [this, extent, pathTransferUsage](VkFormat format) {
-        return std::make_unique<vulkan::Image>(
-            device_, memoryAllocator_,
-            vulkan::ImageCreateInfo{
-                .extent = {extent.width, extent.height, 1U},
-                .format = format,
-                .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                         pathTransferUsage,
-            });
+        return std::make_unique<vulkan::Image>(device_, memoryAllocator_,
+                                               vulkan::ImageCreateInfo{
+                                                   .extent = {extent.width, extent.height, 1U},
+                                                   .format = format,
+                                                   .usage = VK_IMAGE_USAGE_STORAGE_BIT |
+                                                            VK_IMAGE_USAGE_SAMPLED_BIT |
+                                                            pathTransferUsage,
+                                               });
     };
     pathTracingDirectImage_ = createPathImage(pathTracingFormat_);
-    pathTracingDirectView_ =
-        std::make_unique<vulkan::ImageView>(device_, *pathTracingDirectImage_);
+    pathTracingDirectView_ = std::make_unique<vulkan::ImageView>(device_, *pathTracingDirectImage_);
     pathTracingSurfaceImage_ = createPathImage(pathTracingAovFormat_);
     pathTracingSurfaceView_ =
         std::make_unique<vulkan::ImageView>(device_, *pathTracingSurfaceImage_);
     pathTracingNormalImage_ = createPathImage(pathTracingAovFormat_);
-    pathTracingNormalView_ =
-        std::make_unique<vulkan::ImageView>(device_, *pathTracingNormalImage_);
+    pathTracingNormalView_ = std::make_unique<vulkan::ImageView>(device_, *pathTracingNormalImage_);
     pathTracingMotionDepthImage_ = createPathImage(pathTracingFormat_);
     pathTracingMotionDepthView_ =
         std::make_unique<vulkan::ImageView>(device_, *pathTracingMotionDepthImage_);
     pathTracingDepthImage_ = createPathImage(temporalDepthFormat_);
-    pathTracingDepthView_ =
-        std::make_unique<vulkan::ImageView>(device_, *pathTracingDepthImage_);
+    pathTracingDepthView_ = std::make_unique<vulkan::ImageView>(device_, *pathTracingDepthImage_);
+    rayReconstructionDiffuseAlbedoImage_ = createPathImage(pathTracingAovFormat_);
+    rayReconstructionDiffuseAlbedoView_ = std::make_unique<vulkan::ImageView>(
+        device_, *rayReconstructionDiffuseAlbedoImage_);
+    rayReconstructionSpecularAlbedoImage_ = createPathImage(pathTracingAovFormat_);
+    rayReconstructionSpecularAlbedoView_ = std::make_unique<vulkan::ImageView>(
+        device_, *rayReconstructionSpecularAlbedoImage_);
+    rayReconstructionNormalRoughnessImage_ = createPathImage(pathTracingAovFormat_);
+    rayReconstructionNormalRoughnessView_ = std::make_unique<vulkan::ImageView>(
+        device_, *rayReconstructionNormalRoughnessImage_);
+    rayReconstructionSpecularHitDistanceImage_ = createPathImage(temporalDepthFormat_);
+    rayReconstructionSpecularHitDistanceView_ = std::make_unique<vulkan::ImageView>(
+        device_, *rayReconstructionSpecularHitDistanceImage_);
     for (std::size_t index = 0; index < pathHistoryNormalImages_.size(); ++index) {
         pathHistoryNormalImages_[index] = createPathImage(pathTracingAovFormat_);
         pathHistoryNormalViews_[index] =
@@ -1434,9 +1655,41 @@ void Renderer::createPathTracingResources() {
         pathMomentViews_[index] =
             std::make_unique<vulkan::ImageView>(device_, *pathMomentImages_[index]);
     }
+    for (std::size_t index = 0U; index < pathDenoisingDirectImages_.size(); ++index) {
+        pathDenoisingDirectImages_[index] = createPathImage(pathTracingAovFormat_);
+        pathDenoisingDirectViews_[index] =
+            std::make_unique<vulkan::ImageView>(device_, *pathDenoisingDirectImages_[index]);
+        pathDenoisingIndirectImages_[index] = createPathImage(pathTracingAovFormat_);
+        pathDenoisingIndirectViews_[index] =
+            std::make_unique<vulkan::ImageView>(device_, *pathDenoisingIndirectImages_[index]);
+    }
     pathDenoisedImage_ = createPathImage(pathTracingAovFormat_);
-    pathDenoisedView_ =
-        std::make_unique<vulkan::ImageView>(device_, *pathDenoisedImage_);
+    pathDenoisedView_ = std::make_unique<vulkan::ImageView>(device_, *pathDenoisedImage_);
+#if RENDERER_ENABLE_NRD
+    nrdDiffuseInputImage_ = createPathImage(pathTracingAovFormat_);
+    nrdDiffuseInputView_ =
+        std::make_unique<vulkan::ImageView>(device_, *nrdDiffuseInputImage_);
+    nrdSpecularInputImage_ = createPathImage(pathTracingAovFormat_);
+    nrdSpecularInputView_ =
+        std::make_unique<vulkan::ImageView>(device_, *nrdSpecularInputImage_);
+    nrdMaterialImage_ = createPathImage(pathTracingAovFormat_);
+    nrdMaterialView_ = std::make_unique<vulkan::ImageView>(device_, *nrdMaterialImage_);
+    if (!rayReconstructionEnabled()) {
+        nrdMotionImage_ = createPathImage(pathTracingAovFormat_);
+        nrdMotionView_ = std::make_unique<vulkan::ImageView>(device_, *nrdMotionImage_);
+        nrdNormalRoughnessImage_ = createPathImage(nrdNormalRoughnessFormat);
+        nrdNormalRoughnessView_ =
+            std::make_unique<vulkan::ImageView>(device_, *nrdNormalRoughnessImage_);
+        nrdViewZImage_ = createPathImage(temporalDepthFormat_);
+        nrdViewZView_ = std::make_unique<vulkan::ImageView>(device_, *nrdViewZImage_);
+        nrdDiffuseOutputImage_ = createPathImage(pathTracingAovFormat_);
+        nrdDiffuseOutputView_ =
+            std::make_unique<vulkan::ImageView>(device_, *nrdDiffuseOutputImage_);
+        nrdSpecularOutputImage_ = createPathImage(pathTracingAovFormat_);
+        nrdSpecularOutputView_ =
+            std::make_unique<vulkan::ImageView>(device_, *nrdSpecularOutputImage_);
+    }
+#endif
     constexpr double bytesPerMiB = 1024.0 * 1024.0;
     if (config_.aovFrameSink) {
         constexpr std::array<VkDeviceSize, pathAovReadbackTargetCount> bytesPerPixel{
@@ -1449,8 +1702,7 @@ void Renderer::createPathTracingResources() {
             readbackBytes = alignDeviceSize(readbackBytes, 16U);
             pathAovReadbackOffsets_[index] = readbackBytes;
             readbackBytes = addDeviceSize(
-                readbackBytes,
-                multiplyDeviceSize(readbackPixelCount, bytesPerPixel[index]));
+                readbackBytes, multiplyDeviceSize(readbackPixelCount, bytesPerPixel[index]));
         }
         pathAovReadbackBuffer_ = std::make_unique<vulkan::Buffer>(
             device_, memoryAllocator_,
@@ -1458,46 +1710,68 @@ void Renderer::createPathTracingResources() {
                 .size = readbackBytes,
                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 .requiredMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                .preferredMemory = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                .preferredMemory =
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
                 .randomHostAccess = true,
             });
         core::log(core::LogLevel::info, "Path AOV export staging at ", extent.width, "x",
                   extent.height, ": ", static_cast<double>(readbackBytes) / bytesPerMiB,
                   " MiB host-visible");
     }
-    const std::uint64_t pixelCount =
-        static_cast<std::uint64_t>(extent.width) * extent.height;
+    const std::uint64_t pixelCount = static_cast<std::uint64_t>(extent.width) * extent.height;
     const std::uint64_t radianceBytes = pixelCount * 4U * sizeof(float) * 2U;
     const std::uint64_t reconstructionBytes =
-        pixelCount * (5U * sizeof(float) + 2U * 4U * sizeof(std::uint16_t));
+        pixelCount * (6U * sizeof(float) + 5U * 4U * sizeof(std::uint16_t));
     const std::uint64_t historyBytes =
         pixelCount * (2U * 4U * sizeof(std::uint16_t) + 3U * sizeof(float));
-    const std::uint64_t temporalRadianceBytes =
-        pixelCount * 2U * 4U * sizeof(std::uint16_t);
-    const std::uint64_t momentBytes =
-        pixelCount * 2U * 2U * sizeof(std::uint16_t);
+    const std::uint64_t temporalRadianceBytes = pixelCount * 2U * 4U * sizeof(std::uint16_t);
+    const std::uint64_t momentBytes = pixelCount * 2U * 2U * sizeof(std::uint16_t);
     const std::uint64_t spatialRadianceBytes =
-        pixelCount * 4U * sizeof(std::uint16_t);
-    core::log(core::LogLevel::info, "Path-tracing radiance and reconstruction at ",
-              extent.width, "x", extent.height, ": ",
-              static_cast<double>(radianceBytes) / bytesPerMiB,
+        pixelCount * 4U * sizeof(std::uint16_t) *
+        (1U + 2U * static_cast<std::uint64_t>(pathDenoisingPassCount - 1U));
+#if RENDERER_ENABLE_NRD
+    const std::uint64_t nrdExternalBytes =
+        rayReconstructionEnabled()
+            ? pixelCount * (3U * 4U * sizeof(std::uint16_t))
+            : pixelCount *
+                  (6U * 4U * sizeof(std::uint16_t) + sizeof(std::uint32_t) + sizeof(float));
+#else
+    constexpr std::uint64_t nrdExternalBytes = 0U;
+#endif
+    core::log(core::LogLevel::info, "Path-tracing radiance and reconstruction at ", extent.width,
+              "x", extent.height, ": ", static_cast<double>(radianceBytes) / bytesPerMiB,
               " MiB accumulated RGBA32F radiance, ",
               static_cast<double>(reconstructionBytes) / bytesPerMiB,
               " MiB first-hit surface/normal/motion/depth AOVs, ",
               static_cast<double>(historyBytes) / bytesPerMiB,
               " MiB path history metadata/confidence, ",
               static_cast<double>(temporalRadianceBytes) / bytesPerMiB,
-              " MiB temporal radiance history, ",
-              static_cast<double>(momentBytes) / bytesPerMiB,
+              " MiB temporal radiance history, ", static_cast<double>(momentBytes) / bytesPerMiB,
               " MiB temporal luminance moments, ",
               static_cast<double>(spatialRadianceBytes) / bytesPerMiB,
-              " MiB spatially denoised radiance; persistent total ",
+              " MiB direct/indirect multi-scale denoising radiance, ",
+              static_cast<double>(nrdExternalBytes) / bytesPerMiB,
+              " MiB NVIDIA NRD external guides/signals; persistent total ",
               static_cast<double>(radianceBytes + reconstructionBytes + historyBytes +
-                                  temporalRadianceBytes + momentBytes +
-                                  spatialRadianceBytes) /
+                                  temporalRadianceBytes + momentBytes + spatialRadianceBytes +
+                                  nrdExternalBytes) /
                   bytesPerMiB,
               " MiB");
+#if RENDERER_ENABLE_NRD
+    if (!rayReconstructionEnabled()) {
+        nrdDenoiser_ = std::make_unique<nvidia::NrdVulkanDenoiser>(
+            device_, memoryAllocator_, extent, pipelineCache_.handle(),
+            static_cast<std::uint32_t>(framesInFlight),
+            nrd::Denoiser::RELAX_DIFFUSE_SPECULAR);
+        core::log(core::LogLevel::info, "NVIDIA NRD RELAX Vulkan backend at ", extent.width,
+                  "x", extent.height, ": ", nrdDenoiser_->pipelineCount(),
+                  " compute pipelines, ",
+                  static_cast<double>(nrdDenoiser_->permanentPoolBytes()) / bytesPerMiB,
+                  " MiB permanent pool, ",
+                  static_cast<double>(nrdDenoiser_->transientPoolBytes()) / bytesPerMiB,
+                  " MiB transient pool");
+    }
+#endif
 }
 
 void Renderer::destroyFrameResources() {
@@ -1527,11 +1801,15 @@ void Renderer::destroyFrameResources() {
 }
 
 void Renderer::createSceneResources() {
+    if (!config_.scenePath.empty() && config_.sceneAnimationStaticPose) {
+        core::log(core::LogLevel::info,
+                  "glTF animation policy: importing authored initial transforms as a static pose");
+    }
     CpuScenePayload scene =
         config_.scenePath.empty()
             ? makeProceduralScenePayload(config_.emissiveSphereDemo, config_.directionalShadowDemo,
-                                         config_.alphaShadowDemo)
-            : loadGltfScenePayload(config_.scenePath);
+                                         config_.hdriBackdropDemo, config_.alphaShadowDemo)
+            : loadGltfScenePayload(config_.scenePath, config_.sceneAnimationStaticPose);
     if (pathTracingEnabled() && scene.textures.empty()) {
         // The procedural PBR grid marks the renderer's fallback descriptor as a
         // base-color texture. Factor-only path shading deliberately bypasses it.
@@ -1543,9 +1821,8 @@ void Renderer::createSceneResources() {
     glm::uvec4 emissiveTriangleHeader{0U};
     if (pathTracingEnabled()) {
         emissiveTriangles = gpu_scene::buildEmissiveTriangleDistribution(
-            scene.vertices, scene.indices, scene.primitives, scene.primitiveLods,
-            scene.lodSources, scene.instances, scene.materials, scene.transforms,
-            mainView_.visibilityMask);
+            scene.vertices, scene.indices, scene.primitives, scene.primitiveLods, scene.lodSources,
+            scene.instances, scene.materials, scene.transforms, mainView_.visibilityMask);
         emissiveTriangleHeader.x =
             config_.pathEmissiveTriangleSampling
                 ? static_cast<std::uint32_t>(emissiveTriangles.triangles.size())
@@ -1576,22 +1853,54 @@ void Renderer::createSceneResources() {
     glm::vec3 minimum(std::numeric_limits<float>::infinity());
     glm::vec3 maximum(-std::numeric_limits<float>::infinity());
     for (const gpu_scene::InstanceRecord& instance : instances) {
-        const glm::vec3 center(instance.centerRadius);
         const float radius = instance.centerRadius.w;
         if (!std::isfinite(radius) || radius <= 0.0F) {
             throw std::runtime_error("GPU scene has an invalid instance bounding sphere");
         }
-        minimum = glm::min(minimum, center - glm::vec3(radius));
-        maximum = glm::max(maximum, center + glm::vec3(radius));
+        const std::uint32_t primitiveGroup = instance.meshMaterial.x;
+        const std::uint32_t transformIndex = instance.meshMaterial.z;
+        if (primitiveGroup >= scene.primitiveLods.size() || transformIndex >= transforms.size()) {
+            throw std::runtime_error("GPU scene bounds reference invalid primitive or transform");
+        }
+        const gpu_scene::PrimitiveLodRange lodRange = scene.primitiveLods[primitiveGroup];
+        if (lodRange.lodCount == 0U || lodRange.firstLod >= scene.lodSources.size()) {
+            throw std::runtime_error("GPU scene bounds reference an invalid LOD range");
+        }
+        const std::uint32_t primitiveIndex = scene.lodSources[lodRange.firstLod].primitiveIndex;
+        if (primitiveIndex >= scene.primitives.size()) {
+            throw std::runtime_error("GPU scene bounds reference an invalid primitive");
+        }
+        const gpu_scene::PrimitiveRecord& primitive = scene.primitives[primitiveIndex];
+        const std::uint64_t indexEnd =
+            static_cast<std::uint64_t>(primitive.firstIndex) + primitive.indexCount;
+        if (primitive.vertexOffset < 0 || indexEnd > indices.size()) {
+            throw std::runtime_error("GPU scene bounds reference invalid indexed geometry");
+        }
+        const glm::mat4& world = transforms[transformIndex].world;
+        for (std::uint32_t offset = 0U; offset < primitive.indexCount; ++offset) {
+            const std::uint64_t vertexIndex =
+                static_cast<std::uint64_t>(primitive.vertexOffset) +
+                indices[static_cast<std::size_t>(primitive.firstIndex) + offset];
+            if (vertexIndex >= vertices.size()) {
+                throw std::runtime_error("GPU scene bounds reference a vertex outside residency");
+            }
+            const glm::vec3 position = glm::vec3(
+                world * glm::vec4(vertices[static_cast<std::size_t>(vertexIndex)].position, 1.0F));
+            if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+                !std::isfinite(position.z)) {
+                throw std::runtime_error("GPU scene bounds contain a non-finite vertex");
+            }
+            minimum = glm::min(minimum, position);
+            maximum = glm::max(maximum, position);
+        }
     }
+    sceneMinimum_ = minimum;
+    sceneMaximum_ = maximum;
     sceneCenter_ = (minimum + maximum) * 0.5F;
-    sceneRadius_ = 0.0F;
-    for (const gpu_scene::InstanceRecord& instance : instances) {
-        sceneRadius_ =
-            std::max(sceneRadius_, glm::length(glm::vec3(instance.centerRadius) - sceneCenter_) +
-                                       instance.centerRadius.w);
-    }
-    sceneRadius_ = std::max(sceneRadius_, 1.0e-4F);
+    sceneRadius_ = std::max(glm::length((maximum - minimum) * 0.5F), 1.0e-4F);
+    core::log(core::LogLevel::info, "Exact scene bounds: center ", sceneCenter_.x, ", ",
+              sceneCenter_.y, ", ", sceneCenter_.z, "; extent ", maximum.x - minimum.x, ", ",
+              maximum.y - minimum.y, ", ", maximum.z - minimum.z);
     resetCamera();
     static_assert(sizeof(gpu_scene::DrawIndexedIndirectRecord) ==
                   sizeof(VkDrawIndexedIndirectCommand));
@@ -1660,15 +1969,14 @@ void Renderer::createSceneResources() {
             .queueFamilies = sharing,
         });
     if (pathTracingEnabled()) {
-        const VkDeviceSize lightBytes = sizeof(glm::uvec4) +
-                                        emissiveTriangles.triangles.size() *
-                                            sizeof(gpu_scene::EmissiveTriangleRecord);
+        const VkDeviceSize lightBytes =
+            sizeof(glm::uvec4) +
+            emissiveTriangles.triangles.size() * sizeof(gpu_scene::EmissiveTriangleRecord);
         emissiveTriangleBuffer_ = std::make_unique<vulkan::Buffer>(
             device_, memoryAllocator_,
             vulkan::BufferCreateInfo{
                 .size = lightBytes,
-                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 .queueFamilies = sharing,
             });
@@ -1822,24 +2130,22 @@ void Renderer::createSceneResources() {
     lighting::IblAssets ibl = lighting::bakeImageBasedLighting(std::move(environment));
     lighting::EnvironmentSamplingDistribution environmentSampling;
     if (pathTracingEnabled()) {
-        environmentSampling =
-            lighting::buildEnvironmentSamplingDistribution(ibl.environment);
+        environmentSampling = lighting::buildEnvironmentSamplingDistribution(ibl.environment);
         environmentSamplingBuffer_ = std::make_unique<vulkan::Buffer>(
             device_, memoryAllocator_,
             vulkan::BufferCreateInfo{
-                .size = environmentSampling.entries.size() *
-                        sizeof(lighting::EnvironmentAliasEntry),
-                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                .size =
+                    environmentSampling.entries.size() * sizeof(lighting::EnvironmentAliasEntry),
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 .queueFamilies = sharing,
             });
-        core::log(core::LogLevel::info, "Path-tracing environment sampler: ",
-                  environmentSampling.width, "x", environmentSampling.height, " alias table, ",
-                  environmentSamplingBuffer_->size(), " bytes; ",
-                  config_.pathEnvironmentImportanceSampling ? "solid-angle luminance"
-                                                            : "uniform-sphere",
-                  " sampling and power-heuristic MIS enabled");
+        core::log(
+            core::LogLevel::info, "Path-tracing environment sampler: ", environmentSampling.width,
+            "x", environmentSampling.height, " alias table, ", environmentSamplingBuffer_->size(),
+            " bytes; ",
+            config_.pathEnvironmentImportanceSampling ? "solid-angle luminance" : "uniform-sphere",
+            " sampling and power-heuristic MIS enabled");
     }
     const auto bakeMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       std::chrono::steady_clock::now() - bakeStart)
@@ -1994,18 +2300,17 @@ void Renderer::createSceneResources() {
                   " object instance(s), ", rayTracingBuildPlan_.uniqueTriangleCount,
                   " unique triangles, ", rayTracingBuildPlan_.instancedTriangleCount,
                   " triangles after instancing");
-        const bool sceneCompatible =
-            ray_tracing::supportsRayQueryShadows(rayTracingBuildPlan_);
+        const bool sceneCompatible = ray_tracing::supportsRayQueryShadows(rayTracingBuildPlan_);
         if (pathTracingEnabled()) {
-            if (!ray_tracing::supportsOpaquePathTracing(rayTracingBuildPlan_)) {
+            if (!ray_tracing::supportsPathTracing(rayTracingBuildPlan_)) {
                 throw std::runtime_error(
-                    "Path tracing currently requires fully opaque scene materials");
+                    "Path tracing supports opaque and alpha-masked materials; alpha-blended or "
+                    "additive scene materials are not supported");
             }
         }
         const ray_tracing::ShadowBackendSelection sceneSelection =
             ray_tracing::requireSceneCompatibility(
-                pathTracingEnabled() ? ray_tracing::Request::automatic
-                                     : config_.rayTracingRequest,
+                pathTracingEnabled() ? ray_tracing::Request::automatic : config_.rayTracingRequest,
                 {.backend = rayTracingShadowBackend_, .reason = rayTracingSelectionReason_},
                 sceneCompatible);
         if (!sceneSelection.accepted) {
@@ -2040,10 +2345,9 @@ void Renderer::createSceneResources() {
     vertexShader_ =
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "mesh.vert.spv");
     fragmentShader_ = std::make_unique<vulkan::ShaderModule>(
-        device_, shaderDirectory /
-                     (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery
-                          ? "mesh_ray_query.frag.spv"
-                          : "mesh.frag.spv"));
+        device_, shaderDirectory / (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery
+                                        ? "mesh_ray_query.frag.spv"
+                                        : "mesh.frag.spv"));
     shadowVertexShader_ =
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "shadow.vert.spv");
     shadowFragmentShader_ =
@@ -2070,6 +2374,8 @@ void Renderer::createSceneResources() {
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "bloom_blur_v.frag.spv");
     spatialUpscalingFragmentShader_ = std::make_unique<vulkan::ShaderModule>(
         device_, shaderDirectory / "upscale_spatial.frag.spv");
+    reactiveMaskFragmentShader_ = std::make_unique<vulkan::ShaderModule>(
+        device_, shaderDirectory / "upscale_reactive.frag.spv");
     temporalUpscalingFragmentShader_ = std::make_unique<vulkan::ShaderModule>(
         device_, shaderDirectory / "upscale_temporal.frag.spv");
     toneMappingVertexShader_ =
@@ -2087,12 +2393,20 @@ void Renderer::createSceneResources() {
             device_, shaderDirectory / "path_trace_shadow.rmiss.spv");
         pathTracingClosestHitShader_ = std::make_unique<vulkan::ShaderModule>(
             device_, shaderDirectory / "path_trace.rchit.spv");
+        pathTracingAnyHitShader_ = std::make_unique<vulkan::ShaderModule>(
+            device_, shaderDirectory / "path_trace.rahit.spv");
         pathHistoryShader_ = std::make_unique<vulkan::ShaderModule>(
             device_, shaderDirectory / "path_history.comp.spv");
         pathReconstructionShader_ = std::make_unique<vulkan::ShaderModule>(
             device_, shaderDirectory / "path_reconstruct.comp.spv");
         pathDenoisingShader_ = std::make_unique<vulkan::ShaderModule>(
             device_, shaderDirectory / "path_denoise.comp.spv");
+#if RENDERER_ENABLE_NRD
+        pathNrdPrepareShader_ = std::make_unique<vulkan::ShaderModule>(
+            device_, shaderDirectory / "path_nrd_prepare.comp.spv");
+        pathNrdResolveShader_ = std::make_unique<vulkan::ShaderModule>(
+            device_, shaderDirectory / "path_nrd_resolve.comp.spv");
+#endif
     }
     if (vertexShader_->reflection().stage != VK_SHADER_STAGE_VERTEX_BIT ||
         fragmentShader_->reflection().stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
@@ -2117,28 +2431,25 @@ void Renderer::createSceneResources() {
                    candidate.count == count;
         });
     };
-    const bool usesRayQuery =
-        rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery;
-    bool validPbrBindings = bindings.size() == (usesRayQuery ? 14U : 11U) &&
-                            hasBinding(0, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1) &&
-                            hasBinding(0, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
-                            hasBinding(0, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
-                            hasBinding(0, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
-                            hasBinding(0, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
-                            hasBinding(0, 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
-                            hasBinding(0, 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
-                            hasBinding(0, 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
-                            hasBinding(0, 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
-                            (usesRayQuery
-                                 ? hasBinding(0, 11,
-                                              VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1) &&
-                                       hasBinding(0, 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
-                                       hasBinding(0, 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
-                                       hasBinding(0, 14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)
-                                 : hasBinding(0, 10,
-                                              VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                              directionalShadowCascadeCount)) &&
-                            hasBinding(1, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0);
+    const bool usesRayQuery = rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery;
+    bool validPbrBindings =
+        bindings.size() == (usesRayQuery ? 14U : 11U) &&
+        hasBinding(0, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1) &&
+        hasBinding(0, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
+        hasBinding(0, 7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
+        hasBinding(0, 8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
+        hasBinding(0, 9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
+        (usesRayQuery ? hasBinding(0, 11, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1) &&
+                            hasBinding(0, 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
+                            hasBinding(0, 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) &&
+                            hasBinding(0, 14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)
+                      : hasBinding(0, 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                   directionalShadowCascadeCount)) &&
+        hasBinding(1, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0);
     if (!validPbrBindings) {
         throw std::runtime_error("Shader reflection found an unexpected descriptor interface");
     }
@@ -2146,31 +2457,33 @@ void Renderer::createSceneResources() {
     descriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
         device_, *descriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
     std::vector<vulkan::DescriptorBinding> bindlessBindings;
-    std::ranges::copy_if(bindings, std::back_inserter(bindlessBindings),
-                         [](const vulkan::DescriptorBinding& binding) {
-                             return binding.set == 1U;
-                         });
+    std::ranges::copy_if(
+        bindings, std::back_inserter(bindlessBindings),
+        [](const vulkan::DescriptorBinding& binding) { return binding.set == 1U; });
     if (pathTracingEnabled()) {
-        for (const vulkan::DescriptorBinding& incoming :
-             pathTracingClosestHitShader_->reflection().descriptorBindings) {
-            if (incoming.set != 1U) {
-                continue;
+        const std::array pathMaterialShaders{pathTracingClosestHitShader_.get(),
+                                             pathTracingAnyHitShader_.get()};
+        for (const vulkan::ShaderModule* shader : pathMaterialShaders) {
+            for (const vulkan::DescriptorBinding& incoming :
+                 shader->reflection().descriptorBindings) {
+                if (incoming.set != 1U) {
+                    continue;
+                }
+                const auto existing = std::ranges::find_if(
+                    bindlessBindings, [&incoming](const vulkan::DescriptorBinding& binding) {
+                        return binding.binding == incoming.binding;
+                    });
+                if (existing == bindlessBindings.end() || existing->type != incoming.type ||
+                    existing->count != incoming.count) {
+                    throw std::runtime_error(
+                        "Raster and path shaders disagree on the bindless texture interface");
+                }
+                existing->stages |= incoming.stages;
             }
-            const auto existing = std::ranges::find_if(
-                bindlessBindings, [&incoming](const vulkan::DescriptorBinding& binding) {
-                    return binding.binding == incoming.binding;
-                });
-            if (existing == bindlessBindings.end() || existing->type != incoming.type ||
-                existing->count != incoming.count) {
-                throw std::runtime_error(
-                    "Raster and path shaders disagree on the bindless texture interface");
-            }
-            existing->stages |= incoming.stages;
         }
     }
-    bindlessDescriptorSetLayout_ =
-        std::make_unique<vulkan::DescriptorSetLayout>(device_, 1, bindlessBindings,
-                                                      maxBindlessTextures);
+    bindlessDescriptorSetLayout_ = std::make_unique<vulkan::DescriptorSetLayout>(
+        device_, 1, bindlessBindings, maxBindlessTextures);
     bindlessDescriptorPool_ =
         std::make_unique<vulkan::DescriptorPool>(device_, *bindlessDescriptorSetLayout_, 1);
 
@@ -2318,10 +2631,27 @@ void Renderer::createSceneResources() {
     upscalingDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
         device_, *upscalingDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
 
+    const auto& reactiveMaskBindings = reactiveMaskFragmentShader_->reflection().descriptorBindings;
+    if (reactiveMaskFragmentShader_->reflection().stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
+        reactiveMaskBindings.size() != 5U) {
+        throw std::runtime_error("Shader reflection does not match reactive-mask generation");
+    }
+    for (std::size_t index = 0U; index < reactiveMaskBindings.size(); ++index) {
+        const vulkan::DescriptorBinding& binding = reactiveMaskBindings[index];
+        if (binding.set != 0U || binding.binding != index ||
+            binding.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || binding.count != 1U) {
+            throw std::runtime_error("Reactive-mask descriptor reflection is invalid");
+        }
+    }
+    reactiveMaskDescriptorSetLayout_ =
+        std::make_unique<vulkan::DescriptorSetLayout>(device_, 0U, reactiveMaskBindings);
+    reactiveMaskDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
+        device_, *reactiveMaskDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
+
     const auto& temporalUpscalingBindings =
         temporalUpscalingFragmentShader_->reflection().descriptorBindings;
     if (temporalUpscalingFragmentShader_->reflection().stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
-        temporalUpscalingBindings.size() != 5U) {
+        temporalUpscalingBindings.size() != 6U) {
         throw std::runtime_error("Shader reflection does not match temporal upscaling");
     }
     for (std::size_t index = 0U; index < temporalUpscalingBindings.size(); ++index) {
@@ -2331,11 +2661,11 @@ void Renderer::createSceneResources() {
             throw std::runtime_error("Temporal upscaling descriptor reflection is invalid");
         }
     }
-    temporalUpscalingDescriptorSetLayout_ = std::make_unique<vulkan::DescriptorSetLayout>(
-        device_, 0U, temporalUpscalingBindings);
-    temporalUpscalingDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
-        device_, *temporalUpscalingDescriptorSetLayout_,
-        static_cast<std::uint32_t>(framesInFlight));
+    temporalUpscalingDescriptorSetLayout_ =
+        std::make_unique<vulkan::DescriptorSetLayout>(device_, 0U, temporalUpscalingBindings);
+    temporalUpscalingDescriptorPool_ =
+        std::make_unique<vulkan::DescriptorPool>(device_, *temporalUpscalingDescriptorSetLayout_,
+                                                 static_cast<std::uint32_t>(framesInFlight));
 
     const std::array<const vulkan::ShaderReflection*, 2> taaReflections{
         &toneMappingVertexShader_->reflection(), &taaFragmentShader_->reflection()};
@@ -2388,14 +2718,14 @@ void Renderer::createSceneResources() {
         device_, *toneMappingDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
 
     if (pathTracingEnabled()) {
-        const std::array<const vulkan::ShaderReflection*, 4> pathTracingReflections{
+        const std::array<const vulkan::ShaderReflection*, 5> pathTracingReflections{
             &pathTracingRayGenerationShader_->reflection(),
             &pathTracingRadianceMissShader_->reflection(),
             &pathTracingShadowMissShader_->reflection(),
             &pathTracingClosestHitShader_->reflection(),
+            &pathTracingAnyHitShader_->reflection(),
         };
-        const auto pathTracingBindings =
-            vulkan::mergeDescriptorBindings(pathTracingReflections);
+        const auto pathTracingBindings = vulkan::mergeDescriptorBindings(pathTracingReflections);
         constexpr std::array expectedPathTracingTypes{
             VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -2414,25 +2744,30 @@ void Renderer::createSceneResources() {
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         };
         bool validPathTracingBindings =
-            pathTracingRayGenerationShader_->reflection().stage ==
-                VK_SHADER_STAGE_RAYGEN_BIT_KHR &&
-            pathTracingRadianceMissShader_->reflection().stage ==
-                VK_SHADER_STAGE_MISS_BIT_KHR &&
-            pathTracingShadowMissShader_->reflection().stage ==
-                VK_SHADER_STAGE_MISS_BIT_KHR &&
+            pathTracingRayGenerationShader_->reflection().stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR &&
+            pathTracingRadianceMissShader_->reflection().stage == VK_SHADER_STAGE_MISS_BIT_KHR &&
+            pathTracingShadowMissShader_->reflection().stage == VK_SHADER_STAGE_MISS_BIT_KHR &&
             pathTracingClosestHitShader_->reflection().stage ==
                 VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR &&
+            pathTracingAnyHitShader_->reflection().stage == VK_SHADER_STAGE_ANY_HIT_BIT_KHR &&
             pathTracingBindings.size() == expectedPathTracingTypes.size() + 1U;
         for (std::size_t bindingIndex = 0;
              validPathTracingBindings && bindingIndex < expectedPathTracingTypes.size();
              ++bindingIndex) {
-            validPathTracingBindings = pathTracingBindings[bindingIndex].set == 0U &&
-                                       pathTracingBindings[bindingIndex].binding == bindingIndex &&
-                                       pathTracingBindings[bindingIndex].type ==
-                                           expectedPathTracingTypes[bindingIndex] &&
-                                       pathTracingBindings[bindingIndex].count == 1U;
+            validPathTracingBindings =
+                pathTracingBindings[bindingIndex].set == 0U &&
+                pathTracingBindings[bindingIndex].binding == bindingIndex &&
+                pathTracingBindings[bindingIndex].type == expectedPathTracingTypes[bindingIndex] &&
+                pathTracingBindings[bindingIndex].count == 1U;
         }
         if (validPathTracingBindings) {
             const vulkan::DescriptorBinding& materialTextures = pathTracingBindings.back();
@@ -2440,17 +2775,16 @@ void Renderer::createSceneResources() {
                 materialTextures.set == 1U && materialTextures.binding == 0U &&
                 materialTextures.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
                 materialTextures.count == 0U &&
-                (materialTextures.stages & VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) != 0U;
+                (materialTextures.stages & VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) != 0U &&
+                (materialTextures.stages & VK_SHADER_STAGE_ANY_HIT_BIT_KHR) != 0U;
         }
         if (!validPathTracingBindings) {
-            throw std::runtime_error(
-                "Shader reflection does not match the path-tracing pipeline");
+            throw std::runtime_error("Shader reflection does not match the path-tracing pipeline");
         }
         pathTracingDescriptorSetLayout_ =
             std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, pathTracingBindings);
         pathTracingDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
-            device_, *pathTracingDescriptorSetLayout_,
-            static_cast<std::uint32_t>(framesInFlight));
+            device_, *pathTracingDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
 
         const auto& pathHistoryBindings = pathHistoryShader_->reflection().descriptorBindings;
         bool validPathHistoryBindings =
@@ -2459,23 +2793,21 @@ void Renderer::createSceneResources() {
         for (std::size_t bindingIndex = 0U;
              validPathHistoryBindings && bindingIndex < pathHistoryBindings.size();
              ++bindingIndex) {
-            const VkDescriptorType expectedType =
-                bindingIndex < 5U ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                  : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            const VkDescriptorType expectedType = bindingIndex < 5U
+                                                      ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             validPathHistoryBindings = pathHistoryBindings[bindingIndex].set == 0U &&
                                        pathHistoryBindings[bindingIndex].binding == bindingIndex &&
                                        pathHistoryBindings[bindingIndex].type == expectedType &&
                                        pathHistoryBindings[bindingIndex].count == 1U;
         }
         if (!validPathHistoryBindings) {
-            throw std::runtime_error(
-                "Shader reflection does not match path-history validation");
+            throw std::runtime_error("Shader reflection does not match path-history validation");
         }
         pathHistoryDescriptorSetLayout_ =
             std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, pathHistoryBindings);
         pathHistoryDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
-            device_, *pathHistoryDescriptorSetLayout_,
-            static_cast<std::uint32_t>(framesInFlight));
+            device_, *pathHistoryDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
 
         const auto& pathReconstructionBindings =
             pathReconstructionShader_->reflection().descriptorBindings;
@@ -2483,11 +2815,11 @@ void Renderer::createSceneResources() {
             pathReconstructionShader_->reflection().stage == VK_SHADER_STAGE_COMPUTE_BIT &&
             pathReconstructionBindings.size() == 7U;
         for (std::size_t bindingIndex = 0U;
-             validPathReconstructionBindings &&
-             bindingIndex < pathReconstructionBindings.size(); ++bindingIndex) {
-            const VkDescriptorType expectedType =
-                bindingIndex < 5U ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                  : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+             validPathReconstructionBindings && bindingIndex < pathReconstructionBindings.size();
+             ++bindingIndex) {
+            const VkDescriptorType expectedType = bindingIndex < 5U
+                                                      ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             validPathReconstructionBindings =
                 pathReconstructionBindings[bindingIndex].set == 0U &&
                 pathReconstructionBindings[bindingIndex].binding == bindingIndex &&
@@ -2499,23 +2831,21 @@ void Renderer::createSceneResources() {
                 "Shader reflection does not match path temporal reconstruction");
         }
         pathReconstructionDescriptorSetLayout_ =
-            std::make_unique<vulkan::DescriptorSetLayout>(device_, 0,
-                                                          pathReconstructionBindings);
+            std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, pathReconstructionBindings);
         pathReconstructionDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
             device_, *pathReconstructionDescriptorSetLayout_,
             static_cast<std::uint32_t>(framesInFlight));
 
-        const auto& pathDenoisingBindings =
-            pathDenoisingShader_->reflection().descriptorBindings;
+        const auto& pathDenoisingBindings = pathDenoisingShader_->reflection().descriptorBindings;
         bool validPathDenoisingBindings =
             pathDenoisingShader_->reflection().stage == VK_SHADER_STAGE_COMPUTE_BIT &&
-            pathDenoisingBindings.size() == 7U;
+            pathDenoisingBindings.size() == 10U;
         for (std::size_t bindingIndex = 0U;
              validPathDenoisingBindings && bindingIndex < pathDenoisingBindings.size();
              ++bindingIndex) {
-            const VkDescriptorType expectedType =
-                bindingIndex < 6U ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                  : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            const VkDescriptorType expectedType = bindingIndex < 7U
+                                                      ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             validPathDenoisingBindings =
                 pathDenoisingBindings[bindingIndex].set == 0U &&
                 pathDenoisingBindings[bindingIndex].binding == bindingIndex &&
@@ -2523,15 +2853,64 @@ void Renderer::createSceneResources() {
                 pathDenoisingBindings[bindingIndex].count == 1U;
         }
         if (!validPathDenoisingBindings) {
-            throw std::runtime_error(
-                "Shader reflection does not match path spatial denoising");
+            throw std::runtime_error("Shader reflection does not match path multi-scale denoising");
         }
         pathDenoisingDescriptorSetLayout_ =
-            std::make_unique<vulkan::DescriptorSetLayout>(device_, 0,
-                                                          pathDenoisingBindings);
+            std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, pathDenoisingBindings);
         pathDenoisingDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
             device_, *pathDenoisingDescriptorSetLayout_,
+            static_cast<std::uint32_t>(framesInFlight * pathDenoisingPassCount));
+#if RENDERER_ENABLE_NRD
+        const auto& nrdPrepareBindings = pathNrdPrepareShader_->reflection().descriptorBindings;
+        bool validNrdPrepareBindings =
+            pathNrdPrepareShader_->reflection().stage == VK_SHADER_STAGE_COMPUTE_BIT &&
+            nrdPrepareBindings.size() == 7U;
+        for (std::size_t bindingIndex = 0U;
+             validNrdPrepareBindings && bindingIndex < nrdPrepareBindings.size();
+             ++bindingIndex) {
+            const VkDescriptorType expectedType = bindingIndex < 4U
+                                                      ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            validNrdPrepareBindings =
+                nrdPrepareBindings[bindingIndex].set == 0U &&
+                nrdPrepareBindings[bindingIndex].binding == bindingIndex &&
+                nrdPrepareBindings[bindingIndex].type == expectedType &&
+                nrdPrepareBindings[bindingIndex].count == 1U;
+        }
+        if (!validNrdPrepareBindings) {
+            throw std::runtime_error("Shader reflection does not match NVIDIA NRD guide preparation");
+        }
+        pathNrdPrepareDescriptorSetLayout_ =
+            std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, nrdPrepareBindings);
+        pathNrdPrepareDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
+            device_, *pathNrdPrepareDescriptorSetLayout_,
             static_cast<std::uint32_t>(framesInFlight));
+
+        const auto& nrdResolveBindings = pathNrdResolveShader_->reflection().descriptorBindings;
+        bool validNrdResolveBindings =
+            pathNrdResolveShader_->reflection().stage == VK_SHADER_STAGE_COMPUTE_BIT &&
+            nrdResolveBindings.size() == 6U;
+        for (std::size_t bindingIndex = 0U;
+             validNrdResolveBindings && bindingIndex < nrdResolveBindings.size();
+             ++bindingIndex) {
+            const VkDescriptorType expectedType = bindingIndex < 5U
+                                                      ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            validNrdResolveBindings =
+                nrdResolveBindings[bindingIndex].set == 0U &&
+                nrdResolveBindings[bindingIndex].binding == bindingIndex &&
+                nrdResolveBindings[bindingIndex].type == expectedType &&
+                nrdResolveBindings[bindingIndex].count == 1U;
+        }
+        if (!validNrdResolveBindings) {
+            throw std::runtime_error("Shader reflection does not match NVIDIA NRD resolve");
+        }
+        pathNrdResolveDescriptorSetLayout_ =
+            std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, nrdResolveBindings);
+        pathNrdResolveDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
+            device_, *pathNrdResolveDescriptorSetLayout_,
+            static_cast<std::uint32_t>(framesInFlight));
+#endif
     }
 
     for (std::size_t index = 0; index < framesInFlight; ++index) {
@@ -2979,16 +3358,15 @@ void Renderer::createSceneResources() {
               materials.size(), " materials, ", textureImages_.size(), "/", maxBindlessTextures,
               " bindless texture descriptors resident");
     if (pathTracingEnabled()) {
-        const std::size_t texturedMaterialCount =
-            static_cast<std::size_t>(std::ranges::count_if(
-                materials, [](const gpu_scene::MaterialRecord& material) {
-                    return material.textureState.y != 0U;
-                }));
-        core::log(core::LogLevel::info, "Path-tracing material textures: ",
-                  texturedMaterialCount, " textured material(s), ", scene.textures.size(),
+        const std::size_t texturedMaterialCount = static_cast<std::size_t>(
+            std::ranges::count_if(materials, [](const gpu_scene::MaterialRecord& material) {
+                return material.textureState.y != 0U;
+            }));
+        core::log(core::LogLevel::info, "Path-tracing material textures: ", texturedMaterialCount,
+                  " textured material(s), ", scene.textures.size(),
                   " imported texture(s); ray-cone mip LOD enabled");
-        core::log(core::LogLevel::info, "Path-tracing emissive sampler: ",
-                  emissiveTriangles.triangles.size(),
+        core::log(core::LogLevel::info,
+                  "Path-tracing emissive sampler: ", emissiveTriangles.triangles.size(),
                   " resident triangle(s), world-area/luminance CDF and power-heuristic MIS ",
                   config_.pathEmissiveTriangleSampling ? "enabled" : "disabled");
     }
@@ -3090,8 +3468,7 @@ void Renderer::createRayTracingResources(std::span<const gpu_scene::TransformRec
     bottomLevelStructures_.clear();
     bottomLevelStructures_.reserve(bottomLevelSizes.size());
     rayTracingPersistentBytes_ = 0U;
-    if (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery ||
-        pathTracingEnabled()) {
+    if (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery || pathTracingEnabled()) {
         std::vector<ray_tracing::RayGeometryRecord> rayGeometryRecords;
         rayGeometryRecords.reserve(rayTracingBuildPlan_.bottomLevels.size());
         for (const ray_tracing::BlasGeometryPlan& plan : rayTracingBuildPlan_.bottomLevels) {
@@ -3158,8 +3535,7 @@ void Renderer::createRayTracingResources(std::span<const gpu_scene::TransformRec
 #pragma GCC diagnostic ignored "-Wconversion"
 #endif
         instance.instanceCustomIndex = plan.sourceInstanceIndex;
-        instance.mask =
-            ray_tracing::resolveInstanceVisibilityMask(plan, mainView_.visibilityMask);
+        instance.mask = ray_tracing::resolveInstanceVisibilityMask(plan, mainView_.visibilityMask);
         instance.instanceShaderBindingTableRecordOffset = 0U;
         instance.flags = flags;
 #if defined(__GNUC__) || defined(__clang__)
@@ -3183,8 +3559,8 @@ void Renderer::createRayTracingResources(std::span<const gpu_scene::TransformRec
             });
         rayTracingInstanceBuffers_[frameIndex]->write(
             std::as_bytes(std::span(rayTracingPackedInstances_)));
-        rayTracingPersistentBytes_ = addDeviceSize(
-            rayTracingPersistentBytes_, rayTracingInstanceBuffers_[frameIndex]->size());
+        rayTracingPersistentBytes_ = addDeviceSize(rayTracingPersistentBytes_,
+                                                   rayTracingInstanceBuffers_[frameIndex]->size());
     }
     if (pathTracingEnabled() &&
         config_.rayTracingTransformScript != RayTracingTransformScript::none) {
@@ -3197,11 +3573,10 @@ void Renderer::createRayTracingResources(std::span<const gpu_scene::TransformRec
                     .size = transformBytes,
                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                     .requiredMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                    .preferredMemory = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                    .preferredMemory =
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 });
-            transformBuffer->write(
-                std::as_bytes(std::span(rayTracingBaseTransforms_)));
+            transformBuffer->write(std::as_bytes(std::span(rayTracingBaseTransforms_)));
             rayTracingPersistentBytes_ =
                 addDeviceSize(rayTracingPersistentBytes_, transformBuffer->size());
         }
@@ -3475,12 +3850,11 @@ void Renderer::createRayTracingResources(std::span<const gpu_scene::TransformRec
               " frame-local instance inputs and ", rayTracingUpdateScratchSize_,
               " update scratch bytes per frame slot");
     if (config_.rayTracingTransformScript == RayTracingTransformScript::oscillate) {
-        core::log(
-            core::LogLevel::info,
-            pathTracingEnabled()
-                ? "RT transform script: deterministic path instance animation enabled; "
-                  "progressive accumulation resets while temporal history remains eligible"
-                : "RT transform script: deterministic TLAS-only oscillation enabled");
+        core::log(core::LogLevel::info,
+                  pathTracingEnabled()
+                      ? "RT transform script: deterministic path instance animation enabled; "
+                        "progressive accumulation resets while temporal history remains eligible"
+                      : "RT transform script: deterministic TLAS-only oscillation enabled");
     }
 }
 
@@ -3490,8 +3864,7 @@ void Renderer::updateRayTracingInstanceBuffer(std::size_t frameIndex) {
         throw std::runtime_error("RT per-frame instance input is incomplete");
     }
     if (config_.rayTracingTransformScript == RayTracingTransformScript::oscillate) {
-        const std::vector<gpu_scene::TransformRecord> previousTransforms =
-            rayTracingTransforms_;
+        const std::vector<gpu_scene::TransformRecord> previousTransforms = rayTracingTransforms_;
         rayTracingTransforms_ = rayTracingBaseTransforms_;
         if (previousTransforms.size() != rayTracingTransforms_.size()) {
             throw std::runtime_error("RT transform script lost its previous transform state");
@@ -3525,8 +3898,7 @@ void Renderer::updateRayTracingInstanceBuffer(std::size_t frameIndex) {
         const ray_tracing::TlasInstancePlan& instancePlan =
             rayTracingBuildPlan_.topLevelInstances[index];
         const std::array<float, 12> rowMajorTransform =
-            ray_tracing::resolveInstanceTransform3x4(
-                instancePlan, rayTracingTransforms_);
+            ray_tracing::resolveInstanceTransform3x4(instancePlan, rayTracingTransforms_);
         VkTransformMatrixKHR& transform = rayTracingPackedInstances_[index].transform;
         for (std::size_t row = 0; row < 3U; ++row) {
             for (std::size_t column = 0; column < 4U; ++column) {
@@ -3540,15 +3912,13 @@ void Renderer::updateRayTracingInstanceBuffer(std::size_t frameIndex) {
         std::as_bytes(std::span(rayTracingPackedInstances_)));
 }
 
-void Renderer::recordRayTracingTlasUpdate(VkCommandBuffer commandBuffer,
-                                          std::size_t frameIndex) {
+void Renderer::recordRayTracingTlasUpdate(VkCommandBuffer commandBuffer, std::size_t frameIndex) {
     if (!rayTracingFoundationEnabled_) {
         return;
     }
     if (frameIndex >= framesInFlight || topLevelStructure_ == nullptr ||
-        !rayTracingInstanceBuffers_[frameIndex] ||
-        !rayTracingUpdateScratchBuffers_[frameIndex] || rayTracingUpdateScratchSize_ == 0U ||
-        vkCmdBuildAccelerationStructuresKHR == nullptr) {
+        !rayTracingInstanceBuffers_[frameIndex] || !rayTracingUpdateScratchBuffers_[frameIndex] ||
+        rayTracingUpdateScratchSize_ == 0U || vkCmdBuildAccelerationStructuresKHR == nullptr) {
         throw std::runtime_error("RT per-frame TLAS update resources are incomplete");
     }
 
@@ -3607,8 +3977,7 @@ void Renderer::recordRayTracingTlasUpdate(VkCommandBuffer commandBuffer,
         VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
         VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
     const VkDeviceAddress scratchAddress = alignDeviceSize(
-        rayTracingUpdateScratchBuffers_[frameIndex]->deviceAddress(),
-        rayTracingScratchAlignment_);
+        rayTracingUpdateScratchBuffers_[frameIndex]->deviceAddress(), rayTracingScratchAlignment_);
     const VkAccelerationStructureBuildGeometryInfoKHR updateInfo{
         .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
         .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
@@ -3621,25 +3990,22 @@ void Renderer::recordRayTracingTlasUpdate(VkCommandBuffer commandBuffer,
         .scratchData = {.deviceAddress = scratchAddress},
     };
     const VkAccelerationStructureBuildRangeInfoKHR updateRange{
-        .primitiveCount =
-            static_cast<std::uint32_t>(rayTracingBuildPlan_.topLevelInstances.size()),
+        .primitiveCount = static_cast<std::uint32_t>(rayTracingBuildPlan_.topLevelInstances.size()),
     };
     const VkAccelerationStructureBuildRangeInfoKHR* updateRangePointer = &updateRange;
     writeGpuTimestamp(commandBuffer, frameIndex, GpuTimingPass::tlasUpdate, false);
     vkCmdBuildAccelerationStructuresKHR(commandBuffer, 1U, &updateInfo, &updateRangePointer);
     writeGpuTimestamp(commandBuffer, frameIndex, GpuTimingPass::tlasUpdate, true);
-    if (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery ||
-        pathTracingEnabled()) {
+    if (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery || pathTracingEnabled()) {
         const VkMemoryBarrier2 shaderReadBarrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
             .srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
             .srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
-            .dstStageMask =
-                (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery
-                     ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     : VkPipelineStageFlags2{0U}) |
-                (pathTracingEnabled() ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
-                                      : VkPipelineStageFlags2{0U}),
+            .dstStageMask = (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery
+                                 ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                 : VkPipelineStageFlags2{0U}) |
+                            (pathTracingEnabled() ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
+                                                  : VkPipelineStageFlags2{0U}),
             .dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
         };
         const VkDependencyInfo shaderReadDependency{
@@ -3852,6 +4218,20 @@ void Renderer::createGraphicsPipelines() {
         .size = sizeof(glm::vec4) + sizeof(glm::uvec4),
     };
     const std::array temporalUpscalingAttachmentFormats{temporalDepthFormat_};
+    const VkDescriptorSetLayout reactiveMaskSetLayout = reactiveMaskDescriptorSetLayout_->handle();
+    reactiveMaskPipeline_.reset();
+    if (temporalUpscalingEnabled()) {
+        reactiveMaskPipeline_ = std::make_unique<vulkan::GraphicsPipeline>(
+            device_, vulkan::GraphicsPipelineCreateInfo{
+                         .vertexShader = toneMappingVertexShader_.get(),
+                         .fragmentShader = reactiveMaskFragmentShader_.get(),
+                         .colorFormat = reactiveMaskFormat_,
+                         .cullMode = VK_CULL_MODE_NONE,
+                         .cache = pipelineCache_.handle(),
+                         .descriptorSetLayouts = std::span(&reactiveMaskSetLayout, 1),
+                         .pushConstantRanges = std::span(&temporalUpscalingPush, 1),
+                     });
+    }
     temporalUpscalingPipeline_ = std::make_unique<vulkan::GraphicsPipeline>(
         device_, vulkan::GraphicsPipelineCreateInfo{
                      .vertexShader = toneMappingVertexShader_.get(),
@@ -3879,6 +4259,8 @@ void Renderer::createGraphicsPipelines() {
     pathHistoryPipeline_.reset();
     pathReconstructionPipeline_.reset();
     pathDenoisingPipeline_.reset();
+    pathNrdPreparePipeline_.reset();
+    pathNrdResolvePipeline_.reset();
     if (pathTracingEnabled()) {
         const VkDescriptorSetLayout pathHistorySetLayout =
             pathHistoryDescriptorSetLayout_->handle();
@@ -3896,43 +4278,79 @@ void Renderer::createGraphicsPipelines() {
                      });
         const VkDescriptorSetLayout pathReconstructionSetLayout =
             pathReconstructionDescriptorSetLayout_->handle();
+        constexpr VkPushConstantRange pathReconstructionPush{
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0U,
+            .size = sizeof(PathReconstructionControls),
+        };
         pathReconstructionPipeline_ = std::make_unique<vulkan::ComputePipeline>(
             device_, vulkan::ComputePipelineCreateInfo{
                          .shader = pathReconstructionShader_.get(),
                          .cache = pipelineCache_.handle(),
-                         .descriptorSetLayouts =
-                             std::span(&pathReconstructionSetLayout, 1),
-                         .pushConstantRanges = std::span(&pathHistoryPush, 1),
+                         .descriptorSetLayouts = std::span(&pathReconstructionSetLayout, 1),
+                         .pushConstantRanges = std::span(&pathReconstructionPush, 1),
                      });
         const VkDescriptorSetLayout pathDenoisingSetLayout =
             pathDenoisingDescriptorSetLayout_->handle();
+        constexpr VkPushConstantRange pathDenoisingPush{
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0U,
+            .size = sizeof(PathDenoisingControls),
+        };
         pathDenoisingPipeline_ = std::make_unique<vulkan::ComputePipeline>(
             device_, vulkan::ComputePipelineCreateInfo{
                          .shader = pathDenoisingShader_.get(),
                          .cache = pipelineCache_.handle(),
-                         .descriptorSetLayouts =
-                             std::span(&pathDenoisingSetLayout, 1),
-                         .pushConstantRanges = std::span(&pathHistoryPush, 1),
+                         .descriptorSetLayouts = std::span(&pathDenoisingSetLayout, 1),
+                         .pushConstantRanges = std::span(&pathDenoisingPush, 1),
                      });
+#if RENDERER_ENABLE_NRD
+        const VkDescriptorSetLayout nrdPrepareSetLayout =
+            pathNrdPrepareDescriptorSetLayout_->handle();
+        constexpr VkPushConstantRange nrdPreparePush{
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .offset = 0U,
+            .size = sizeof(glm::mat4),
+        };
+        pathNrdPreparePipeline_ = std::make_unique<vulkan::ComputePipeline>(
+            device_, vulkan::ComputePipelineCreateInfo{
+                         .shader = pathNrdPrepareShader_.get(),
+                         .cache = pipelineCache_.handle(),
+                         .descriptorSetLayouts = std::span(&nrdPrepareSetLayout, 1),
+                         .pushConstantRanges = std::span(&nrdPreparePush, 1),
+                     });
+        const VkDescriptorSetLayout nrdResolveSetLayout =
+            pathNrdResolveDescriptorSetLayout_->handle();
+        pathNrdResolvePipeline_ = std::make_unique<vulkan::ComputePipeline>(
+            device_, vulkan::ComputePipelineCreateInfo{
+                         .shader = pathNrdResolveShader_.get(),
+                         .cache = pipelineCache_.handle(),
+                         .descriptorSetLayouts = std::span(&nrdResolveSetLayout, 1),
+                     });
+#endif
         const std::array pathTracingSetLayouts{
             pathTracingDescriptorSetLayout_->handle(),
             bindlessDescriptorSetLayout_->handle(),
         };
         constexpr VkPushConstantRange pathTracingPush{
-            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+            .stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
+                          VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
             .offset = 0U,
-            .size = sizeof(std::uint32_t),
+            .size = sizeof(PathTracingControls),
         };
         const std::array<const vulkan::ShaderModule*, 2> missShaders{
             pathTracingRadianceMissShader_.get(), pathTracingShadowMissShader_.get()};
         const std::array<const vulkan::ShaderModule*, 2> closestHitShaders{
             pathTracingClosestHitShader_.get(), nullptr};
+        const std::array<const vulkan::ShaderModule*, 2> anyHitShaders{
+            pathTracingAnyHitShader_.get(), pathTracingAnyHitShader_.get()};
         pathTracingPipeline_ = std::make_unique<vulkan::RayTracingPipeline>(
             device_, memoryAllocator_,
             vulkan::RayTracingPipelineCreateInfo{
                 .rayGenerationShader = pathTracingRayGenerationShader_.get(),
                 .missShaders = missShaders,
                 .closestHitShaders = closestHitShaders,
+                .anyHitShaders = anyHitShaders,
                 .maxRecursionDepth = config_.pathMaxBounces + 2U,
                 .cache = pipelineCache_.handle(),
                 .descriptorSetLayouts = pathTracingSetLayouts,
@@ -3950,6 +4368,23 @@ void Renderer::importUpscalingHistoryImages() {
     graphUpscalingHistoryColorWriteImage_ = {};
     graphUpscalingHistoryDepthReadImage_ = {};
     graphUpscalingHistoryDepthWriteImage_ = {};
+    graphDlssOutputImage_ = {};
+    if (dlssUpscalingEnabled()) {
+        if (!renderGraph_ || !dlssOutputImage_ || !dlssOutputView_) {
+            throw std::runtime_error("DLSS graph requires a complete output resource");
+        }
+        constexpr VkImageSubresourceRange colorSubresource{
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0U,
+            .levelCount = 1U,
+            .baseArrayLayer = 0U,
+            .layerCount = 1U,
+        };
+        graphDlssOutputImage_ = renderGraph_->importImage(
+            "DLSS output", dlssOutputImage_->handle(), colorSubresource, {},
+            render_graph::QueueType::graphics);
+        return;
+    }
     if (!temporalUpscalingEnabled()) {
         return;
     }
@@ -3965,18 +4400,18 @@ void Renderer::importUpscalingHistoryImages() {
         .baseArrayLayer = 0U,
         .layerCount = 1U,
     };
-    graphUpscalingHistoryColorReadImage_ = renderGraph_->importImage(
-        "Upscaling color history read", VK_NULL_HANDLE, colorSubresource, {},
-        render_graph::QueueType::graphics);
-    graphUpscalingHistoryColorWriteImage_ = renderGraph_->importImage(
-        "Upscaling color history write", VK_NULL_HANDLE, colorSubresource, {},
-        render_graph::QueueType::graphics);
-    graphUpscalingHistoryDepthReadImage_ = renderGraph_->importImage(
-        "Upscaling depth history read", VK_NULL_HANDLE, colorSubresource, {},
-        render_graph::QueueType::graphics);
-    graphUpscalingHistoryDepthWriteImage_ = renderGraph_->importImage(
-        "Upscaling depth history write", VK_NULL_HANDLE, colorSubresource, {},
-        render_graph::QueueType::graphics);
+    graphUpscalingHistoryColorReadImage_ =
+        renderGraph_->importImage("Upscaling color history read", VK_NULL_HANDLE, colorSubresource,
+                                  {}, render_graph::QueueType::graphics);
+    graphUpscalingHistoryColorWriteImage_ =
+        renderGraph_->importImage("Upscaling color history write", VK_NULL_HANDLE, colorSubresource,
+                                  {}, render_graph::QueueType::graphics);
+    graphUpscalingHistoryDepthReadImage_ =
+        renderGraph_->importImage("Upscaling depth history read", VK_NULL_HANDLE, colorSubresource,
+                                  {}, render_graph::QueueType::graphics);
+    graphUpscalingHistoryDepthWriteImage_ =
+        renderGraph_->importImage("Upscaling depth history write", VK_NULL_HANDLE, colorSubresource,
+                                  {}, render_graph::QueueType::graphics);
 }
 
 void Renderer::createPathTracingRenderGraph() {
@@ -3984,23 +4419,44 @@ void Renderer::createPathTracingRenderGraph() {
     using render_graph::ImageState;
     using render_graph::QueueType;
 
+#if RENDERER_ENABLE_NRD
+    const bool nrdShaderInputsComplete = nrdDiffuseInputImage_ && nrdDiffuseInputView_ &&
+                                         nrdSpecularInputImage_ && nrdSpecularInputView_ &&
+                                         nrdMaterialImage_ && nrdMaterialView_;
+    const bool nrdResourcesComplete =
+        nrdShaderInputsComplete &&
+        (rayReconstructionEnabled() ||
+         (nrdDenoiser_ && nrdMotionImage_ && nrdMotionView_ &&
+          nrdNormalRoughnessImage_ && nrdNormalRoughnessView_ && nrdViewZImage_ &&
+          nrdViewZView_ && nrdDiffuseOutputImage_ && nrdDiffuseOutputView_ &&
+          nrdSpecularOutputImage_ && nrdSpecularOutputView_));
+#else
+    constexpr bool nrdResourcesComplete = true;
+#endif
+
     if (!pathTracingAccumulationImage_ || !pathTracingAccumulationView_ ||
-        !pathTracingDirectImage_ || !pathTracingDirectView_ ||
-        !pathTracingSurfaceImage_ || !pathTracingSurfaceView_ ||
-        !pathTracingNormalImage_ || !pathTracingNormalView_ ||
-        !pathTracingMotionDepthImage_ || !pathTracingMotionDepthView_ ||
-        !pathTracingDepthImage_ || !pathTracingDepthView_ ||
-        !pathHistoryNormalImages_.front() || !pathHistoryNormalViews_.front() ||
-        !pathHistoryDepthImages_.front() || !pathHistoryDepthViews_.front() ||
-        !pathHistoryValidityImage_ || !pathHistoryValidityView_ ||
-        !pathReconstructionImages_.front() || !pathReconstructionViews_.front() ||
-        !pathReconstructionImages_.back() || !pathReconstructionViews_.back() ||
-        !pathMomentImages_.front() || !pathMomentViews_.front() ||
-        !pathMomentImages_.back() || !pathMomentViews_.back() ||
-        !pathDenoisedImage_ || !pathDenoisedView_ ||
-        (config_.aovFrameSink && !pathAovReadbackBuffer_) ||
-        !rayTracingGeometryBuffer_ || !environmentSamplingBuffer_ ||
-        !emissiveTriangleBuffer_) {
+        !pathTracingDirectImage_ || !pathTracingDirectView_ || !pathTracingSurfaceImage_ ||
+        !pathTracingSurfaceView_ || !pathTracingNormalImage_ || !pathTracingNormalView_ ||
+        !pathTracingMotionDepthImage_ || !pathTracingMotionDepthView_ || !pathTracingDepthImage_ ||
+        !pathTracingDepthView_ || !rayReconstructionDiffuseAlbedoImage_ ||
+        !rayReconstructionDiffuseAlbedoView_ || !rayReconstructionSpecularAlbedoImage_ ||
+        !rayReconstructionSpecularAlbedoView_ || !rayReconstructionNormalRoughnessImage_ ||
+        !rayReconstructionNormalRoughnessView_ ||
+        !rayReconstructionSpecularHitDistanceImage_ ||
+        !rayReconstructionSpecularHitDistanceView_ || !pathHistoryNormalImages_.front() ||
+        !pathHistoryNormalViews_.front() || !pathHistoryDepthImages_.front() ||
+        !pathHistoryDepthViews_.front() || !pathHistoryValidityImage_ ||
+        !pathHistoryValidityView_ || !pathReconstructionImages_.front() ||
+        !pathReconstructionViews_.front() || !pathReconstructionImages_.back() ||
+        !pathReconstructionViews_.back() || !pathMomentImages_.front() ||
+        !pathMomentViews_.front() || !pathMomentImages_.back() || !pathMomentViews_.back() ||
+        !pathDenoisingDirectImages_.front() || !pathDenoisingDirectViews_.front() ||
+        !pathDenoisingDirectImages_.back() || !pathDenoisingDirectViews_.back() ||
+        !pathDenoisingIndirectImages_.front() || !pathDenoisingIndirectViews_.front() ||
+        !pathDenoisingIndirectImages_.back() || !pathDenoisingIndirectViews_.back() ||
+        !pathDenoisedImage_ || !pathDenoisedView_ || !nrdResourcesComplete ||
+        (config_.aovFrameSink && !pathAovReadbackBuffer_) || !rayTracingGeometryBuffer_ ||
+        !environmentSamplingBuffer_ || !emissiveTriangleBuffer_) {
         throw std::runtime_error("Path-tracing graph requires complete persistent resources");
     }
     renderGraph_ = std::make_unique<render_graph::RenderGraph>(device_, memoryAllocator_);
@@ -4024,17 +4480,17 @@ void Renderer::createPathTracingRenderGraph() {
     const bool concurrentUpload =
         device_.queueFamilies().graphics != device_.queueFamilies().transfer;
 
-    graphSwapchainImage_ = renderGraph_->importImage(
-        "Swapchain", VK_NULL_HANDLE, colorSubresource, {}, QueueType::graphics);
+    graphSwapchainImage_ = renderGraph_->importImage("Swapchain", VK_NULL_HANDLE, colorSubresource,
+                                                     {}, QueueType::graphics);
     graphPathTracingAccumulationImage_ = renderGraph_->importImage(
-        "Path-tracing accumulation", pathTracingAccumulationImage_->handle(), colorSubresource,
-        {}, QueueType::graphics);
-    graphPathTracingDirectImage_ = renderGraph_->importImage(
-        "Path-tracing direct radiance", pathTracingDirectImage_->handle(), colorSubresource,
-        {}, QueueType::graphics);
+        "Path-tracing accumulation", pathTracingAccumulationImage_->handle(), colorSubresource, {},
+        QueueType::graphics);
+    graphPathTracingDirectImage_ =
+        renderGraph_->importImage("Path-tracing direct radiance", pathTracingDirectImage_->handle(),
+                                  colorSubresource, {}, QueueType::graphics);
     graphPathTracingSurfaceImage_ = renderGraph_->importImage(
-        "Path-tracing albedo and roughness", pathTracingSurfaceImage_->handle(),
-        colorSubresource, {}, QueueType::graphics);
+        "Path-tracing albedo and roughness", pathTracingSurfaceImage_->handle(), colorSubresource,
+        {}, QueueType::graphics);
     graphPathTracingNormalImage_ = renderGraph_->importImage(
         "Path-tracing geometric and shading normals", pathTracingNormalImage_->handle(),
         colorSubresource, {}, QueueType::graphics);
@@ -4042,8 +4498,22 @@ void Renderer::createPathTracingRenderGraph() {
         "Path-tracing motion, previous depth, and hit distance",
         pathTracingMotionDepthImage_->handle(), colorSubresource, {}, QueueType::graphics);
     graphPathTracingDepthImage_ = renderGraph_->importImage(
-        "Path-tracing current device depth", pathTracingDepthImage_->handle(),
+        "Path-tracing current device depth", pathTracingDepthImage_->handle(), colorSubresource, {},
+        QueueType::graphics);
+    graphRayReconstructionDiffuseAlbedoImage_ = renderGraph_->importImage(
+        "Ray Reconstruction diffuse albedo", rayReconstructionDiffuseAlbedoImage_->handle(),
         colorSubresource, {}, QueueType::graphics);
+    graphRayReconstructionSpecularAlbedoImage_ = renderGraph_->importImage(
+        "Ray Reconstruction specular albedo", rayReconstructionSpecularAlbedoImage_->handle(),
+        colorSubresource, {}, QueueType::graphics);
+    graphRayReconstructionNormalRoughnessImage_ = renderGraph_->importImage(
+        "Ray Reconstruction world normal and roughness",
+        rayReconstructionNormalRoughnessImage_->handle(), colorSubresource, {},
+        QueueType::graphics);
+    graphRayReconstructionSpecularHitDistanceImage_ = renderGraph_->importImage(
+        "Ray Reconstruction specular hit distance",
+        rayReconstructionSpecularHitDistanceImage_->handle(), colorSubresource, {},
+        QueueType::graphics);
     graphPathHistoryNormalReadImage_ = renderGraph_->importImage(
         "Path history geometric normal read", pathHistoryNormalImages_.front()->handle(),
         colorSubresource, {}, QueueType::graphics);
@@ -4056,52 +4526,85 @@ void Renderer::createPathTracingRenderGraph() {
     graphPathHistoryDepthWriteImage_ = renderGraph_->importImage(
         "Path history device depth write", pathHistoryDepthImages_.back()->handle(),
         colorSubresource, {}, QueueType::graphics);
-    graphPathHistoryValidityImage_ = renderGraph_->importImage(
-        "Path history validity", pathHistoryValidityImage_->handle(), colorSubresource,
-        {}, QueueType::graphics);
+    graphPathHistoryValidityImage_ =
+        renderGraph_->importImage("Path history validity", pathHistoryValidityImage_->handle(),
+                                  colorSubresource, {}, QueueType::graphics);
     graphPathReconstructionReadImage_ = renderGraph_->importImage(
         "Path reconstructed radiance read", pathReconstructionImages_.front()->handle(),
         colorSubresource, {}, QueueType::graphics);
     graphPathReconstructionWriteImage_ = renderGraph_->importImage(
         "Path reconstructed radiance write", pathReconstructionImages_.back()->handle(),
         colorSubresource, {}, QueueType::graphics);
-    graphPathMomentReadImage_ = renderGraph_->importImage(
-        "Path temporal moments read", pathMomentImages_.front()->handle(),
-        colorSubresource, {}, QueueType::graphics);
-    graphPathMomentWriteImage_ = renderGraph_->importImage(
-        "Path temporal moments write", pathMomentImages_.back()->handle(),
-        colorSubresource, {}, QueueType::graphics);
-    graphPathDenoisedImage_ = renderGraph_->importImage(
-        "Path spatially denoised radiance", pathDenoisedImage_->handle(),
-        colorSubresource, {}, QueueType::graphics);
-    graphEnvironmentImage_ = renderGraph_->importImage(
-        "HDR environment", environmentImage_->handle(), colorSubresource, environmentState,
-        QueueType::graphics, concurrentUpload);
-    graphVertexBuffer_ = renderGraph_->importBuffer(
-        "Scene vertices", vertexBuffer_->handle(), 0U, vertexBuffer_->size(), storageReadState,
-        QueueType::graphics, concurrentUpload);
-    graphIndexBuffer_ = renderGraph_->importBuffer(
-        "Scene indices", indexBuffer_->handle(), 0U, indexBuffer_->size(), storageReadState,
-        QueueType::graphics, concurrentUpload);
-    graphInstanceBuffer_ = renderGraph_->importBuffer(
-        "Scene instances", instanceBuffer_->handle(), 0U, instanceBuffer_->size(),
-        storageReadState, QueueType::graphics, concurrentUpload);
-    graphMaterialBuffer_ = renderGraph_->importBuffer(
-        "Scene materials", materialBuffer_->handle(), 0U, materialBuffer_->size(),
-        storageReadState, QueueType::graphics, concurrentUpload);
-    const vulkan::Buffer* graphTransformBuffer =
-        pathAnimatedTransformBuffers_.front()
-            ? pathAnimatedTransformBuffers_.front().get()
-            : transformBuffer_.get();
+    graphPathMomentReadImage_ =
+        renderGraph_->importImage("Path temporal moments read", pathMomentImages_.front()->handle(),
+                                  colorSubresource, {}, QueueType::graphics);
+    graphPathMomentWriteImage_ =
+        renderGraph_->importImage("Path temporal moments write", pathMomentImages_.back()->handle(),
+                                  colorSubresource, {}, QueueType::graphics);
+    for (std::size_t index = 0U; index < pathDenoisingDirectImages_.size(); ++index) {
+        graphPathDenoisingDirectImages_[index] = renderGraph_->importImage(
+            "Path denoising direct scale " + std::to_string(index),
+            pathDenoisingDirectImages_[index]->handle(), colorSubresource, {}, QueueType::graphics);
+        graphPathDenoisingIndirectImages_[index] =
+            renderGraph_->importImage("Path denoising indirect scale " + std::to_string(index),
+                                      pathDenoisingIndirectImages_[index]->handle(),
+                                      colorSubresource, {}, QueueType::graphics);
+    }
+    graphPathDenoisedImage_ = renderGraph_->importImage("Path multi-scale denoised radiance",
+                                                        pathDenoisedImage_->handle(),
+                                                        colorSubresource, {}, QueueType::graphics);
+#if RENDERER_ENABLE_NRD
+    graphNrdDiffuseInputImage_ = renderGraph_->importImage(
+        "NRD diffuse noisy radiance", nrdDiffuseInputImage_->handle(), colorSubresource, {},
+        QueueType::graphics);
+    graphNrdSpecularInputImage_ = renderGraph_->importImage(
+        "NRD specular noisy radiance", nrdSpecularInputImage_->handle(), colorSubresource, {},
+        QueueType::graphics);
+    graphNrdMaterialImage_ = renderGraph_->importImage(
+        "NRD material factors", nrdMaterialImage_->handle(), colorSubresource, {},
+        QueueType::graphics);
+    if (!rayReconstructionEnabled()) {
+        graphNrdMotionImage_ = renderGraph_->importImage(
+            "NRD motion guide", nrdMotionImage_->handle(), colorSubresource, {},
+            QueueType::graphics);
+        graphNrdNormalRoughnessImage_ = renderGraph_->importImage(
+            "NRD normal and roughness guide", nrdNormalRoughnessImage_->handle(),
+            colorSubresource, {}, QueueType::graphics);
+        graphNrdViewZImage_ = renderGraph_->importImage(
+            "NRD view Z guide", nrdViewZImage_->handle(), colorSubresource, {},
+            QueueType::graphics);
+        graphNrdDiffuseOutputImage_ = renderGraph_->importImage(
+            "NRD diffuse denoised radiance", nrdDiffuseOutputImage_->handle(),
+            colorSubresource, {}, QueueType::graphics);
+        graphNrdSpecularOutputImage_ = renderGraph_->importImage(
+            "NRD specular denoised radiance", nrdSpecularOutputImage_->handle(),
+            colorSubresource, {}, QueueType::graphics);
+    }
+#endif
+    graphEnvironmentImage_ =
+        renderGraph_->importImage("HDR environment", environmentImage_->handle(), colorSubresource,
+                                  environmentState, QueueType::graphics, concurrentUpload);
+    graphVertexBuffer_ = renderGraph_->importBuffer("Scene vertices", vertexBuffer_->handle(), 0U,
+                                                    vertexBuffer_->size(), storageReadState,
+                                                    QueueType::graphics, concurrentUpload);
+    graphIndexBuffer_ = renderGraph_->importBuffer("Scene indices", indexBuffer_->handle(), 0U,
+                                                   indexBuffer_->size(), storageReadState,
+                                                   QueueType::graphics, concurrentUpload);
+    graphInstanceBuffer_ = renderGraph_->importBuffer("Scene instances", instanceBuffer_->handle(),
+                                                      0U, instanceBuffer_->size(), storageReadState,
+                                                      QueueType::graphics, concurrentUpload);
+    graphMaterialBuffer_ = renderGraph_->importBuffer("Scene materials", materialBuffer_->handle(),
+                                                      0U, materialBuffer_->size(), storageReadState,
+                                                      QueueType::graphics, concurrentUpload);
+    const vulkan::Buffer* graphTransformBuffer = pathAnimatedTransformBuffers_.front()
+                                                     ? pathAnimatedTransformBuffers_.front().get()
+                                                     : transformBuffer_.get();
     graphTransformBuffer_ = renderGraph_->importBuffer(
-        "Scene transforms", graphTransformBuffer->handle(), 0U,
-        graphTransformBuffer->size(),
-        pathAnimatedTransformBuffers_.front()
-            ? BufferState{.stages = VK_PIPELINE_STAGE_2_HOST_BIT,
-                          .access = VK_ACCESS_2_HOST_WRITE_BIT}
-            : storageReadState,
-        QueueType::graphics,
-        pathAnimatedTransformBuffers_.front() ? false : concurrentUpload);
+        "Scene transforms", graphTransformBuffer->handle(), 0U, graphTransformBuffer->size(),
+        pathAnimatedTransformBuffers_.front() ? BufferState{.stages = VK_PIPELINE_STAGE_2_HOST_BIT,
+                                                            .access = VK_ACCESS_2_HOST_WRITE_BIT}
+                                              : storageReadState,
+        QueueType::graphics, pathAnimatedTransformBuffers_.front() ? false : concurrentUpload);
     graphRayTracingGeometryBuffer_ = renderGraph_->importBuffer(
         "Ray geometry ranges", rayTracingGeometryBuffer_->handle(), 0U,
         rayTracingGeometryBuffer_->size(), storageReadState, QueueType::graphics);
@@ -4111,8 +4614,7 @@ void Renderer::createPathTracingRenderGraph() {
         concurrentUpload);
     graphEmissiveTriangleBuffer_ = renderGraph_->importBuffer(
         "Emissive triangle distribution", emissiveTriangleBuffer_->handle(), 0U,
-        emissiveTriangleBuffer_->size(), storageReadState, QueueType::graphics,
-        concurrentUpload);
+        emissiveTriangleBuffer_->size(), storageReadState, QueueType::graphics, concurrentUpload);
     graphUniformBuffer_ = renderGraph_->importBuffer(
         "Frame uniform", uniformBuffers_.front()->handle(), 0U, uniformBuffers_.front()->size(),
         BufferState{
@@ -4123,15 +4625,15 @@ void Renderer::createPathTracingRenderGraph() {
         QueueType::graphics);
     graphCaptureBuffer_ = {};
     if (captureReadbackBuffer_) {
-        graphCaptureBuffer_ = renderGraph_->importBuffer(
-            "Capture readback", captureReadbackBuffer_->handle(), 0U,
-            captureReadbackBuffer_->size(), {}, QueueType::graphics);
+        graphCaptureBuffer_ =
+            renderGraph_->importBuffer("Capture readback", captureReadbackBuffer_->handle(), 0U,
+                                       captureReadbackBuffer_->size(), {}, QueueType::graphics);
     }
     graphPathAovReadbackBuffer_ = {};
     if (pathAovReadbackBuffer_) {
-        graphPathAovReadbackBuffer_ = renderGraph_->importBuffer(
-            "Path AOV readback", pathAovReadbackBuffer_->handle(), 0U,
-            pathAovReadbackBuffer_->size(), {}, QueueType::graphics);
+        graphPathAovReadbackBuffer_ =
+            renderGraph_->importBuffer("Path AOV readback", pathAovReadbackBuffer_->handle(), 0U,
+                                       pathAovReadbackBuffer_->size(), {}, QueueType::graphics);
     }
 
     const render_graph::PassHandle pathTracingPass = renderGraph_->addPass(
@@ -4141,32 +4643,37 @@ void Renderer::createPathTracingRenderGraph() {
             if (userData == nullptr) {
                 throw std::runtime_error("Path-tracing pass requires frame context");
             }
-            recordPathTracingPass(commandBuffer,
-                                  *static_cast<const GraphFrameContext*>(userData));
+            recordPathTracingPass(commandBuffer, *static_cast<const GraphFrameContext*>(userData));
         });
     renderGraph_->readWriteImage(
         pathTracingPass, graphPathTracingAccumulationImage_,
         ImageState{
             .stages = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             .layout = VK_IMAGE_LAYOUT_GENERAL,
         });
     constexpr ImageState pathOutputState{
         .stages = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-        .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
         .layout = VK_IMAGE_LAYOUT_GENERAL,
     };
-    renderGraph_->readWriteImage(pathTracingPass, graphPathTracingDirectImage_,
-                                 pathOutputState);
-    renderGraph_->readWriteImage(pathTracingPass, graphPathTracingSurfaceImage_,
-                                 pathOutputState);
-    renderGraph_->readWriteImage(pathTracingPass, graphPathTracingNormalImage_,
-                                 pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass, graphPathTracingDirectImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass, graphPathTracingSurfaceImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass, graphPathTracingNormalImage_, pathOutputState);
     renderGraph_->readWriteImage(pathTracingPass, graphPathTracingMotionDepthImage_,
                                  pathOutputState);
     renderGraph_->readWriteImage(pathTracingPass, graphPathTracingDepthImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass, graphNrdDiffuseInputImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass, graphNrdSpecularInputImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass, graphNrdMaterialImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass,
+                                 graphRayReconstructionDiffuseAlbedoImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass,
+                                 graphRayReconstructionSpecularAlbedoImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass,
+                                 graphRayReconstructionNormalRoughnessImage_, pathOutputState);
+    renderGraph_->readWriteImage(pathTracingPass,
+                                 graphRayReconstructionSpecularHitDistanceImage_, pathOutputState);
     renderGraph_->readImage(pathTracingPass, graphEnvironmentImage_, environmentState);
     renderGraph_->readBuffer(pathTracingPass, graphVertexBuffer_, storageReadState);
     renderGraph_->readBuffer(pathTracingPass, graphIndexBuffer_, storageReadState);
@@ -4176,13 +4683,13 @@ void Renderer::createPathTracingRenderGraph() {
     renderGraph_->readBuffer(pathTracingPass, graphRayTracingGeometryBuffer_, storageReadState);
     renderGraph_->readBuffer(pathTracingPass, graphEnvironmentSamplingBuffer_, storageReadState);
     renderGraph_->readBuffer(pathTracingPass, graphEmissiveTriangleBuffer_, storageReadState);
-    renderGraph_->readBuffer(
-        pathTracingPass, graphUniformBuffer_,
-        BufferState{
-            .stages = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-            .access = VK_ACCESS_2_UNIFORM_READ_BIT,
-        });
+    renderGraph_->readBuffer(pathTracingPass, graphUniformBuffer_,
+                             BufferState{
+                                 .stages = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                                 .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+                             });
 
+    if (!rayReconstructionEnabled()) {
     const render_graph::PassHandle pathHistoryPass = renderGraph_->addPass(
         "Path history validation", QueueType::graphics,
         [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
@@ -4190,8 +4697,7 @@ void Renderer::createPathTracingRenderGraph() {
             if (userData == nullptr) {
                 throw std::runtime_error("Path-history pass requires frame context");
             }
-            recordPathHistoryPass(commandBuffer,
-                                  *static_cast<const GraphFrameContext*>(userData));
+            recordPathHistoryPass(commandBuffer, *static_cast<const GraphFrameContext*>(userData));
         });
     constexpr ImageState pathHistorySampleState{
         .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -4203,12 +4709,10 @@ void Renderer::createPathTracingRenderGraph() {
         .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
         .layout = VK_IMAGE_LAYOUT_GENERAL,
     };
-    renderGraph_->readImage(pathHistoryPass, graphPathTracingNormalImage_,
-                            pathHistorySampleState);
+    renderGraph_->readImage(pathHistoryPass, graphPathTracingNormalImage_, pathHistorySampleState);
     renderGraph_->readImage(pathHistoryPass, graphPathTracingMotionDepthImage_,
                             pathHistorySampleState);
-    renderGraph_->readImage(pathHistoryPass, graphPathTracingDepthImage_,
-                            pathHistorySampleState);
+    renderGraph_->readImage(pathHistoryPass, graphPathTracingDepthImage_, pathHistorySampleState);
     renderGraph_->readImage(pathHistoryPass, graphPathHistoryNormalReadImage_,
                             pathHistorySampleState);
     renderGraph_->readImage(pathHistoryPass, graphPathHistoryDepthReadImage_,
@@ -4227,8 +4731,8 @@ void Renderer::createPathTracingRenderGraph() {
             if (userData == nullptr) {
                 throw std::runtime_error("Path reconstruction pass requires frame context");
             }
-            recordPathReconstructionPass(
-                commandBuffer, *static_cast<const GraphFrameContext*>(userData));
+            recordPathReconstructionPass(commandBuffer,
+                                         *static_cast<const GraphFrameContext*>(userData));
         });
     renderGraph_->readImage(pathReconstructionPass, graphPathTracingAccumulationImage_,
                             pathHistorySampleState);
@@ -4236,7 +4740,15 @@ void Renderer::createPathTracingRenderGraph() {
                             pathHistorySampleState);
     renderGraph_->readImage(pathReconstructionPass, graphPathHistoryValidityImage_,
                             pathHistorySampleState);
+    // The reconstructed output remains frame-slot ping-ponged. Transition the
+    // opposite slot on its first frame even though filtered radiance is now the
+    // temporal feedback source, so it is ready when it becomes the next output.
     renderGraph_->readImage(pathReconstructionPass, graphPathReconstructionReadImage_,
+                            pathHistorySampleState);
+    // Feed the spatially filtered previous result back into temporal
+    // reconstruction. The final denoised image is read here before the current
+    // frame's last denoising scale overwrites it later in the graph.
+    renderGraph_->readImage(pathReconstructionPass, graphPathDenoisedImage_,
                             pathHistorySampleState);
     renderGraph_->readImage(pathReconstructionPass, graphPathMomentReadImage_,
                             pathHistorySampleState);
@@ -4245,30 +4757,126 @@ void Renderer::createPathTracingRenderGraph() {
     renderGraph_->writeImage(pathReconstructionPass, graphPathMomentWriteImage_,
                              pathHistoryWriteState);
 
-    const render_graph::PassHandle pathDenoisingPass = renderGraph_->addPass(
-        "Path spatial denoising", QueueType::graphics,
+    render_graph::PassHandle lastPathDenoisingPass{};
+    for (std::size_t passIndex = 0U; passIndex < pathDenoisingPassCount; ++passIndex) {
+        const render_graph::PassHandle pathDenoisingPass = renderGraph_->addPass(
+            "Path variance-guided denoising scale " + std::to_string(passIndex),
+            QueueType::graphics,
+            [this, passIndex](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+                              const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error("Path denoising pass requires frame context");
+                }
+                recordPathDenoisingPass(
+                    commandBuffer, *static_cast<const GraphFrameContext*>(userData), passIndex);
+            });
+        if (passIndex == 0U) {
+            renderGraph_->readImage(pathDenoisingPass, graphPathTracingDirectImage_,
+                                    pathHistorySampleState);
+            renderGraph_->readImage(pathDenoisingPass, graphPathReconstructionWriteImage_,
+                                    pathHistorySampleState);
+        } else {
+            renderGraph_->readImage(pathDenoisingPass,
+                                    graphPathDenoisingDirectImages_[passIndex - 1U],
+                                    pathHistorySampleState);
+            renderGraph_->readImage(pathDenoisingPass,
+                                    graphPathDenoisingIndirectImages_[passIndex - 1U],
+                                    pathHistorySampleState);
+        }
+        renderGraph_->readImage(pathDenoisingPass, graphPathTracingSurfaceImage_,
+                                pathHistorySampleState);
+        renderGraph_->readImage(pathDenoisingPass, graphPathTracingNormalImage_,
+                                pathHistorySampleState);
+        renderGraph_->readImage(pathDenoisingPass, graphPathTracingMotionDepthImage_,
+                                pathHistorySampleState);
+        renderGraph_->readImage(pathDenoisingPass, graphPathTracingDepthImage_,
+                                pathHistorySampleState);
+        renderGraph_->readImage(pathDenoisingPass, graphPathMomentWriteImage_,
+                                pathHistorySampleState);
+        if (passIndex + 1U < pathDenoisingPassCount) {
+            renderGraph_->writeImage(pathDenoisingPass, graphPathDenoisingDirectImages_[passIndex],
+                                     pathHistoryWriteState);
+            renderGraph_->writeImage(pathDenoisingPass,
+                                     graphPathDenoisingIndirectImages_[passIndex],
+                                     pathHistoryWriteState);
+        } else {
+            renderGraph_->writeImage(pathDenoisingPass, graphPathDenoisedImage_,
+                                     pathHistoryWriteState);
+        }
+        lastPathDenoisingPass = pathDenoisingPass;
+    }
+
+#if RENDERER_ENABLE_NRD
+    const render_graph::PassHandle nrdPreparePass = renderGraph_->addPass(
+        "Prepare NVIDIA NRD guides and signals", QueueType::graphics,
         [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
                const void* userData) {
             if (userData == nullptr) {
-                throw std::runtime_error("Path denoising pass requires frame context");
+                throw std::runtime_error("NRD guide preparation requires frame context");
             }
-            recordPathDenoisingPass(
-                commandBuffer, *static_cast<const GraphFrameContext*>(userData));
+            recordNrdPreparePass(commandBuffer,
+                                 *static_cast<const GraphFrameContext*>(userData));
         });
-    renderGraph_->readImage(pathDenoisingPass, graphPathReconstructionWriteImage_,
+    renderGraph_->addDependency(lastPathDenoisingPass, nrdPreparePass);
+    renderGraph_->readImage(nrdPreparePass, graphPathTracingSurfaceImage_,
                             pathHistorySampleState);
-    renderGraph_->readImage(pathDenoisingPass, graphPathTracingSurfaceImage_,
+    renderGraph_->readImage(nrdPreparePass, graphPathTracingNormalImage_,
                             pathHistorySampleState);
-    renderGraph_->readImage(pathDenoisingPass, graphPathTracingNormalImage_,
+    renderGraph_->readImage(nrdPreparePass, graphPathTracingMotionDepthImage_,
                             pathHistorySampleState);
-    renderGraph_->readImage(pathDenoisingPass, graphPathTracingMotionDepthImage_,
+    renderGraph_->readImage(nrdPreparePass, graphPathTracingDepthImage_, pathHistorySampleState);
+    renderGraph_->writeImage(nrdPreparePass, graphNrdMotionImage_, pathHistoryWriteState);
+    renderGraph_->writeImage(nrdPreparePass, graphNrdNormalRoughnessImage_, pathHistoryWriteState);
+    renderGraph_->writeImage(nrdPreparePass, graphNrdViewZImage_, pathHistoryWriteState);
+
+    const render_graph::PassHandle nrdDenoisingPass = renderGraph_->addPass(
+        "NVIDIA NRD RELAX denoising", QueueType::graphics,
+        [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+               const void* userData) {
+            if (userData == nullptr) {
+                throw std::runtime_error("NRD denoising requires frame context");
+            }
+            recordNrdDenoisingPass(commandBuffer,
+                                   *static_cast<const GraphFrameContext*>(userData));
+        });
+    renderGraph_->addDependency(nrdPreparePass, nrdDenoisingPass);
+    renderGraph_->readImage(nrdDenoisingPass, graphNrdMotionImage_, pathHistorySampleState);
+    renderGraph_->readImage(nrdDenoisingPass, graphNrdNormalRoughnessImage_,
                             pathHistorySampleState);
-    renderGraph_->readImage(pathDenoisingPass, graphPathTracingDepthImage_,
+    renderGraph_->readImage(nrdDenoisingPass, graphNrdViewZImage_, pathHistorySampleState);
+    renderGraph_->readImage(nrdDenoisingPass, graphNrdDiffuseInputImage_,
                             pathHistorySampleState);
-    renderGraph_->readImage(pathDenoisingPass, graphPathMomentWriteImage_,
+    renderGraph_->readImage(nrdDenoisingPass, graphNrdSpecularInputImage_,
                             pathHistorySampleState);
-    renderGraph_->writeImage(pathDenoisingPass, graphPathDenoisedImage_,
+    renderGraph_->writeImage(nrdDenoisingPass, graphNrdDiffuseOutputImage_,
                              pathHistoryWriteState);
+    renderGraph_->writeImage(nrdDenoisingPass, graphNrdSpecularOutputImage_,
+                             pathHistoryWriteState);
+
+    const render_graph::PassHandle nrdResolvePass = renderGraph_->addPass(
+        "Resolve NVIDIA NRD radiance", QueueType::graphics,
+        [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+               const void* userData) {
+            if (userData == nullptr) {
+                throw std::runtime_error("NRD resolve requires frame context");
+            }
+            recordNrdResolvePass(commandBuffer,
+                                 *static_cast<const GraphFrameContext*>(userData));
+        });
+    renderGraph_->addDependency(nrdDenoisingPass, nrdResolvePass);
+    renderGraph_->readImage(nrdResolvePass, graphNrdDiffuseOutputImage_,
+                            pathHistorySampleState);
+    renderGraph_->readImage(nrdResolvePass, graphNrdSpecularOutputImage_,
+                            pathHistorySampleState);
+    renderGraph_->readImage(nrdResolvePass, graphNrdMaterialImage_,
+                            pathHistorySampleState);
+    renderGraph_->readImage(nrdResolvePass, graphPathTracingMotionDepthImage_,
+                            pathHistorySampleState);
+    renderGraph_->readImage(nrdResolvePass, graphPathTracingAccumulationImage_,
+                            pathHistorySampleState);
+    renderGraph_->writeImage(nrdResolvePass, graphPathDenoisedImage_, pathHistoryWriteState);
+#endif
+    }
 
     if (graphPathAovReadbackBuffer_) {
         const render_graph::PassHandle aovReadbackPass = renderGraph_->addPass(
@@ -4290,31 +4898,27 @@ void Renderer::createPathTracingRenderGraph() {
         };
         renderGraph_->readImage(aovReadbackPass, graphPathTracingAccumulationImage_,
                                 transferReadState);
-        renderGraph_->readImage(aovReadbackPass, graphPathTracingDirectImage_,
-                                transferReadState);
-        renderGraph_->readImage(aovReadbackPass, graphPathTracingSurfaceImage_,
-                                transferReadState);
-        renderGraph_->readImage(aovReadbackPass, graphPathTracingNormalImage_,
-                                transferReadState);
+        renderGraph_->readImage(aovReadbackPass, graphPathTracingDirectImage_, transferReadState);
+        renderGraph_->readImage(aovReadbackPass, graphPathTracingSurfaceImage_, transferReadState);
+        renderGraph_->readImage(aovReadbackPass, graphPathTracingNormalImage_, transferReadState);
         renderGraph_->readImage(aovReadbackPass, graphPathTracingMotionDepthImage_,
                                 transferReadState);
-        renderGraph_->readImage(aovReadbackPass, graphPathTracingDepthImage_,
-                                transferReadState);
-        renderGraph_->readImage(aovReadbackPass, graphPathHistoryValidityImage_,
-                                transferReadState);
+        renderGraph_->readImage(aovReadbackPass, graphPathTracingDepthImage_, transferReadState);
+        renderGraph_->readImage(aovReadbackPass, graphPathHistoryValidityImage_, transferReadState);
         renderGraph_->readImage(aovReadbackPass, graphPathReconstructionWriteImage_,
                                 transferReadState);
-        renderGraph_->readImage(aovReadbackPass, graphPathDenoisedImage_,
-                                transferReadState);
-        renderGraph_->writeBuffer(
-            aovReadbackPass, graphPathAovReadbackBuffer_,
-            BufferState{
-                .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
-                .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            });
+        renderGraph_->readImage(aovReadbackPass, graphPathDenoisedImage_, transferReadState);
+        renderGraph_->writeBuffer(aovReadbackPass, graphPathAovReadbackBuffer_,
+                                  BufferState{
+                                      .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                      .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                  });
     }
 
-    graphUpscalingSourceImage_ = pathPresentationSourceImage();
+    graphUpscalingSourceImage_ = rayReconstructionEnabled()
+                                     ? graphPathTracingAccumulationImage_
+                                     : pathPresentationSourceImage();
+    graphReactiveMaskImage_ = {};
     graphUpscaledImage_ = graphUpscalingSourceImage_;
     graphUpscaledDepthImage_ = {};
     if (spatialUpscalingEnabled()) {
@@ -4328,8 +4932,19 @@ void Renderer::createPathTracingRenderGraph() {
             },
             vulkan::ImageViewCreateInfo{});
     } else if (temporalUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        graphReactiveMaskImage_ = renderGraph_->createTransientImage(
+            "Temporal upscaling reactive mask",
+            vulkan::ImageCreateInfo{
+                .extent = {outputExtent.width, outputExtent.height, 1U},
+                .format = reactiveMaskFormat_,
+                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            },
+            vulkan::ImageViewCreateInfo{});
         graphUpscaledImage_ = graphUpscalingHistoryColorWriteImage_;
         graphUpscaledDepthImage_ = graphUpscalingHistoryDepthWriteImage_;
+    } else if (dlssUpscalingEnabled()) {
+        graphUpscaledImage_ = graphDlssOutputImage_;
     }
     render_graph::PassHandle initializeUpscalingHistoryPass{};
     if (temporalUpscalingEnabled()) {
@@ -4351,12 +4966,10 @@ void Renderer::createPathTracingRenderGraph() {
                 constexpr VkClearColorValue depthClear{{1.0F, 0.0F, 0.0F, 0.0F}};
                 vkCmdClearColorImage(commandBuffer,
                                      graph.image(graphUpscalingHistoryColorReadImage_),
-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colorClear, 1U,
-                                     &range);
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colorClear, 1U, &range);
                 vkCmdClearColorImage(commandBuffer,
                                      graph.image(graphUpscalingHistoryDepthReadImage_),
-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &depthClear, 1U,
-                                     &range);
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &depthClear, 1U, &range);
             });
         const ImageState clearState{
             .stages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -4368,9 +4981,25 @@ void Renderer::createPathTracingRenderGraph() {
         renderGraph_->writeImage(initializeUpscalingHistoryPass,
                                  graphUpscalingHistoryDepthReadImage_, clearState);
     }
+    render_graph::PassHandle reactiveMaskPass{};
+    if (temporalUpscalingEnabled()) {
+        reactiveMaskPass = renderGraph_->addPass(
+            "Generate temporal reactive mask", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                   const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error("Reactive-mask pass requires frame context");
+                }
+                recordReactiveMaskPass(commandBuffer, graph,
+                                       *static_cast<const GraphFrameContext*>(userData));
+            });
+    }
     const render_graph::PassHandle upscalingPass = renderGraph_->addPass(
-        spatialUpscalingEnabled()   ? "Spatial upscaling"
+        spatialUpscalingEnabled()    ? "Spatial upscaling"
         : temporalUpscalingEnabled() ? "Temporal upscaling"
+        : dlssUpscalingEnabled()     ? (rayReconstructionEnabled()
+                                             ? "NVIDIA DLSS Ray Reconstruction"
+                                             : "NVIDIA DLSS Super Resolution")
                                      : "Native upscaling",
         QueueType::graphics,
         [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
@@ -4384,18 +5013,54 @@ void Renderer::createPathTracingRenderGraph() {
     if (temporalUpscalingEnabled()) {
         renderGraph_->addDependency(initializeUpscalingHistoryPass, upscalingPass);
     }
-    constexpr ImageState upscalingReadState{
-        .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+    const ImageState upscalingReadState{
+        .stages = dlssUpscalingEnabled() ? VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                         : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         .layout = VK_IMAGE_LAYOUT_GENERAL,
     };
     renderGraph_->readImage(upscalingPass, graphUpscalingSourceImage_, upscalingReadState);
+    if (dlssUpscalingEnabled()) {
+        renderGraph_->readImage(upscalingPass, graphPathTracingDepthImage_, upscalingReadState);
+        renderGraph_->readImage(upscalingPass, graphPathTracingMotionDepthImage_,
+                                upscalingReadState);
+        if (rayReconstructionEnabled()) {
+            renderGraph_->readImage(upscalingPass,
+                                    graphRayReconstructionDiffuseAlbedoImage_,
+                                    upscalingReadState);
+            renderGraph_->readImage(upscalingPass,
+                                    graphRayReconstructionSpecularAlbedoImage_,
+                                    upscalingReadState);
+            renderGraph_->readImage(upscalingPass,
+                                    graphRayReconstructionNormalRoughnessImage_,
+                                    upscalingReadState);
+            renderGraph_->readImage(upscalingPass,
+                                    graphRayReconstructionSpecularHitDistanceImage_,
+                                    upscalingReadState);
+        }
+    }
     if (temporalUpscalingEnabled()) {
         constexpr ImageState temporalHistoryReadState{
             .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
             .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         };
+        renderGraph_->addDependency(initializeUpscalingHistoryPass, reactiveMaskPass);
+        renderGraph_->addDependency(reactiveMaskPass, upscalingPass);
+        renderGraph_->readImage(reactiveMaskPass, graphUpscalingSourceImage_, upscalingReadState);
+        renderGraph_->readImage(reactiveMaskPass, graphPathTracingDepthImage_, upscalingReadState);
+        renderGraph_->readImage(reactiveMaskPass, graphPathTracingMotionDepthImage_,
+                                upscalingReadState);
+        renderGraph_->readImage(reactiveMaskPass, graphUpscalingHistoryColorReadImage_,
+                                temporalHistoryReadState);
+        renderGraph_->readImage(reactiveMaskPass, graphUpscalingHistoryDepthReadImage_,
+                                temporalHistoryReadState);
+        renderGraph_->writeImage(reactiveMaskPass, graphReactiveMaskImage_,
+                                 ImageState{
+                                     .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                     .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                 });
         renderGraph_->readImage(upscalingPass, graphPathTracingDepthImage_, upscalingReadState);
         renderGraph_->readImage(upscalingPass, graphPathTracingMotionDepthImage_,
                                 upscalingReadState);
@@ -4403,34 +5068,39 @@ void Renderer::createPathTracingRenderGraph() {
                                 temporalHistoryReadState);
         renderGraph_->readImage(upscalingPass, graphUpscalingHistoryDepthReadImage_,
                                 temporalHistoryReadState);
+        renderGraph_->readImage(upscalingPass, graphReactiveMaskImage_, temporalHistoryReadState);
     }
     if (upscalingDispatchEnabled()) {
-        renderGraph_->writeImage(
-            upscalingPass, graphUpscaledImage_,
-            ImageState{
-                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            });
+        renderGraph_->writeImage(upscalingPass, graphUpscaledImage_,
+                                 dlssUpscalingEnabled()
+                                     ? ImageState{
+                                           .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                           .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                           .layout = VK_IMAGE_LAYOUT_GENERAL,
+                                       }
+                                     : ImageState{
+                                           .stages =
+                                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                           .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                           .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                       });
     }
     if (temporalUpscalingEnabled()) {
-        renderGraph_->writeImage(
-            upscalingPass, graphUpscaledDepthImage_,
-            ImageState{
-                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            });
+        renderGraph_->writeImage(upscalingPass, graphUpscaledDepthImage_,
+                                 ImageState{
+                                     .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                     .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                 });
         const render_graph::PassHandle preserveUpscalingDepthPass =
             renderGraph_->addPass("Preserve temporal upscaling depth", QueueType::graphics);
         renderGraph_->addDependency(upscalingPass, preserveUpscalingDepthPass);
-        renderGraph_->readImage(
-            preserveUpscalingDepthPass, graphUpscaledDepthImage_,
-            ImageState{
-                .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            });
+        renderGraph_->readImage(preserveUpscalingDepthPass, graphUpscaledDepthImage_,
+                                ImageState{
+                                    .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                    .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                                    .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                });
     }
 
     const render_graph::PassHandle toneMappingPass = renderGraph_->addPass(
@@ -4469,19 +5139,17 @@ void Renderer::createPathTracingRenderGraph() {
             renderGraph_->readImage(toneMappingPass, image, pathDebugReadState);
         }
     }
-    renderGraph_->readBuffer(
-        toneMappingPass, graphUniformBuffer_,
-        BufferState{
-            .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            .access = VK_ACCESS_2_UNIFORM_READ_BIT,
-        });
-    renderGraph_->writeImage(
-        toneMappingPass, graphSwapchainImage_,
-        ImageState{
-            .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        });
+    renderGraph_->readBuffer(toneMappingPass, graphUniformBuffer_,
+                             BufferState{
+                                 .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                 .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+                             });
+    renderGraph_->writeImage(toneMappingPass, graphSwapchainImage_,
+                             ImageState{
+                                 .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                 .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                 .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                             });
 
     if (graphCaptureBuffer_) {
         const render_graph::PassHandle capturePass = renderGraph_->addPass(
@@ -4493,47 +5161,62 @@ void Renderer::createPathTracingRenderGraph() {
                     recordCapturePass(commandBuffer, graph);
                 }
             });
-        renderGraph_->readImage(
-            capturePass, graphSwapchainImage_,
-            ImageState{
-                .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
-                .access = VK_ACCESS_2_TRANSFER_READ_BIT,
-                .layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            });
-        renderGraph_->writeBuffer(
-            capturePass, graphCaptureBuffer_,
-            BufferState{
-                .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
-                .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            });
+        renderGraph_->readImage(capturePass, graphSwapchainImage_,
+                                ImageState{
+                                    .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                    .access = VK_ACCESS_2_TRANSFER_READ_BIT,
+                                    .layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                });
+        renderGraph_->writeBuffer(capturePass, graphCaptureBuffer_,
+                                  BufferState{
+                                      .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
+                                      .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                  });
     }
     const render_graph::PassHandle presentPass =
         renderGraph_->addPass("Present transition", QueueType::graphics);
-    renderGraph_->readImage(
-        presentPass, graphSwapchainImage_,
-        ImageState{
-            .stages = VK_PIPELINE_STAGE_2_NONE,
-            .access = VK_ACCESS_2_NONE,
-            .layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        });
+    renderGraph_->readImage(presentPass, graphSwapchainImage_,
+                            ImageState{
+                                .stages = VK_PIPELINE_STAGE_2_NONE,
+                                .access = VK_ACCESS_2_NONE,
+                                .layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            });
     renderGraph_->compile();
     core::log(core::LogLevel::info,
-              "Render graph compiled: TLAS update -> progressive path tracing -> path history "
-              "validation -> path temporal reconstruction -> path spatial denoising",
+              rayReconstructionEnabled()
+                  ? "Render graph compiled: TLAS update -> noisy path tracing"
+                  : "Render graph compiled: TLAS update -> progressive path tracing -> path "
+                    "history validation -> path temporal reconstruction -> path multi-scale "
+                    "denoising",
+#if RENDERER_ENABLE_NRD
+              rayReconstructionEnabled()
+                  ? ""
+                  : " -> NRD guide preparation -> NVIDIA NRD RELAX -> NRD resolve",
+#endif
               graphPathAovReadbackBuffer_ ? " -> path AOV readback" : "",
-              spatialUpscalingEnabled()
-                  ? " -> Spatial upscaling -> tone mapping"
+              spatialUpscalingEnabled() ? " -> Spatial upscaling -> tone mapping"
               : temporalUpscalingEnabled()
-                  ? " -> Temporal upscaling -> tone mapping"
+                  ? " -> Reactive mask -> Temporal upscaling -> tone mapping"
+              : dlssUpscalingEnabled()
+                  ? (rayReconstructionEnabled()
+                         ? " -> NVIDIA DLSS Ray Reconstruction -> tone mapping"
+                         : " -> NVIDIA DLSS Super Resolution -> tone mapping")
                   : " -> Native upscaling -> tone mapping",
               graphCaptureBuffer_ ? " -> Capture" : "", " -> Present");
     if (spatialUpscalingEnabled()) {
         const VkExtent2D outputExtent = swapchain_.extent();
         const std::uint64_t outputBytes =
             static_cast<std::uint64_t>(outputExtent.width) * outputExtent.height * 8U;
-        core::log(core::LogLevel::info, "Spatial upscaling HDR output at ",
-                  outputExtent.width, "x", outputExtent.height, ": ",
-                  static_cast<double>(outputBytes) / (1024.0 * 1024.0), " MiB transient");
+        core::log(core::LogLevel::info, "Spatial upscaling HDR output at ", outputExtent.width, "x",
+                  outputExtent.height, ": ", static_cast<double>(outputBytes) / (1024.0 * 1024.0),
+                  " MiB transient");
+    } else if (temporalUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        const std::uint64_t maskBytes =
+            static_cast<std::uint64_t>(outputExtent.width) * outputExtent.height;
+        core::log(core::LogLevel::info, "Temporal reactive mask at ", outputExtent.width, "x",
+                  outputExtent.height, ": ", static_cast<double>(maskBytes) / (1024.0 * 1024.0),
+                  " MiB transient");
     }
 }
 
@@ -4547,8 +5230,7 @@ void Renderer::createRenderGraph() {
     using render_graph::QueueType;
 
     const bool rasterShadowMaps = rasterShadowMapsEnabled();
-    const bool rayQueryShadows =
-        rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery;
+    const bool rayQueryShadows = rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery;
     renderGraph_ = std::make_unique<render_graph::RenderGraph>(device_, memoryAllocator_);
     importUpscalingHistoryImages();
     const bool concurrentUpload =
@@ -5001,9 +5683,8 @@ void Renderer::createRenderGraph() {
          ++cascadeIndex) {
         const render_graph::ImageHandle shadowImage = graphDirectionalShadowImages_[cascadeIndex];
         const render_graph::PassHandle shadowPass = renderGraph_->addPass(
-            rasterShadowMaps
-                ? "Directional shadow map cascade " + std::to_string(cascadeIndex)
-                : "Clear disabled shadow fallback " + std::to_string(cascadeIndex),
+            rasterShadowMaps ? "Directional shadow map cascade " + std::to_string(cascadeIndex)
+                             : "Clear disabled shadow fallback " + std::to_string(cascadeIndex),
             QueueType::graphics,
             [this, cascadeIndex, shadowImage](VkCommandBuffer commandBuffer,
                                               const render_graph::RenderGraph& graph,
@@ -5083,36 +5764,32 @@ void Renderer::createRenderGraph() {
             }
             recordPbrPass(commandBuffer, graph, *static_cast<const GraphFrameContext*>(userData));
         });
-    renderGraph_->readBuffer(pbrPass, graphVertexBuffer_,
-                             BufferState{
-                                 .stages = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
-                                           (rayQueryShadows
-                                                ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                                                : VkPipelineStageFlags2{0U}),
-                                 .access = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
-                                           (rayQueryShadows
-                                                ? VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-                                                : VkAccessFlags2{0U}),
-                             });
-    renderGraph_->readBuffer(pbrPass, graphIndexBuffer_,
-                             BufferState{
-                                 .stages = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
-                                           (rayQueryShadows
-                                                ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                                                : VkPipelineStageFlags2{0U}),
-                                 .access = VK_ACCESS_2_INDEX_READ_BIT |
-                                           (rayQueryShadows
-                                                ? VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-                                                : VkAccessFlags2{0U}),
-                             });
-    renderGraph_->readBuffer(pbrPass, graphInstanceBuffer_,
-                             BufferState{
-                                 .stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                                           (rayQueryShadows
-                                                ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                                                : VkPipelineStageFlags2{0U}),
-                                 .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-                             });
+    renderGraph_->readBuffer(
+        pbrPass, graphVertexBuffer_,
+        BufferState{
+            .stages = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                      (rayQueryShadows ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                       : VkPipelineStageFlags2{0U}),
+            .access = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                      (rayQueryShadows ? VK_ACCESS_2_SHADER_STORAGE_READ_BIT : VkAccessFlags2{0U}),
+        });
+    renderGraph_->readBuffer(
+        pbrPass, graphIndexBuffer_,
+        BufferState{
+            .stages = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
+                      (rayQueryShadows ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                       : VkPipelineStageFlags2{0U}),
+            .access = VK_ACCESS_2_INDEX_READ_BIT |
+                      (rayQueryShadows ? VK_ACCESS_2_SHADER_STORAGE_READ_BIT : VkAccessFlags2{0U}),
+        });
+    renderGraph_->readBuffer(
+        pbrPass, graphInstanceBuffer_,
+        BufferState{
+            .stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                      (rayQueryShadows ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                       : VkPipelineStageFlags2{0U}),
+            .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        });
     renderGraph_->readBuffer(pbrPass, graphVisibleInstanceBuffer_,
                              BufferState{
                                  .stages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
@@ -5320,6 +5997,7 @@ void Renderer::createRenderGraph() {
     }
 
     graphUpscalingSourceImage_ = postProcessSource;
+    graphReactiveMaskImage_ = {};
     graphUpscaledImage_ = graphUpscalingSourceImage_;
     graphUpscaledDepthImage_ = {};
     if (spatialUpscalingEnabled()) {
@@ -5333,8 +6011,19 @@ void Renderer::createRenderGraph() {
             },
             vulkan::ImageViewCreateInfo{});
     } else if (temporalUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        graphReactiveMaskImage_ = renderGraph_->createTransientImage(
+            "Temporal upscaling reactive mask",
+            vulkan::ImageCreateInfo{
+                .extent = {outputExtent.width, outputExtent.height, 1U},
+                .format = reactiveMaskFormat_,
+                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            },
+            vulkan::ImageViewCreateInfo{});
         graphUpscaledImage_ = graphUpscalingHistoryColorWriteImage_;
         graphUpscaledDepthImage_ = graphUpscalingHistoryDepthWriteImage_;
+    } else if (dlssUpscalingEnabled()) {
+        graphUpscaledImage_ = graphDlssOutputImage_;
     }
     render_graph::PassHandle initializeUpscalingHistoryPass{};
     if (temporalUpscalingEnabled()) {
@@ -5356,12 +6045,10 @@ void Renderer::createRenderGraph() {
                 constexpr VkClearColorValue depthClear{{1.0F, 0.0F, 0.0F, 0.0F}};
                 vkCmdClearColorImage(commandBuffer,
                                      graph.image(graphUpscalingHistoryColorReadImage_),
-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colorClear, 1U,
-                                     &range);
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colorClear, 1U, &range);
                 vkCmdClearColorImage(commandBuffer,
                                      graph.image(graphUpscalingHistoryDepthReadImage_),
-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &depthClear, 1U,
-                                     &range);
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &depthClear, 1U, &range);
             });
         const ImageState clearState{
             .stages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
@@ -5373,9 +6060,23 @@ void Renderer::createRenderGraph() {
         renderGraph_->writeImage(initializeUpscalingHistoryPass,
                                  graphUpscalingHistoryDepthReadImage_, clearState);
     }
+    render_graph::PassHandle reactiveMaskPass{};
+    if (temporalUpscalingEnabled()) {
+        reactiveMaskPass = renderGraph_->addPass(
+            "Generate temporal reactive mask", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                   const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error("Reactive-mask pass requires frame context");
+                }
+                recordReactiveMaskPass(commandBuffer, graph,
+                                       *static_cast<const GraphFrameContext*>(userData));
+            });
+    }
     const render_graph::PassHandle upscalingPass = renderGraph_->addPass(
-        spatialUpscalingEnabled()   ? "Spatial upscaling"
+        spatialUpscalingEnabled()    ? "Spatial upscaling"
         : temporalUpscalingEnabled() ? "Temporal upscaling"
+        : dlssUpscalingEnabled()     ? "NVIDIA DLSS Super Resolution"
                                      : "Native upscaling",
         QueueType::graphics,
         [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
@@ -5389,33 +6090,66 @@ void Renderer::createRenderGraph() {
     if (temporalUpscalingEnabled()) {
         renderGraph_->addDependency(initializeUpscalingHistoryPass, upscalingPass);
     }
-    renderGraph_->readImage(upscalingPass, graphUpscalingSourceImage_,
-                            config_.taaEnabled ? historySampledState : sampledImageState);
+    const ImageState dlssReadState{
+        .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    renderGraph_->readImage(
+        upscalingPass, graphUpscalingSourceImage_,
+        dlssUpscalingEnabled()
+            ? dlssReadState
+            : (config_.taaEnabled ? historySampledState : sampledImageState));
+    if (dlssUpscalingEnabled()) {
+        renderGraph_->readImage(upscalingPass, graphDepthImage_, dlssReadState);
+        renderGraph_->readImage(upscalingPass, graphMotionImage_, dlssReadState);
+    }
     if (temporalUpscalingEnabled()) {
+        renderGraph_->addDependency(initializeUpscalingHistoryPass, reactiveMaskPass);
+        renderGraph_->addDependency(reactiveMaskPass, upscalingPass);
+        renderGraph_->readImage(reactiveMaskPass, graphUpscalingSourceImage_, sampledImageState);
+        renderGraph_->readImage(reactiveMaskPass, graphDepthImage_, sampledImageState);
+        renderGraph_->readImage(reactiveMaskPass, graphMotionImage_, sampledImageState);
+        renderGraph_->readImage(reactiveMaskPass, graphUpscalingHistoryColorReadImage_,
+                                sampledImageState);
+        renderGraph_->readImage(reactiveMaskPass, graphUpscalingHistoryDepthReadImage_,
+                                sampledImageState);
+        renderGraph_->writeImage(reactiveMaskPass, graphReactiveMaskImage_,
+                                 ImageState{
+                                     .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                     .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                 });
         renderGraph_->readImage(upscalingPass, graphDepthImage_, sampledImageState);
         renderGraph_->readImage(upscalingPass, graphMotionImage_, sampledImageState);
         renderGraph_->readImage(upscalingPass, graphUpscalingHistoryColorReadImage_,
                                 sampledImageState);
         renderGraph_->readImage(upscalingPass, graphUpscalingHistoryDepthReadImage_,
                                 sampledImageState);
+        renderGraph_->readImage(upscalingPass, graphReactiveMaskImage_, sampledImageState);
     }
     if (upscalingDispatchEnabled()) {
-        renderGraph_->writeImage(
-            upscalingPass, graphUpscaledImage_,
-            ImageState{
-                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            });
+        renderGraph_->writeImage(upscalingPass, graphUpscaledImage_,
+                                 dlssUpscalingEnabled()
+                                     ? ImageState{
+                                           .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                           .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                           .layout = VK_IMAGE_LAYOUT_GENERAL,
+                                       }
+                                     : ImageState{
+                                           .stages =
+                                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                           .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                           .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                       });
     }
     if (temporalUpscalingEnabled()) {
-        renderGraph_->writeImage(
-            upscalingPass, graphUpscaledDepthImage_,
-            ImageState{
-                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            });
+        renderGraph_->writeImage(upscalingPass, graphUpscaledDepthImage_,
+                                 ImageState{
+                                     .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                     .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                 });
         const render_graph::PassHandle preserveUpscalingDepthPass =
             renderGraph_->addPass("Preserve temporal upscaling depth", QueueType::graphics);
         renderGraph_->addDependency(upscalingPass, preserveUpscalingDepthPass);
@@ -5434,14 +6168,16 @@ void Renderer::createRenderGraph() {
                                   *static_cast<const GraphFrameContext*>(userData));
         });
     renderGraph_->addDependency(upscalingPass, toneMappingPass);
-    renderGraph_->readImage(
-        toneMappingPass, graphUpscaledImage_,
-        upscalingDispatchEnabled() ? sampledImageState
-                                   : (config_.taaEnabled ? historySampledState
-                                                         : sampledImageState));
+    renderGraph_->readImage(toneMappingPass, graphUpscaledImage_,
+                            upscalingDispatchEnabled()
+                                ? sampledImageState
+                                : (config_.taaEnabled ? historySampledState : sampledImageState));
     if (config_.bloomEnabled) {
         renderGraph_->readImage(toneMappingPass, graphBloomLevels_.front().filtered,
                                 sampledImageState);
+    }
+    if (config_.temporalDebugView == TemporalDebugView::reactiveMask) {
+        renderGraph_->readImage(toneMappingPass, graphReactiveMaskImage_, sampledImageState);
     }
     renderGraph_->readImage(toneMappingPass, graphMotionImage_, sampledImageState);
     renderGraph_->readBuffer(toneMappingPass, graphUniformBuffer_,
@@ -5502,10 +6238,11 @@ void Renderer::createRenderGraph() {
                            "Hi-Z build"),
               config_.taaEnabled ? " -> Temporal resolve" : "",
               config_.bloomEnabled ? " -> Bloom" : " -> Bloom skipped",
-              spatialUpscalingEnabled()
-                  ? " -> Spatial upscaling -> Tone mapping"
+              spatialUpscalingEnabled() ? " -> Spatial upscaling -> Tone mapping"
               : temporalUpscalingEnabled()
-                  ? " -> Temporal upscaling -> Tone mapping"
+                  ? " -> Reactive mask -> Temporal upscaling -> Tone mapping"
+              : dlssUpscalingEnabled()
+                  ? " -> NVIDIA DLSS Super Resolution -> Tone mapping"
                   : " -> Native upscaling -> Tone mapping",
               graphCaptureBuffer_ ? " -> Capture" : "", " -> Present");
 
@@ -5513,9 +6250,16 @@ void Renderer::createRenderGraph() {
         const VkExtent2D outputExtent = swapchain_.extent();
         const std::uint64_t outputBytes =
             static_cast<std::uint64_t>(outputExtent.width) * outputExtent.height * 8U;
-        core::log(core::LogLevel::info, "Spatial upscaling HDR output at ",
-                  outputExtent.width, "x", outputExtent.height, ": ",
-                  static_cast<double>(outputBytes) / (1024.0 * 1024.0), " MiB transient");
+        core::log(core::LogLevel::info, "Spatial upscaling HDR output at ", outputExtent.width, "x",
+                  outputExtent.height, ": ", static_cast<double>(outputBytes) / (1024.0 * 1024.0),
+                  " MiB transient");
+    } else if (temporalUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        const std::uint64_t maskBytes =
+            static_cast<std::uint64_t>(outputExtent.width) * outputExtent.height;
+        core::log(core::LogLevel::info, "Temporal reactive mask at ", outputExtent.width, "x",
+                  outputExtent.height, ": ", static_cast<double>(maskBytes) / (1024.0 * 1024.0),
+                  " MiB transient");
     }
 
     const post::ResourceMemory memory = post::resourceMemory(
@@ -5544,10 +6288,10 @@ void Renderer::createRenderGraph() {
                            shadowDrawCountBuffers_[cascadeIndex]->size();
     }
     core::log(core::LogLevel::info, "Directional shadow resources: ",
-              rasterShadowMaps ? "three active cascades at " : "inactive fallbacks at ",
-              shadowSize, "x", shadowSize, ", images ",
-              static_cast<double>(shadowImageBytes) / bytesPerMiB, " MiB transient; GPU work ",
-              static_cast<double>(shadowWorkBytes) / bytesPerMiB, " MiB persistent");
+              rasterShadowMaps ? "three active cascades at " : "inactive fallbacks at ", shadowSize,
+              "x", shadowSize, ", images ", static_cast<double>(shadowImageBytes) / bytesPerMiB,
+              " MiB transient; GPU work ", static_cast<double>(shadowWorkBytes) / bytesPerMiB,
+              " MiB persistent");
     for (std::size_t levelIndex = 0; levelIndex < memory.bloomLevels.size(); ++levelIndex) {
         const post::BloomLevelMemory& level = memory.bloomLevels[levelIndex];
         core::log(core::LogLevel::info, "Bloom level ", levelIndex, " at ", level.width, "x",
@@ -5559,11 +6303,13 @@ void Renderer::createRenderGraph() {
 
 void Renderer::updatePathTracingDescriptors() {
     if (!pathTracingEnabled() || !pathTracingDescriptorPool_ || !topLevelStructure_ ||
-        !pathTracingAccumulationView_ || !pathTracingDirectView_ ||
-        !pathTracingSurfaceView_ ||
+        !pathTracingAccumulationView_ || !pathTracingDirectView_ || !pathTracingSurfaceView_ ||
         !pathTracingNormalView_ || !pathTracingMotionDepthView_ || !pathTracingDepthView_ ||
-        !rayTracingGeometryBuffer_ ||
-        !environmentSamplingBuffer_ || !emissiveTriangleBuffer_) {
+        !nrdDiffuseInputView_ || !nrdSpecularInputView_ || !nrdMaterialView_ ||
+        !rayReconstructionDiffuseAlbedoView_ || !rayReconstructionSpecularAlbedoView_ ||
+        !rayReconstructionNormalRoughnessView_ ||
+        !rayReconstructionSpecularHitDistanceView_ ||
+        !rayTracingGeometryBuffer_ || !environmentSamplingBuffer_ || !emissiveTriangleBuffer_) {
         throw std::runtime_error("Path-tracing descriptors require complete ray resources");
     }
     const VkAccelerationStructureKHR topLevelHandle = topLevelStructure_->handle();
@@ -5587,6 +6333,21 @@ void Renderer::updatePathTracingDescriptors() {
                               .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
         VkDescriptorImageInfo{.imageView = pathTracingDepthView_->handle(),
                               .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = nrdDiffuseInputView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = nrdSpecularInputView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = nrdMaterialView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = rayReconstructionDiffuseAlbedoView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = rayReconstructionSpecularAlbedoView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = rayReconstructionNormalRoughnessView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{
+            .imageView = rayReconstructionSpecularHitDistanceView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
     };
     const VkDescriptorImageInfo environmentInfo{
         .sampler = iblSampler_->handle(),
@@ -5609,12 +6370,10 @@ void Renderer::updatePathTracingDescriptors() {
                 ? pathAnimatedTransformBuffers_[frameIndex].get()
                 : transformBuffer_.get();
         const std::array storageBuffers{
-            VkDescriptorBufferInfo{.buffer = vertexBuffer_->handle(),
-                                   .offset = 0U,
-                                   .range = vertexBuffer_->size()},
-            VkDescriptorBufferInfo{.buffer = indexBuffer_->handle(),
-                                   .offset = 0U,
-                                   .range = indexBuffer_->size()},
+            VkDescriptorBufferInfo{
+                .buffer = vertexBuffer_->handle(), .offset = 0U, .range = vertexBuffer_->size()},
+            VkDescriptorBufferInfo{
+                .buffer = indexBuffer_->handle(), .offset = 0U, .range = indexBuffer_->size()},
             VkDescriptorBufferInfo{.buffer = instanceBuffer_->handle(),
                                    .offset = 0U,
                                    .range = instanceBuffer_->size()},
@@ -5633,7 +6392,7 @@ void Renderer::updatePathTracingDescriptors() {
             .offset = 0U,
             .range = sizeof(FrameUniform),
         };
-        std::array<VkWriteDescriptorSet, 17> writes{};
+        std::array<VkWriteDescriptorSet, 24> writes{};
         writes[0] = {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext = &accelerationWrite,
@@ -5692,8 +6451,7 @@ void Renderer::updatePathTracingDescriptors() {
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .pBufferInfo = &emissiveTriangleInfo,
         };
-        for (std::size_t imageIndex = 0; imageIndex < reconstructionInfos.size();
-             ++imageIndex) {
+        for (std::size_t imageIndex = 0; imageIndex < reconstructionInfos.size(); ++imageIndex) {
             writes[12U + imageIndex] = {
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = pathTracingDescriptorPool_->set(frameIndex),
@@ -5756,8 +6514,8 @@ void Renderer::updatePathHistoryDescriptors() {
                 .descriptorCount = 1U,
                 .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo = sampled ? &sampledInfos[binding]
-                                      : &storageInfos[binding - sampledInfos.size()],
+                .pImageInfo =
+                    sampled ? &sampledInfos[binding] : &storageInfos[binding - sampledInfos.size()],
             };
         }
         vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
@@ -5768,14 +6526,14 @@ void Renderer::updatePathHistoryDescriptors() {
 void Renderer::updatePathReconstructionDescriptors() {
     if (!pathTracingEnabled() || !pathReconstructionDescriptorPool_ || !brdfLutSampler_ ||
         !hiZSampler_ || !pathTracingAccumulationView_ || !pathTracingMotionDepthView_ ||
-        !pathHistoryValidityView_) {
+        !pathHistoryValidityView_ || !pathDenoisedView_) {
         throw std::runtime_error(
             "Path reconstruction descriptors require complete temporal resources");
     }
     for (std::size_t writeIndex = 0U; writeIndex < framesInFlight; ++writeIndex) {
         const std::size_t readIndex = 1U - writeIndex;
-        if (!pathReconstructionViews_[readIndex] || !pathReconstructionViews_[writeIndex] ||
-            !pathMomentViews_[readIndex] || !pathMomentViews_[writeIndex]) {
+        if (!pathReconstructionViews_[writeIndex] || !pathMomentViews_[readIndex] ||
+            !pathMomentViews_[writeIndex]) {
             throw std::runtime_error("Path reconstruction ping-pong resources are incomplete");
         }
         const std::array sampledInfos{
@@ -5789,7 +6547,7 @@ void Renderer::updatePathReconstructionDescriptors() {
                                   .imageView = pathHistoryValidityView_->handle(),
                                   .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
             VkDescriptorImageInfo{.sampler = brdfLutSampler_->handle(),
-                                  .imageView = pathReconstructionViews_[readIndex]->handle(),
+                                  .imageView = pathDenoisedView_->handle(),
                                   .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
             VkDescriptorImageInfo{.sampler = brdfLutSampler_->handle(),
                                   .imageView = pathMomentViews_[readIndex]->handle(),
@@ -5815,8 +6573,8 @@ void Renderer::updatePathReconstructionDescriptors() {
                 .descriptorCount = 1U,
                 .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
                                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo = sampled ? &sampledInfos[binding]
-                                      : &outputInfos[binding - sampledInfos.size()],
+                .pImageInfo =
+                    sampled ? &sampledInfos[binding] : &outputInfos[binding - sampledInfos.size()],
             };
         }
         vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
@@ -5826,8 +6584,11 @@ void Renderer::updatePathReconstructionDescriptors() {
 
 void Renderer::updatePathDenoisingDescriptors() {
     if (!pathTracingEnabled() || !pathDenoisingDescriptorPool_ || !hiZSampler_ ||
-        !pathTracingSurfaceView_ || !pathTracingNormalView_ ||
-        !pathTracingMotionDepthView_ || !pathTracingDepthView_ || !pathDenoisedView_) {
+        !pathTracingDirectView_ || !pathTracingSurfaceView_ || !pathTracingNormalView_ ||
+        !pathTracingMotionDepthView_ || !pathTracingDepthView_ ||
+        !pathDenoisingDirectViews_.front() || !pathDenoisingDirectViews_.back() ||
+        !pathDenoisingIndirectViews_.front() || !pathDenoisingIndirectViews_.back() ||
+        !pathDenoisedView_) {
         throw std::runtime_error(
             "Path denoising descriptors require complete reconstruction resources");
     }
@@ -5835,52 +6596,176 @@ void Renderer::updatePathDenoisingDescriptors() {
         if (!pathReconstructionViews_[writeIndex] || !pathMomentViews_[writeIndex]) {
             throw std::runtime_error("Path denoising frame resources are incomplete");
         }
-        const std::array sampledInfos{
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathReconstructionViews_[writeIndex]->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingSurfaceView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingNormalView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingMotionDepthView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingDepthView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathMomentViews_[writeIndex]->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        };
-        const VkDescriptorImageInfo outputInfo{
-            .imageView = pathDenoisedView_->handle(),
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
-        std::array<VkWriteDescriptorSet, 7> writes{};
-        for (std::size_t binding = 0U; binding < sampledInfos.size(); ++binding) {
-            writes[binding] = {
+        for (std::size_t passIndex = 0U; passIndex < pathDenoisingPassCount; ++passIndex) {
+            const vulkan::ImageView& directInput = passIndex == 0U
+                                                       ? *pathTracingDirectView_
+                                                       : *pathDenoisingDirectViews_[passIndex - 1U];
+            const vulkan::ImageView& indirectOrBeautyInput =
+                passIndex == 0U ? *pathReconstructionViews_[writeIndex]
+                                : *pathDenoisingIndirectViews_[passIndex - 1U];
+            const std::array sampledInfos{
+                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                                      .imageView = directInput.handle(),
+                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                                      .imageView = indirectOrBeautyInput.handle(),
+                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                                      .imageView = pathTracingSurfaceView_->handle(),
+                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                                      .imageView = pathTracingNormalView_->handle(),
+                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                                      .imageView = pathTracingMotionDepthView_->handle(),
+                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                                      .imageView = pathTracingDepthView_->handle(),
+                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                                      .imageView = pathMomentViews_[writeIndex]->handle(),
+                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+            };
+            const bool finalPass = passIndex + 1U == pathDenoisingPassCount;
+            const std::size_t scratchOutput = finalPass ? 0U : passIndex;
+            const VkImageView directOutput =
+                finalPass ? pathDenoisedView_->handle()
+                          : pathDenoisingDirectViews_[scratchOutput]->handle();
+            const VkImageView indirectOutput =
+                finalPass ? pathDenoisedView_->handle()
+                          : pathDenoisingIndirectViews_[scratchOutput]->handle();
+            // All statically reachable storage descriptors must name an image
+            // transitioned by this graph pass, even though the push-constant
+            // branch writes only scratch outputs or only final radiance.
+            const VkImageView radianceOutput =
+                finalPass ? pathDenoisedView_->handle() : directOutput;
+            const std::array outputInfos{
+                VkDescriptorImageInfo{
+                    .imageView = directOutput,
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                },
+                VkDescriptorImageInfo{
+                    .imageView = indirectOutput,
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                },
+                VkDescriptorImageInfo{
+                    .imageView = radianceOutput,
+                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                },
+            };
+            const std::size_t descriptorIndex = writeIndex * pathDenoisingPassCount + passIndex;
+            std::array<VkWriteDescriptorSet, 10> writes{};
+            for (std::size_t binding = 0U; binding < writes.size(); ++binding) {
+                const bool sampled = binding < sampledInfos.size();
+                writes[binding] = {
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = pathDenoisingDescriptorPool_->set(descriptorIndex),
+                    .dstBinding = static_cast<std::uint32_t>(binding),
+                    .descriptorCount = 1U,
+                    .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                              : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    .pImageInfo = sampled ? &sampledInfos[binding]
+                                          : &outputInfos[binding - sampledInfos.size()],
+                };
+            }
+            vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
+                                   writes.data(), 0U, nullptr);
+        }
+    }
+}
+
+void Renderer::updateNrdDescriptors() {
+#if RENDERER_ENABLE_NRD
+    if (!pathTracingEnabled() || !pathNrdPrepareDescriptorPool_ ||
+        !pathNrdResolveDescriptorPool_ || !hiZSampler_ ||
+        !pathTracingAccumulationView_ || !pathTracingSurfaceView_ ||
+        !pathTracingNormalView_ || !pathTracingMotionDepthView_ ||
+        !pathTracingDepthView_ || !nrdMotionView_ || !nrdNormalRoughnessView_ ||
+        !nrdViewZView_ || !nrdDiffuseInputView_ || !nrdSpecularInputView_ || !nrdMaterialView_ ||
+        !nrdDiffuseOutputView_ || !nrdSpecularOutputView_ || !pathDenoisedView_) {
+        throw std::runtime_error("NVIDIA NRD descriptors require complete guide and signal resources");
+    }
+    const std::array prepareSampledInfos{
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = pathTracingSurfaceView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = pathTracingNormalView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = pathTracingMotionDepthView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = pathTracingDepthView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+    };
+    const std::array prepareStorageInfos{
+        VkDescriptorImageInfo{.imageView = nrdMotionView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = nrdNormalRoughnessView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.imageView = nrdViewZView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+    };
+    const std::array resolveSampledInfos{
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = nrdDiffuseOutputView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = nrdSpecularOutputView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = nrdMaterialView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = pathTracingMotionDepthView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
+                              .imageView = pathTracingAccumulationView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+    };
+    const VkDescriptorImageInfo resolveStorageInfo{
+        .imageView = pathDenoisedView_->handle(),
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    for (std::size_t frameIndex = 0U; frameIndex < framesInFlight; ++frameIndex) {
+        std::array<VkWriteDescriptorSet, 7> prepareWrites{};
+        for (std::size_t binding = 0U; binding < prepareWrites.size(); ++binding) {
+            const bool sampled = binding < prepareSampledInfos.size();
+            prepareWrites[binding] = {
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = pathDenoisingDescriptorPool_->set(writeIndex),
+                .dstSet = pathNrdPrepareDescriptorPool_->set(frameIndex),
                 .dstBinding = static_cast<std::uint32_t>(binding),
                 .descriptorCount = 1U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                .pImageInfo = &sampledInfos[binding],
+                .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = sampled
+                                  ? &prepareSampledInfos[binding]
+                                  : &prepareStorageInfos[binding - prepareSampledInfos.size()],
             };
         }
-        writes.back() = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = pathDenoisingDescriptorPool_->set(writeIndex),
-            .dstBinding = 6U,
-            .descriptorCount = 1U,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .pImageInfo = &outputInfo,
-        };
-        vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
-                               writes.data(), 0U, nullptr);
+        vkUpdateDescriptorSets(device_.handle(),
+                               static_cast<std::uint32_t>(prepareWrites.size()),
+                               prepareWrites.data(), 0U, nullptr);
+
+        std::array<VkWriteDescriptorSet, 6> resolveWrites{};
+        for (std::size_t binding = 0U; binding < resolveWrites.size(); ++binding) {
+            const bool sampled = binding < resolveSampledInfos.size();
+            resolveWrites[binding] = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = pathNrdResolveDescriptorPool_->set(frameIndex),
+                .dstBinding = static_cast<std::uint32_t>(binding),
+                .descriptorCount = 1U,
+                .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = sampled ? &resolveSampledInfos[binding] : &resolveStorageInfo,
+            };
+        }
+        vkUpdateDescriptorSets(device_.handle(),
+                               static_cast<std::uint32_t>(resolveWrites.size()),
+                               resolveWrites.data(), 0U, nullptr);
     }
+#endif
 }
 
 render_graph::ImageHandle Renderer::pathPresentationSourceImage() const {
@@ -5914,8 +6799,7 @@ render_graph::ImageHandle Renderer::pathPresentationSourceImage() const {
     throw std::runtime_error("Unknown path presentation source");
 }
 
-const vulkan::ImageView&
-Renderer::pathPresentationSourceView(std::size_t frameIndex) const {
+const vulkan::ImageView& Renderer::pathPresentationSourceView(std::size_t frameIndex) const {
     const vulkan::ImageView* selectedView = nullptr;
     switch (config_.pathDebugView) {
     case PathDebugView::final:
@@ -5960,8 +6844,8 @@ Renderer::pathPresentationSourceView(std::size_t frameIndex) const {
 }
 
 void Renderer::updateUpscalingDescriptor() {
-    if (!upscalingDescriptorPool_ || !temporalUpscalingDescriptorPool_ ||
-        !brdfLutSampler_ || !hiZSampler_ || !renderGraph_) {
+    if (!upscalingDescriptorPool_ || !reactiveMaskDescriptorPool_ ||
+        !temporalUpscalingDescriptorPool_ || !brdfLutSampler_ || !hiZSampler_ || !renderGraph_) {
         throw std::runtime_error("Upscaling descriptors require complete renderer resources");
     }
     for (std::size_t index = 0U; index < framesInFlight; ++index) {
@@ -5997,7 +6881,7 @@ void Renderer::updateUpscalingDescriptor() {
         }
         const std::size_t historyReadIndex = 1U - index;
         if (!upscalingHistoryColorViews_[historyReadIndex] ||
-            !upscalingHistoryDepthViews_[historyReadIndex]) {
+            !upscalingHistoryDepthViews_[historyReadIndex] || !graphReactiveMaskImage_) {
             throw std::runtime_error("Temporal upscaling descriptor history is incomplete");
         }
         const VkDescriptorImageInfo depthInfo{
@@ -6014,7 +6898,7 @@ void Renderer::updateUpscalingDescriptor() {
             .imageLayout = pathTracingEnabled() ? VK_IMAGE_LAYOUT_GENERAL
                                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         };
-        const std::array temporalInfos{
+        const std::array<VkDescriptorImageInfo, 5> temporalSourceInfos{
             sourceInfo,
             depthInfo,
             motionInfo,
@@ -6029,7 +6913,33 @@ void Renderer::updateUpscalingDescriptor() {
                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             },
         };
-        std::array<VkWriteDescriptorSet, 5> writes{};
+        std::array<VkWriteDescriptorSet, 5> reactiveWrites{};
+        for (std::size_t bindingIndex = 0U; bindingIndex < reactiveWrites.size(); ++bindingIndex) {
+            reactiveWrites[bindingIndex] = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = reactiveMaskDescriptorPool_->set(index),
+                .dstBinding = static_cast<std::uint32_t>(bindingIndex),
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &temporalSourceInfos[bindingIndex],
+            };
+        }
+        vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(reactiveWrites.size()),
+                               reactiveWrites.data(), 0U, nullptr);
+
+        const std::array<VkDescriptorImageInfo, 6> temporalInfos{
+            temporalSourceInfos[0],
+            temporalSourceInfos[1],
+            temporalSourceInfos[2],
+            temporalSourceInfos[3],
+            temporalSourceInfos[4],
+            VkDescriptorImageInfo{
+                .sampler = hiZSampler_->handle(),
+                .imageView = renderGraph_->imageView(graphReactiveMaskImage_),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+        };
+        std::array<VkWriteDescriptorSet, 6> writes{};
         for (std::size_t bindingIndex = 0U; bindingIndex < writes.size(); ++bindingIndex) {
             writes[bindingIndex] = {
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -6057,14 +6967,14 @@ void Renderer::updateToneMappingDescriptor() {
         };
         for (std::size_t index = 0; index < framesInFlight; ++index) {
             const vulkan::ImageView& pathSource = pathPresentationSourceView(index);
-            const VkImageView selectedView = spatialUpscalingEnabled()
-                                                 ? renderGraph_->imageView(graphUpscaledImage_)
-                                             : temporalUpscalingEnabled()
-                                                 ? upscalingHistoryColorViews_[index]->handle()
-                                                 : pathSource.handle();
-            const VkImageLayout selectedLayout =
-                upscalingDispatchEnabled() ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                           : VK_IMAGE_LAYOUT_GENERAL;
+            const VkImageView selectedView =
+                spatialUpscalingEnabled()    ? renderGraph_->imageView(graphUpscaledImage_)
+                : temporalUpscalingEnabled() ? upscalingHistoryColorViews_[index]->handle()
+                : dlssUpscalingEnabled()     ? dlssOutputView_->handle()
+                                             : pathSource.handle();
+            const VkImageLayout selectedLayout = upscalingDispatchEnabled()
+                                                     ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                     : VK_IMAGE_LAYOUT_GENERAL;
             const VkDescriptorImageInfo selectedInfo{
                 .sampler = brdfLutSampler_->handle(),
                 .imageView = selectedView,
@@ -6120,6 +7030,7 @@ void Renderer::updateToneMappingDescriptor() {
         .imageView = renderGraph_->imageView(graphNormalImage_),
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     };
+    const bool reactiveMaskDebug = config_.temporalDebugView == TemporalDebugView::reactiveMask;
     for (std::size_t index = 0; index < framesInFlight; ++index) {
         const VkDescriptorImageInfo bloomSourceInfo{
             .sampler = brdfLutSampler_->handle(),
@@ -6130,10 +7041,10 @@ void Renderer::updateToneMappingDescriptor() {
         };
         const VkDescriptorImageInfo postProcessInfo{
             .sampler = brdfLutSampler_->handle(),
-            .imageView = spatialUpscalingEnabled()
-                             ? renderGraph_->imageView(graphUpscaledImage_)
+            .imageView = spatialUpscalingEnabled() ? renderGraph_->imageView(graphUpscaledImage_)
                          : temporalUpscalingEnabled()
                              ? upscalingHistoryColorViews_[index]->handle()
+                         : dlssUpscalingEnabled() ? dlssOutputView_->handle()
                              : (config_.taaEnabled ? historyColorViews_[index]->handle()
                                                    : currentColorInfo.imageView),
             .imageLayout = upscalingDispatchEnabled()
@@ -6143,11 +7054,13 @@ void Renderer::updateToneMappingDescriptor() {
         };
         const VkDescriptorImageInfo bloomInfo{
             .sampler = brdfLutSampler_->handle(),
-            .imageView = config_.bloomEnabled
+            .imageView = reactiveMaskDebug ? renderGraph_->imageView(graphReactiveMaskImage_)
+                         : config_.bloomEnabled
                              ? renderGraph_->imageView(graphBloomLevels_.front().filtered)
                              : postProcessInfo.imageView,
-            .imageLayout = config_.bloomEnabled ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                                : postProcessInfo.imageLayout,
+            .imageLayout = reactiveMaskDebug || config_.bloomEnabled
+                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                               : postProcessInfo.imageLayout,
         };
         const std::array toneWrites{
             VkWriteDescriptorSet{
@@ -6438,9 +7351,20 @@ void Renderer::resetCamera() {
     constexpr float verticalFieldOfView = 42.0F;
     const float cameraDistance =
         sceneRadius_ / std::sin(glm::radians(verticalFieldOfView * 0.5F)) * 1.10F;
-    cameraYaw_ = -0.5F * std::numbers::pi_v<float>;
     cameraPitch_ = 0.0F;
-    cameraPosition_ = sceneCenter_ + glm::vec3(0.0F, 0.0F, cameraDistance);
+    if (config_.cameraStartView == CameraStartView::interior) {
+        const glm::vec3 extent = sceneMaximum_ - sceneMinimum_;
+        cameraYaw_ = std::numbers::pi_v<float>;
+        cameraPosition_ = sceneCenter_ + glm::vec3(extent.x * 0.32F, 0.0F, 0.0F);
+        cameraPosition_.y = sceneMinimum_.y + extent.y * 0.18F;
+    } else if (config_.cameraStartView == CameraStartView::side) {
+        cameraYaw_ = std::numbers::pi_v<float>;
+        cameraPosition_ = sceneCenter_ + glm::vec3(cameraDistance, 0.0F, 0.0F);
+    } else {
+        cameraYaw_ = -0.5F * std::numbers::pi_v<float>;
+        cameraPosition_ = sceneCenter_ + glm::vec3(0.0F, 0.0F, cameraDistance);
+    }
+    temporalScriptOriginYaw_ = cameraYaw_;
     temporalScriptOrigin_ = cameraPosition_;
     temporalState_.reset();
     cameraMovedThisFrame_ = true;
@@ -6497,7 +7421,11 @@ void Renderer::updateCamera() {
     movement -= input.moveDown ? up : glm::vec3(0.0F);
     const float movementLengthSquared = glm::dot(movement, movement);
     if (movementLengthSquared > 0.0F) {
-        const float speed = sceneRadius_ * (input.speedBoost ? 6.0F : 1.5F);
+        // Keep ordinary navigation precise even in large imported scenes. The old
+        // 1.5x-radius default crossed Sponza in well under a second, which made
+        // inspection of path-traced detail impractical. Shift retains that old
+        // traversal speed for deliberate fast movement.
+        const float speed = sceneRadius_ * (input.speedBoost ? 1.5F : 0.35F);
         cameraPosition_ += movement / std::sqrt(movementLengthSquared) * speed * deltaSeconds;
     }
 
@@ -6518,7 +7446,7 @@ void Renderer::updateCamera() {
     } else if (config_.temporalCameraScript == TemporalCameraScript::rotate) {
         constexpr float rotationRadiansPerFrame = 0.025F;
         cameraPosition_ = temporalScriptOrigin_;
-        cameraYaw_ = -0.5F * std::numbers::pi_v<float> +
+        cameraYaw_ = temporalScriptOriginYaw_ +
                      static_cast<float>(renderedFrameCount_) * rotationRadiansPerFrame;
     } else if (config_.temporalCameraScript == TemporalCameraScript::approach) {
         constexpr float travelPerFrame = 0.08F;
@@ -6550,10 +7478,18 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
     const float cameraDistance = glm::length(cameraPosition_ - sceneCenter_);
     const float nearPlane = std::max(cameraDistance - sceneRadius_ * 1.5F, sceneRadius_ * 0.001F);
     const float farPlane = std::max(cameraDistance + sceneRadius_ * 2.0F, sceneRadius_ * 4.0F);
+    cameraNear_ = nearPlane;
+    cameraFar_ = farPlane;
+    cameraFovRadians_ = glm::radians(verticalFieldOfView);
     glm::mat4 projection =
         glm::perspectiveRH_ZO(glm::radians(verticalFieldOfView), aspect, nearPlane, farPlane);
     projection[1][1] *= -1.0F;
-    const bool jitterEnabled = (config_.taaEnabled || temporalUpscalingEnabled()) &&
+    // Path tracing owns primary-ray sampling. Jittering its projection makes
+    // the per-pixel accumulated radiance disagree with the current first-hit
+    // AOVs, which causes stationary denoising/upscaling shimmer.
+    const bool jitterEnabled = (!pathTracingEnabled() || rayReconstructionEnabled()) &&
+                               (config_.taaEnabled || temporalUpscalingEnabled() ||
+                                dlssUpscalingEnabled()) &&
                                config_.postTestPattern == post::TestPattern::none;
     temporalState_.beginFrame(view, projection, extent.width, extent.height, renderedFrameCount_,
                               jitterEnabled);
@@ -6569,7 +7505,7 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         .motionVectorsAvailable = true,
         .jitterAvailable = true,
         .exposureAvailable = true,
-        .reactiveMaskAvailable = false,
+        .reactiveMaskAvailable = temporalUpscalingEnabled(),
         .currentJitterPixels = {currentCamera.jitterPixels.x, currentCamera.jitterPixels.y},
         .previousJitterPixels = {previousCamera.jitterPixels.x, previousCamera.jitterPixels.y},
         .exposureScale = exposureScale,
@@ -6629,6 +7565,7 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         config_.pathDebugView == PathDebugView::final
             ? 0U
             : 4U + static_cast<std::uint32_t>(config_.pathDebugView);
+    const float proceduralLightScale = config_.hdriBackdropDemo ? 0.0F : 1.0F;
     const FrameUniform uniform{
         .viewProjection = currentCamera.jitteredViewProjection,
         .inverseViewProjection = glm::inverse(currentCamera.jitteredViewProjection),
@@ -6636,38 +7573,34 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         .previousViewProjection = previousCamera.jitteredViewProjection,
         .previousUnjitteredViewProjection = previousCamera.unjitteredViewProjection,
         .cameraPositionExposure = {cameraPosition_, exposureScale},
-        .directionalDirectionIntensity = {directionalLightTravel, 3.5F},
+        .directionalDirectionIntensity = {directionalLightTravel, 3.5F * proceduralLightScale},
         .directionalColor = {1.0F, 0.92F, 0.82F,
                              config_.postTestPattern == post::TestPattern::none
-                                 ? 0.0F
+                                 ? config_.filmGrainIntensity
                                  : config_.postTestPosition.y},
         .pointPositionIntensity = {sceneCenter_ + glm::vec3(-0.60F, 0.45F, 0.85F) * sceneRadius_,
-                                   3.0F * sceneRadius_ * sceneRadius_},
+                                   3.0F * sceneRadius_ * sceneRadius_ * proceduralLightScale},
         .pointColorRange = {0.45F, 0.65F, 1.0F, sceneRadius_ * 4.0F},
         .environmentParameters =
             {environmentRotationRadians_,
-             pathTracingEnabled()
-                 ? (config_.pathEnvironmentImportanceSampling ? 1.0F : 0.0F)
-                 : (config_.postTestPattern == post::TestPattern::none
-                        ? 0.0F
-                        : config_.postTestSourceValue),
+             pathTracingEnabled() ? (config_.pathEnvironmentImportanceSampling ? 1.0F : 0.0F)
+                                  : (config_.postTestPattern == post::TestPattern::none
+                                         ? 0.0F
+                                         : config_.postTestSourceValue),
              pathTracingEnabled()
                  ? static_cast<float>(config_.pathMaxBounces)
                  : (config_.postTestPattern == post::TestPattern::movingSquare
-                        ? std::min(0.85F,
-                                   0.15F + static_cast<float>(renderedFrameCount_) * 0.05F)
+                        ? std::min(0.85F, 0.15F + static_cast<float>(renderedFrameCount_) * 0.05F)
                         : (config_.postTestPattern == post::TestPattern::none
                                ? 0.0F
                                : config_.postTestPosition.x)),
              pathTracingEnabled()
                  ? static_cast<float>(pathRussianRouletteStartDepth)
                  : (config_.postTestPattern == post::TestPattern::movingSquare
-                        ? std::min(0.85F,
-                                   0.15F +
-                                       static_cast<float>(renderedFrameCount_ > 0U
-                                                              ? renderedFrameCount_ - 1U
-                                                              : 0U) *
-                                           0.05F)
+                        ? std::min(0.85F, 0.15F + static_cast<float>(renderedFrameCount_ > 0U
+                                                                         ? renderedFrameCount_ - 1U
+                                                                         : 0U) *
+                                                      0.05F)
                         : (config_.postTestPattern == post::TestPattern::none
                                ? 0.0F
                                : config_.postTestPosition.x))},
@@ -6686,7 +7619,11 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
                           pathTracingEnabled()
                               ? pathDebugCode
                               : static_cast<std::uint32_t>(config_.temporalDebugView),
-                          config_.taaEnabled ? 1U : 0U, config_.bloomEnabled ? 1U : 0U},
+                          config_.taaEnabled || temporalUpscalingEnabled() ||
+                                  dlssUpscalingEnabled()
+                              ? 1U
+                              : 0U,
+                          config_.bloomEnabled ? 1U : 0U},
         .shadowSceneCenterRadius = shadowCascades[0],
         .shadowCascadeCenterRadius1 = shadowCascades[1],
         .shadowCascadeCenterRadius2 = shadowCascades[2],
@@ -6704,49 +7641,76 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
 void Renderer::recreateSwapchain() {
     const auto [width, height] = window_.waitForDrawableSize();
     (void)window_.consumeFramebufferResize();
-    if (width == 0 || height == 0) {
+    if (width == 0 || height == 0 || window_.shouldClose()) {
         return;
     }
     vulkan::check(vkDeviceWaitIdle(device_.handle()), "vkDeviceWaitIdle(swapchain recreation)");
+    const VkFormat previousFormat = swapchain_.format();
+    const VkExtent2D previousRenderExtent = renderExtent();
+    const VkExtent2D previousOutputExtent = swapchain_.extent();
+    if (!swapchain_.recreate(width, height)) {
+        return;
+    }
     for (VkSemaphore semaphore : renderFinishedSemaphores_) {
         vkDestroySemaphore(device_.handle(), semaphore, nullptr);
     }
     renderFinishedSemaphores_.clear();
-    const VkFormat previousFormat = swapchain_.format();
-    swapchain_.recreate(width, height);
-    renderGraph_.reset();
     const VkExtent2D resizedRenderExtent = renderExtent();
     const VkExtent2D resizedOutputExtent = swapchain_.extent();
-    core::log(core::LogLevel::info, "Upscaler resize: ", upscaler_->name(), ", quality ",
-              upscaling::qualityModeName(upscaler_->qualityMode()), ", render ",
-              resizedRenderExtent.width, "x", resizedRenderExtent.height, " -> output ",
-              resizedOutputExtent.width, "x", resizedOutputExtent.height,
-              "; reconstruction history reset");
-    if (pathTracingEnabled() &&
-        (pathTracingImageInitialized_ || pathTracingSampleIndex_ > 0U)) {
-        ++pathTracingResetCount_;
-    }
-    createCaptureBuffer();
-    createTemporalResources();
-    createUpscalingHistoryResources();
-    createPathTracingResources();
-    createRenderGraph();
-    if (pathTracingEnabled()) {
-        updatePathTracingDescriptors();
-        updatePathHistoryDescriptors();
-        updatePathReconstructionDescriptors();
-        updatePathDenoisingDescriptors();
+    const bool outputExtentChanged = resizedOutputExtent.width != previousOutputExtent.width ||
+                                     resizedOutputExtent.height != previousOutputExtent.height;
+    const bool renderExtentChanged = resizedRenderExtent.width != previousRenderExtent.width ||
+                                     resizedRenderExtent.height != previousRenderExtent.height;
+    const bool formatChanged = swapchain_.format() != previousFormat;
+    const bool rebuildFrameSizedResources =
+        outputExtentChanged || renderExtentChanged || formatChanged;
+    if (rebuildFrameSizedResources) {
+#if RENDERER_ENABLE_STREAMLINE
+        if (dlssUpscalingEnabled() && streamlineRuntime_ != nullptr) {
+            streamlineRuntime_->releaseDlssResources();
+        }
+#endif
+        renderGraph_.reset();
+        core::log(core::LogLevel::info, "Upscaler resize: ", upscaler_->name(), ", quality ",
+                  upscaling::qualityModeName(upscaler_->qualityMode()), ", render ",
+                  resizedRenderExtent.width, "x", resizedRenderExtent.height, " -> output ",
+                  resizedOutputExtent.width, "x", resizedOutputExtent.height,
+                  "; reconstruction history reset");
+        if (pathTracingEnabled() &&
+            (pathTracingImageInitialized_ || pathTracingSampleIndex_ > 0U)) {
+            ++pathTracingResetCount_;
+        }
+        createCaptureBuffer();
+        createTemporalResources();
+        createUpscalingHistoryResources();
+        createPathTracingResources();
+        createRenderGraph();
+        if (pathTracingEnabled()) {
+            updatePathTracingDescriptors();
+            updatePathHistoryDescriptors();
+            updatePathReconstructionDescriptors();
+            updatePathDenoisingDescriptors();
+#if RENDERER_ENABLE_NRD
+            if (!rayReconstructionEnabled()) {
+                updateNrdDescriptors();
+            }
+#endif
+        } else {
+            updateShadowDescriptor();
+        }
+        updateUpscalingDescriptor();
+        updateToneMappingDescriptor();
+        if (!pathTracingEnabled()) {
+            updateHiZDescriptors();
+        }
+        hiZReady_ = false;
+        if (formatChanged) {
+            createGraphicsPipelines();
+        }
     } else {
-        updateShadowDescriptor();
-    }
-    updateUpscalingDescriptor();
-    updateToneMappingDescriptor();
-    if (!pathTracingEnabled()) {
-        updateHiZDescriptors();
-    }
-    hiZReady_ = false;
-    if (swapchain_.format() != previousFormat) {
-        createGraphicsPipelines();
+        core::log(core::LogLevel::info, "Swapchain restored at unchanged ",
+                  resizedOutputExtent.width, "x", resizedOutputExtent.height,
+                  "; offscreen images and temporal/path history preserved");
     }
     const VkSemaphoreCreateInfo semaphoreInfo{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
@@ -6759,7 +7723,7 @@ void Renderer::recreateSwapchain() {
         renderFinishedSemaphores_.push_back(semaphore);
     }
     imageInitialized_.assign(swapchain_.imageCount(), false);
-    if (pathTracingEnabled()) {
+    if (pathTracingEnabled() && rebuildFrameSizedResources) {
         core::log(core::LogLevel::info,
                   "Path-tracing accumulation reset after swapchain recreation");
     }
@@ -6793,18 +7757,33 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
     };
     renderGraph_->bindImportedImage(graphSwapchainImage_, swapchain_.image(imageIndex),
                                     swapchainState, render_graph::QueueType::graphics);
-    renderGraph_->bindImportedBuffer(graphUniformBuffer_, uniformBuffers_[frameIndex]->handle(), 0,
-                                     uniformBuffers_[frameIndex]->size(),
-                                     render_graph::BufferState{
-                                         .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                                   VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                                                   VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                                                   (pathTracingEnabled()
-                                                        ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
-                                                        : VkPipelineStageFlags2{0U}),
-                                         .access = VK_ACCESS_2_UNIFORM_READ_BIT,
-                                     },
-                                     render_graph::QueueType::graphics);
+    renderGraph_->bindImportedBuffer(
+        graphUniformBuffer_, uniformBuffers_[frameIndex]->handle(), 0,
+        uniformBuffers_[frameIndex]->size(),
+        render_graph::BufferState{
+            .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                      (pathTracingEnabled() ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
+                                            : VkPipelineStageFlags2{0U}),
+            .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+        },
+        render_graph::QueueType::graphics);
+    if (dlssUpscalingEnabled()) {
+        if (!dlssOutputImage_ || !graphDlssOutputImage_) {
+            throw std::runtime_error("DLSS output binding is incomplete");
+        }
+        const render_graph::ImageState outputState =
+            dlssOutputLayoutInitialized_
+                ? render_graph::ImageState{
+                      .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                      .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                      .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  }
+                : render_graph::ImageState{};
+        renderGraph_->bindImportedImage(graphDlssOutputImage_, dlssOutputImage_->handle(),
+                                        outputState, render_graph::QueueType::graphics);
+    }
     if (temporalUpscalingEnabled()) {
         const std::size_t historyWriteIndex = frameIndex;
         const std::size_t historyReadIndex = 1U - historyWriteIndex;
@@ -6816,33 +7795,29 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                       .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                   }
                 : render_graph::ImageState{};
-        renderGraph_->bindImportedImage(
-            graphUpscalingHistoryColorReadImage_,
-            upscalingHistoryColorImages_[historyReadIndex]->handle(), historyState,
-            render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphUpscalingHistoryColorWriteImage_,
-            upscalingHistoryColorImages_[historyWriteIndex]->handle(), historyState,
-            render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphUpscalingHistoryDepthReadImage_,
-            upscalingHistoryDepthImages_[historyReadIndex]->handle(), historyState,
-            render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphUpscalingHistoryDepthWriteImage_,
-            upscalingHistoryDepthImages_[historyWriteIndex]->handle(), historyState,
-            render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphUpscalingHistoryColorReadImage_,
+                                        upscalingHistoryColorImages_[historyReadIndex]->handle(),
+                                        historyState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphUpscalingHistoryColorWriteImage_,
+                                        upscalingHistoryColorImages_[historyWriteIndex]->handle(),
+                                        historyState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphUpscalingHistoryDepthReadImage_,
+                                        upscalingHistoryDepthImages_[historyReadIndex]->handle(),
+                                        historyState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphUpscalingHistoryDepthWriteImage_,
+                                        upscalingHistoryDepthImages_[historyWriteIndex]->handle(),
+                                        historyState, render_graph::QueueType::graphics);
     }
     if (pathTracingEnabled()) {
         if (pathAnimatedTransformBuffers_[frameIndex]) {
-            renderGraph_->bindImportedBuffer(
-                graphTransformBuffer_, pathAnimatedTransformBuffers_[frameIndex]->handle(), 0U,
-                pathAnimatedTransformBuffers_[frameIndex]->size(),
-                render_graph::BufferState{
-                    .stages = VK_PIPELINE_STAGE_2_HOST_BIT,
-                    .access = VK_ACCESS_2_HOST_WRITE_BIT,
-                },
-                render_graph::QueueType::graphics);
+            renderGraph_->bindImportedBuffer(graphTransformBuffer_,
+                                             pathAnimatedTransformBuffers_[frameIndex]->handle(),
+                                             0U, pathAnimatedTransformBuffers_[frameIndex]->size(),
+                                             render_graph::BufferState{
+                                                 .stages = VK_PIPELINE_STAGE_2_HOST_BIT,
+                                                 .access = VK_ACCESS_2_HOST_WRITE_BIT,
+                                             },
+                                             render_graph::QueueType::graphics);
         }
         const render_graph::ImageState accumulationState =
             pathTracingImageInitialized_
@@ -6852,23 +7827,39 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                       .layout = VK_IMAGE_LAYOUT_GENERAL,
                   }
                 : render_graph::ImageState{};
+        renderGraph_->bindImportedImage(graphPathTracingAccumulationImage_,
+                                        pathTracingAccumulationImage_->handle(), accumulationState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathTracingDirectImage_,
+                                        pathTracingDirectImage_->handle(), accumulationState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathTracingSurfaceImage_,
+                                        pathTracingSurfaceImage_->handle(), accumulationState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathTracingNormalImage_,
+                                        pathTracingNormalImage_->handle(), accumulationState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathTracingMotionDepthImage_,
+                                        pathTracingMotionDepthImage_->handle(), accumulationState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathTracingDepthImage_,
+                                        pathTracingDepthImage_->handle(), accumulationState,
+                                        render_graph::QueueType::graphics);
         renderGraph_->bindImportedImage(
-            graphPathTracingAccumulationImage_, pathTracingAccumulationImage_->handle(),
-            accumulationState, render_graph::QueueType::graphics);
+            graphRayReconstructionDiffuseAlbedoImage_,
+            rayReconstructionDiffuseAlbedoImage_->handle(), accumulationState,
+            render_graph::QueueType::graphics);
         renderGraph_->bindImportedImage(
-            graphPathTracingDirectImage_, pathTracingDirectImage_->handle(),
-            accumulationState, render_graph::QueueType::graphics);
+            graphRayReconstructionSpecularAlbedoImage_,
+            rayReconstructionSpecularAlbedoImage_->handle(), accumulationState,
+            render_graph::QueueType::graphics);
         renderGraph_->bindImportedImage(
-            graphPathTracingSurfaceImage_, pathTracingSurfaceImage_->handle(),
-            accumulationState, render_graph::QueueType::graphics);
+            graphRayReconstructionNormalRoughnessImage_,
+            rayReconstructionNormalRoughnessImage_->handle(), accumulationState,
+            render_graph::QueueType::graphics);
         renderGraph_->bindImportedImage(
-            graphPathTracingNormalImage_, pathTracingNormalImage_->handle(),
-            accumulationState, render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathTracingMotionDepthImage_, pathTracingMotionDepthImage_->handle(),
-            accumulationState, render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathTracingDepthImage_, pathTracingDepthImage_->handle(), accumulationState,
+            graphRayReconstructionSpecularHitDistanceImage_,
+            rayReconstructionSpecularHitDistanceImage_->handle(), accumulationState,
             render_graph::QueueType::graphics);
         const std::size_t historyWriteIndex = frameIndex;
         const std::size_t historyReadIndex = 1U - historyWriteIndex;
@@ -6896,22 +7887,21 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                       .layout = VK_IMAGE_LAYOUT_GENERAL,
                   }
                 : render_graph::ImageState{};
-        renderGraph_->bindImportedImage(
-            graphPathHistoryNormalReadImage_, pathHistoryNormalImages_[historyReadIndex]->handle(),
-            historyReadState, render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathHistoryNormalWriteImage_,
-            pathHistoryNormalImages_[historyWriteIndex]->handle(), historyWriteState,
-            render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathHistoryDepthReadImage_, pathHistoryDepthImages_[historyReadIndex]->handle(),
-            historyReadState, render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathHistoryDepthWriteImage_, pathHistoryDepthImages_[historyWriteIndex]->handle(),
-            historyWriteState, render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathHistoryValidityImage_, pathHistoryValidityImage_->handle(), validityState,
-            render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathHistoryNormalReadImage_,
+                                        pathHistoryNormalImages_[historyReadIndex]->handle(),
+                                        historyReadState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathHistoryNormalWriteImage_,
+                                        pathHistoryNormalImages_[historyWriteIndex]->handle(),
+                                        historyWriteState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathHistoryDepthReadImage_,
+                                        pathHistoryDepthImages_[historyReadIndex]->handle(),
+                                        historyReadState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathHistoryDepthWriteImage_,
+                                        pathHistoryDepthImages_[historyWriteIndex]->handle(),
+                                        historyWriteState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathHistoryValidityImage_,
+                                        pathHistoryValidityImage_->handle(), validityState,
+                                        render_graph::QueueType::graphics);
         const render_graph::ImageState reconstructionReadState =
             pathHistoryLayoutsInitialized_
                 ? render_graph::ImageState{
@@ -6928,14 +7918,13 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                       .layout = VK_IMAGE_LAYOUT_GENERAL,
                   }
                 : render_graph::ImageState{};
-        renderGraph_->bindImportedImage(
-            graphPathReconstructionReadImage_,
-            pathReconstructionImages_[historyReadIndex]->handle(), reconstructionReadState,
-            render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathReconstructionWriteImage_,
-            pathReconstructionImages_[historyWriteIndex]->handle(), reconstructionWriteState,
-            render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathReconstructionReadImage_,
+                                        pathReconstructionImages_[historyReadIndex]->handle(),
+                                        reconstructionReadState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathReconstructionWriteImage_,
+                                        pathReconstructionImages_[historyWriteIndex]->handle(),
+                                        reconstructionWriteState,
+                                        render_graph::QueueType::graphics);
         const render_graph::ImageState momentState =
             pathHistoryLayoutsInitialized_
                 ? render_graph::ImageState{
@@ -6944,12 +7933,29 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                       .layout = VK_IMAGE_LAYOUT_GENERAL,
                   }
                 : render_graph::ImageState{};
-        renderGraph_->bindImportedImage(
-            graphPathMomentReadImage_, pathMomentImages_[historyReadIndex]->handle(),
-            momentState, render_graph::QueueType::graphics);
-        renderGraph_->bindImportedImage(
-            graphPathMomentWriteImage_, pathMomentImages_[historyWriteIndex]->handle(),
-            momentState, render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathMomentReadImage_,
+                                        pathMomentImages_[historyReadIndex]->handle(), momentState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathMomentWriteImage_,
+                                        pathMomentImages_[historyWriteIndex]->handle(), momentState,
+                                        render_graph::QueueType::graphics);
+        const render_graph::ImageState denoisingScratchState =
+            pathHistoryLayoutsInitialized_
+                ? render_graph::ImageState{
+                      .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                      .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                      .layout = VK_IMAGE_LAYOUT_GENERAL,
+                  }
+                : render_graph::ImageState{};
+        for (std::size_t index = 0U; index < pathDenoisingDirectImages_.size(); ++index) {
+            renderGraph_->bindImportedImage(
+                graphPathDenoisingDirectImages_[index], pathDenoisingDirectImages_[index]->handle(),
+                denoisingScratchState, render_graph::QueueType::graphics);
+            renderGraph_->bindImportedImage(graphPathDenoisingIndirectImages_[index],
+                                            pathDenoisingIndirectImages_[index]->handle(),
+                                            denoisingScratchState,
+                                            render_graph::QueueType::graphics);
+        }
         const render_graph::ImageState denoisedState =
             pathHistoryLayoutsInitialized_
                 ? render_graph::ImageState{
@@ -6958,13 +7964,46 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                       .layout = VK_IMAGE_LAYOUT_GENERAL,
                   }
                 : render_graph::ImageState{};
-        renderGraph_->bindImportedImage(
-            graphPathDenoisedImage_, pathDenoisedImage_->handle(), denoisedState,
-            render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphPathDenoisedImage_, pathDenoisedImage_->handle(),
+                                        denoisedState, render_graph::QueueType::graphics);
+#if RENDERER_ENABLE_NRD
+        const render_graph::ImageState nrdExternalState =
+            nrdExternalLayoutsInitialized_
+                ? render_graph::ImageState{
+                      .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                      .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                      .layout = VK_IMAGE_LAYOUT_GENERAL,
+                  }
+                : render_graph::ImageState{};
+        renderGraph_->bindImportedImage(graphNrdDiffuseInputImage_,
+                                        nrdDiffuseInputImage_->handle(), nrdExternalState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphNrdSpecularInputImage_,
+                                        nrdSpecularInputImage_->handle(), nrdExternalState,
+                                        render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(graphNrdMaterialImage_, nrdMaterialImage_->handle(),
+                                        nrdExternalState, render_graph::QueueType::graphics);
+        if (!rayReconstructionEnabled()) {
+            renderGraph_->bindImportedImage(graphNrdMotionImage_, nrdMotionImage_->handle(),
+                                            nrdExternalState, render_graph::QueueType::graphics);
+            renderGraph_->bindImportedImage(graphNrdNormalRoughnessImage_,
+                                            nrdNormalRoughnessImage_->handle(), nrdExternalState,
+                                            render_graph::QueueType::graphics);
+            renderGraph_->bindImportedImage(graphNrdViewZImage_, nrdViewZImage_->handle(),
+                                            nrdExternalState, render_graph::QueueType::graphics);
+            renderGraph_->bindImportedImage(graphNrdDiffuseOutputImage_,
+                                            nrdDiffuseOutputImage_->handle(), nrdExternalState,
+                                            render_graph::QueueType::graphics);
+            renderGraph_->bindImportedImage(graphNrdSpecularOutputImage_,
+                                            nrdSpecularOutputImage_->handle(), nrdExternalState,
+                                            render_graph::QueueType::graphics);
+        }
+#endif
         if (captureReadbackBuffer_) {
-            renderGraph_->bindImportedBuffer(
-                graphCaptureBuffer_, captureReadbackBuffer_->handle(), 0U,
-                captureReadbackBuffer_->size(), {}, render_graph::QueueType::graphics);
+            renderGraph_->bindImportedBuffer(graphCaptureBuffer_, captureReadbackBuffer_->handle(),
+                                             0U, captureReadbackBuffer_->size(), {},
+                                             render_graph::QueueType::graphics);
         }
         if (pathAovReadbackBuffer_) {
             renderGraph_->bindImportedBuffer(
@@ -7235,17 +8274,46 @@ void Renderer::recordPathTracingPass(VkCommandBuffer commandBuffer,
         pathTracingDescriptorPool_->set(context.frameIndex),
         bindlessDescriptorPool_->set(0),
     };
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-                            pathTracingPipeline_->layout(), 0U,
-                            static_cast<std::uint32_t>(descriptorSets.size()),
-                            descriptorSets.data(), 0U, nullptr);
-    vkCmdPushConstants(commandBuffer, pathTracingPipeline_->layout(),
-                       VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0U, sizeof(pathTracingSampleIndex_),
-                       &pathTracingSampleIndex_);
+    vkCmdBindDescriptorSets(
+        commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pathTracingPipeline_->layout(), 0U,
+        static_cast<std::uint32_t>(descriptorSets.size()), descriptorSets.data(), 0U, nullptr);
     const VkExtent2D extent = renderExtent();
-    vkCmdTraceRaysKHR(commandBuffer, &pathTracingPipeline_->rayGenerationRegion(),
-                      &pathTracingPipeline_->missRegion(), &pathTracingPipeline_->hitRegion(),
-                      &pathTracingPipeline_->callableRegion(), extent.width, extent.height, 1U);
+    const VkShaderStageFlags pathTracingStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+                                                 VK_SHADER_STAGE_MISS_BIT_KHR |
+                                                 VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    for (std::uint32_t sampleInFrame = 0U; sampleInFrame < pathSamplesThisFrame_; ++sampleInFrame) {
+        const PathTracingControls controls{
+            .sampleIndex = rayReconstructionEnabled()
+                               ? static_cast<std::uint32_t>(renderedFrameCount_) + sampleInFrame
+                               : pathTracingSampleIndex_ + sampleInFrame,
+            .sampleInFrame = sampleInFrame,
+            .samplesThisFrame = pathSamplesThisFrame_,
+            .fixedPrimarySample = rayReconstructionEnabled()
+                                      ? 2U
+                                      : (temporalUpscalingEnabled() ? 1U : 0U),
+        };
+        vkCmdPushConstants(commandBuffer, pathTracingPipeline_->layout(), pathTracingStages, 0U,
+                           sizeof(controls), &controls);
+        vkCmdTraceRaysKHR(commandBuffer, &pathTracingPipeline_->rayGenerationRegion(),
+                          &pathTracingPipeline_->missRegion(), &pathTracingPipeline_->hitRegion(),
+                          &pathTracingPipeline_->callableRegion(), extent.width, extent.height, 1U);
+        if (sampleInFrame + 1U < pathSamplesThisFrame_) {
+            const VkMemoryBarrier2 sampleBarrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                .dstAccessMask =
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            };
+            const VkDependencyInfo dependency{
+                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                .memoryBarrierCount = 1U,
+                .pMemoryBarriers = &sampleBarrier,
+            };
+            vkCmdPipelineBarrier2(commandBuffer, &dependency);
+        }
+    }
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathTracing, true);
 }
 
@@ -7262,8 +8330,8 @@ void Renderer::recordPathHistoryPass(VkCommandBuffer commandBuffer,
                             pathHistoryPipeline_->layout(), 0U, 1U, &descriptorSet, 0U, nullptr);
     const std::uint32_t historyValid =
         pathHistoryLayoutsInitialized_ && temporalState_.historyValid() ? 1U : 0U;
-    vkCmdPushConstants(commandBuffer, pathHistoryPipeline_->layout(),
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(historyValid), &historyValid);
+    vkCmdPushConstants(commandBuffer, pathHistoryPipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT,
+                       0U, sizeof(historyValid), &historyValid);
     constexpr std::uint32_t workgroupSize = 8U;
     const VkExtent2D extent = renderExtent();
     vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
@@ -7277,8 +8345,7 @@ void Renderer::recordPathReconstructionPass(VkCommandBuffer commandBuffer,
         throw std::runtime_error(
             "Path reconstruction dispatch requires a complete compute pipeline");
     }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathReconstruction,
-                      false);
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathReconstruction, false);
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pathReconstructionPipeline_->handle());
     const VkDescriptorSet descriptorSet =
@@ -7286,9 +8353,12 @@ void Renderer::recordPathReconstructionPass(VkCommandBuffer commandBuffer,
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pathReconstructionPipeline_->layout(), 0U, 1U, &descriptorSet, 0U,
                             nullptr);
+    const PathReconstructionControls controls{
+        .sampleIndex = pathTracingSampleIndex_,
+        .samplesThisFrame = pathSamplesThisFrame_,
+    };
     vkCmdPushConstants(commandBuffer, pathReconstructionPipeline_->layout(),
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(pathTracingSampleIndex_),
-                       &pathTracingSampleIndex_);
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(controls), &controls);
     constexpr std::uint32_t workgroupSize = 8U;
     const VkExtent2D extent = renderExtent();
     vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
@@ -7297,27 +8367,150 @@ void Renderer::recordPathReconstructionPass(VkCommandBuffer commandBuffer,
 }
 
 void Renderer::recordPathDenoisingPass(VkCommandBuffer commandBuffer,
-                                       const GraphFrameContext& context) {
-    if (!pathDenoisingPipeline_ || !pathDenoisingDescriptorPool_) {
-        throw std::runtime_error(
-            "Path denoising dispatch requires a complete compute pipeline");
+                                       const GraphFrameContext& context, std::size_t passIndex) {
+    if (!pathDenoisingPipeline_ || !pathDenoisingDescriptorPool_ ||
+        passIndex >= pathDenoisingPassCount) {
+        throw std::runtime_error("Path denoising dispatch requires a complete compute pipeline");
     }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathDenoising, false);
+    if (passIndex == 0U) {
+        writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathDenoising, false);
+    }
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pathDenoisingPipeline_->handle());
-    const VkDescriptorSet descriptorSet =
-        pathDenoisingDescriptorPool_->set(context.frameIndex);
+    const std::size_t descriptorIndex = context.frameIndex * pathDenoisingPassCount + passIndex;
+    const VkDescriptorSet descriptorSet = pathDenoisingDescriptorPool_->set(descriptorIndex);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pathDenoisingPipeline_->layout(), 0U, 1U, &descriptorSet, 0U,
-                            nullptr);
-    vkCmdPushConstants(commandBuffer, pathDenoisingPipeline_->layout(),
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(pathTracingSampleIndex_),
-                       &pathTracingSampleIndex_);
+                            pathDenoisingPipeline_->layout(), 0U, 1U, &descriptorSet, 0U, nullptr);
+    const PathDenoisingControls controls{
+        .sampleIndex = pathTracingSampleIndex_,
+        .stepWidth = 1U << static_cast<std::uint32_t>(passIndex),
+        .passIndex = static_cast<std::uint32_t>(passIndex),
+        .passCount = static_cast<std::uint32_t>(pathDenoisingPassCount),
+        .samplesThisFrame = pathSamplesThisFrame_,
+    };
+    vkCmdPushConstants(commandBuffer, pathDenoisingPipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT,
+                       0U, sizeof(controls), &controls);
     constexpr std::uint32_t workgroupSize = 8U;
     const VkExtent2D extent = renderExtent();
     vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
                   (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathDenoising, true);
+    if (passIndex + 1U == pathDenoisingPassCount) {
+        writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathDenoising, true);
+    }
+}
+
+void Renderer::recordNrdPreparePass(VkCommandBuffer commandBuffer,
+                                    const GraphFrameContext& context) {
+#if RENDERER_ENABLE_NRD
+    if (!pathNrdPreparePipeline_ || !pathNrdPrepareDescriptorPool_) {
+        throw std::runtime_error("NRD guide preparation requires a complete compute pipeline");
+    }
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdPrepare, false);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      pathNrdPreparePipeline_->handle());
+    const VkDescriptorSet descriptorSet = pathNrdPrepareDescriptorPool_->set(context.frameIndex);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pathNrdPreparePipeline_->layout(), 0U, 1U, &descriptorSet, 0U,
+                            nullptr);
+    const glm::mat4 inverseProjection =
+        glm::inverse(temporalState_.current().unjitteredProjection);
+    vkCmdPushConstants(commandBuffer, pathNrdPreparePipeline_->layout(),
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(inverseProjection),
+                       glm::value_ptr(inverseProjection));
+    constexpr std::uint32_t workgroupSize = 8U;
+    const VkExtent2D extent = renderExtent();
+    vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
+                  (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdPrepare, true);
+#else
+    (void)commandBuffer;
+    (void)context;
+#endif
+}
+
+void Renderer::recordNrdDenoisingPass(VkCommandBuffer commandBuffer,
+                                      const GraphFrameContext& context) {
+#if RENDERER_ENABLE_NRD
+    if (!nrdDenoiser_ || !nrdMotionImage_ || !nrdMotionView_ ||
+        !nrdNormalRoughnessImage_ || !nrdNormalRoughnessView_ || !nrdViewZImage_ ||
+        !nrdViewZView_ || !nrdDiffuseInputImage_ || !nrdDiffuseInputView_ ||
+        !nrdSpecularInputImage_ || !nrdSpecularInputView_ || !nrdDiffuseOutputImage_ ||
+        !nrdDiffuseOutputView_ || !nrdSpecularOutputImage_ || !nrdSpecularOutputView_) {
+        throw std::runtime_error("NRD denoising requires complete external resources");
+    }
+    const auto matrixArray = [](const glm::mat4& matrix) {
+        std::array<float, 16> result{};
+        std::memcpy(result.data(), glm::value_ptr(matrix), sizeof(matrix));
+        return result;
+    };
+    const temporal::CameraMatrices& currentCamera = temporalState_.current();
+    const temporal::CameraMatrices& previousCamera = temporalState_.previousForRendering();
+    const VkExtent2D extent = renderExtent();
+    if (extent.width > std::numeric_limits<std::uint16_t>::max() ||
+        extent.height > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::runtime_error("NRD render extent exceeds its 16-bit API limit");
+    }
+    const nrd::CommonSettings settings = nvidia::makeNrdCommonSettings(
+        static_cast<std::uint16_t>(extent.width), static_cast<std::uint16_t>(extent.height),
+        static_cast<std::uint32_t>(renderedFrameCount_),
+        matrixArray(currentCamera.unjitteredProjection),
+        matrixArray(previousCamera.unjitteredProjection), matrixArray(currentCamera.view),
+        matrixArray(previousCamera.view), !temporalState_.historyValid());
+
+    nvidia::NrdExternalResourceTable externalResources{};
+    const auto bind = [&externalResources](nrd::ResourceType type, const vulkan::Image& image,
+                                           const vulkan::ImageView& view) {
+        externalResources[static_cast<std::size_t>(type)] = {
+            .image = image.handle(),
+            .view = view.handle(),
+            .format = image.format(),
+        };
+    };
+    bind(nrd::ResourceType::IN_MV, *nrdMotionImage_, *nrdMotionView_);
+    bind(nrd::ResourceType::IN_NORMAL_ROUGHNESS, *nrdNormalRoughnessImage_,
+         *nrdNormalRoughnessView_);
+    bind(nrd::ResourceType::IN_VIEWZ, *nrdViewZImage_, *nrdViewZView_);
+    bind(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, *nrdDiffuseInputImage_,
+         *nrdDiffuseInputView_);
+    bind(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, *nrdSpecularInputImage_,
+         *nrdSpecularInputView_);
+    bind(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, *nrdDiffuseOutputImage_,
+         *nrdDiffuseOutputView_);
+    bind(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, *nrdSpecularOutputImage_,
+         *nrdSpecularOutputView_);
+
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdDenoising, false);
+    nrdDenoiser_->record(commandBuffer, static_cast<std::uint32_t>(context.frameIndex), settings,
+                         externalResources);
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdDenoising, true);
+#else
+    (void)commandBuffer;
+    (void)context;
+#endif
+}
+
+void Renderer::recordNrdResolvePass(VkCommandBuffer commandBuffer,
+                                    const GraphFrameContext& context) {
+#if RENDERER_ENABLE_NRD
+    if (!pathNrdResolvePipeline_ || !pathNrdResolveDescriptorPool_) {
+        throw std::runtime_error("NRD resolve requires a complete compute pipeline");
+    }
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdResolve, false);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      pathNrdResolvePipeline_->handle());
+    const VkDescriptorSet descriptorSet = pathNrdResolveDescriptorPool_->set(context.frameIndex);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pathNrdResolvePipeline_->layout(), 0U, 1U, &descriptorSet, 0U,
+                            nullptr);
+    constexpr std::uint32_t workgroupSize = 8U;
+    const VkExtent2D extent = renderExtent();
+    vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
+                  (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdResolve, true);
+#else
+    (void)commandBuffer;
+    (void)context;
+#endif
 }
 
 void Renderer::recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
@@ -7337,8 +8530,7 @@ void Renderer::recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
         pathDenoisedImage_->handle(),
     };
     const VkExtent2D extent = renderExtent();
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathAovReadback,
-                      false);
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathAovReadback, false);
     for (std::size_t index = 0U; index < images.size(); ++index) {
         const VkBufferImageCopy copy{
             .bufferOffset = pathAovReadbackOffsets_[index],
@@ -7354,11 +8546,65 @@ void Renderer::recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
             .imageOffset = {0, 0, 0},
             .imageExtent = {extent.width, extent.height, 1U},
         };
-        vkCmdCopyImageToBuffer(commandBuffer, images[index],
-                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vkCmdCopyImageToBuffer(commandBuffer, images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                pathAovReadbackBuffer_->handle(), 1U, &copy);
     }
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathAovReadback, true);
+}
+
+void Renderer::recordReactiveMaskPass(VkCommandBuffer commandBuffer,
+                                      const render_graph::RenderGraph& graph,
+                                      const GraphFrameContext& context) {
+    if (!temporalUpscalingEnabled() || !reactiveMaskPipeline_ || !reactiveMaskDescriptorPool_ ||
+        !graphReactiveMaskImage_) {
+        throw std::runtime_error("Reactive-mask pipeline resources are incomplete");
+    }
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::reactiveMask, false);
+    const VkExtent2D outputExtent = swapchain_.extent();
+    const VkRenderingAttachmentInfo colorAttachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = graph.imageView(graphReactiveMaskImage_),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    const VkRenderingInfo renderingInfo{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = {.offset = {0, 0}, .extent = outputExtent},
+        .layerCount = 1U,
+        .colorAttachmentCount = 1U,
+        .pColorAttachments = &colorAttachment,
+    };
+    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    const VkViewport viewport{
+        .x = 0.0F,
+        .y = 0.0F,
+        .width = static_cast<float>(outputExtent.width),
+        .height = static_cast<float>(outputExtent.height),
+        .minDepth = 0.0F,
+        .maxDepth = 1.0F,
+    };
+    const VkRect2D scissor{.offset = {0, 0}, .extent = outputExtent};
+    vkCmdSetViewport(commandBuffer, 0U, 1U, &viewport);
+    vkCmdSetScissor(commandBuffer, 0U, 1U, &scissor);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      reactiveMaskPipeline_->handle());
+    const VkDescriptorSet descriptorSet = reactiveMaskDescriptorPool_->set(context.frameIndex);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            reactiveMaskPipeline_->layout(), 0U, 1U, &descriptorSet, 0U, nullptr);
+    const TemporalUpscalingControls controls{
+        .temporalJitter = {upscalingFramePlan_.currentJitterPixels.x,
+                           upscalingFramePlan_.currentJitterPixels.y,
+                           upscalingFramePlan_.previousJitterPixels.x,
+                           upscalingFramePlan_.previousJitterPixels.y},
+        .flags = {upscalingFramePlan_.resetHistory ? 0U : 1U, pathTracingEnabled() ? 1U : 0U, 0U,
+                  0U},
+    };
+    vkCmdPushConstants(commandBuffer, reactiveMaskPipeline_->layout(), VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0U, sizeof(controls), &controls);
+    vkCmdDraw(commandBuffer, 3U, 1U, 0U, 0U);
+    vkCmdEndRendering(commandBuffer);
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::reactiveMask, true);
 }
 
 void Renderer::recordUpscalingPass(VkCommandBuffer commandBuffer,
@@ -7380,8 +8626,12 @@ void Renderer::recordUpscalingPass(VkCommandBuffer commandBuffer,
         writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::upscaling, true);
         return;
     }
-    if ((spatialUpscalingEnabled() &&
-         (!spatialUpscalingPipeline_ || !upscalingDescriptorPool_)) ||
+    if (dlssUpscalingEnabled()) {
+        recordDlssPass(commandBuffer, graph, context);
+        writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::upscaling, true);
+        return;
+    }
+    if ((spatialUpscalingEnabled() && (!spatialUpscalingPipeline_ || !upscalingDescriptorPool_)) ||
         (temporalUpscalingEnabled() &&
          (!temporalUpscalingPipeline_ || !temporalUpscalingDescriptorPool_ ||
           !upscalingHistoryColorViews_[context.frameIndex] ||
@@ -7426,29 +8676,23 @@ void Renderer::recordUpscalingPass(VkCommandBuffer commandBuffer,
     const VkRect2D scissor{.offset = {0, 0}, .extent = expectedOutputExtent};
     vkCmdSetViewport(commandBuffer, 0U, 1U, &viewport);
     vkCmdSetScissor(commandBuffer, 0U, 1U, &scissor);
-    const vulkan::GraphicsPipeline& pipeline = temporalUpscalingEnabled()
-                                                   ? *temporalUpscalingPipeline_
-                                                   : *spatialUpscalingPipeline_;
+    const vulkan::GraphicsPipeline& pipeline =
+        temporalUpscalingEnabled() ? *temporalUpscalingPipeline_ : *spatialUpscalingPipeline_;
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle());
-    const VkDescriptorSet descriptorSet = temporalUpscalingEnabled()
-                                              ? temporalUpscalingDescriptorPool_->set(
-                                                    context.frameIndex)
-                                              : upscalingDescriptorPool_->set(context.frameIndex);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            pipeline.layout(), 0U, 1U, &descriptorSet, 0U, nullptr);
+    const VkDescriptorSet descriptorSet =
+        temporalUpscalingEnabled() ? temporalUpscalingDescriptorPool_->set(context.frameIndex)
+                                   : upscalingDescriptorPool_->set(context.frameIndex);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout(), 0U,
+                            1U, &descriptorSet, 0U, nullptr);
     if (temporalUpscalingEnabled()) {
-        struct TemporalUpscalingControls {
-            glm::vec4 temporalJitter{0.0F};
-            glm::uvec4 flags{0U};
-        };
-        static_assert(sizeof(TemporalUpscalingControls) == sizeof(glm::vec4) +
-                                                               sizeof(glm::uvec4));
+        static_assert(sizeof(TemporalUpscalingControls) == sizeof(glm::vec4) + sizeof(glm::uvec4));
         const TemporalUpscalingControls controls{
             .temporalJitter = {upscalingFramePlan_.currentJitterPixels.x,
                                upscalingFramePlan_.currentJitterPixels.y,
                                upscalingFramePlan_.previousJitterPixels.x,
                                upscalingFramePlan_.previousJitterPixels.y},
-            .flags = {upscalingFramePlan_.resetHistory ? 0U : 1U, 0U, 0U, 0U},
+            .flags = {upscalingFramePlan_.resetHistory ? 0U : 1U, pathTracingEnabled() ? 1U : 0U,
+                      cameraMovedThisFrame_ ? 1U : 0U, 0U},
         };
         vkCmdPushConstants(commandBuffer, pipeline.layout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0U,
                            sizeof(controls), &controls);
@@ -7456,6 +8700,160 @@ void Renderer::recordUpscalingPass(VkCommandBuffer commandBuffer,
     vkCmdDraw(commandBuffer, 3U, 1U, 0U, 0U);
     vkCmdEndRendering(commandBuffer);
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::upscaling, true);
+}
+
+void Renderer::recordDlssPass(VkCommandBuffer commandBuffer,
+                              const render_graph::RenderGraph& graph,
+                              const GraphFrameContext& context) {
+#if RENDERER_ENABLE_STREAMLINE
+    if (!streamlineRuntime_ || !dlssOutputImage_ || !dlssOutputView_) {
+        throw std::runtime_error("DLSS dispatch resources are incomplete");
+    }
+
+    const vulkan::Image* inputColorImage = nullptr;
+    VkImageView inputColorView = graph.imageView(graphUpscalingSourceImage_);
+    const vulkan::Image* depthImage = nullptr;
+    VkImageView depthView = VK_NULL_HANDLE;
+    const vulkan::Image* motionImage = nullptr;
+    VkImageView motionView = VK_NULL_HANDLE;
+    VkImageLayout inputLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    if (pathTracingEnabled()) {
+        if (rayReconstructionEnabled()) {
+            inputColorImage = pathTracingAccumulationImage_.get();
+            inputColorView = pathTracingAccumulationView_->handle();
+        } else {
+            inputColorView = pathPresentationSourceView(context.frameIndex).handle();
+            switch (config_.pathDebugView) {
+        case PathDebugView::final:
+        case PathDebugView::variance:
+            inputColorImage = pathDenoisedImage_.get();
+            break;
+        case PathDebugView::reconstructionWeight:
+        case PathDebugView::temporalRadiance:
+            inputColorImage = pathReconstructionImages_.at(context.frameIndex).get();
+            break;
+        case PathDebugView::direct:
+            inputColorImage = pathTracingDirectImage_.get();
+            break;
+        case PathDebugView::indirect:
+        case PathDebugView::lightingResidual:
+        case PathDebugView::rawRadiance:
+            inputColorImage = pathTracingAccumulationImage_.get();
+            break;
+        case PathDebugView::albedo:
+        case PathDebugView::roughness:
+            inputColorImage = pathTracingSurfaceImage_.get();
+            break;
+        case PathDebugView::geometricNormal:
+        case PathDebugView::shadingNormal:
+            inputColorImage = pathTracingNormalImage_.get();
+            break;
+        case PathDebugView::motion:
+        case PathDebugView::hitDistance:
+            inputColorImage = pathTracingMotionDepthImage_.get();
+            break;
+        case PathDebugView::depth:
+            inputColorImage = pathTracingDepthImage_.get();
+            break;
+        case PathDebugView::historyValidity:
+            inputColorImage = pathHistoryValidityImage_.get();
+            break;
+            }
+        }
+        depthImage = pathTracingDepthImage_.get();
+        depthView = pathTracingDepthView_->handle();
+        motionImage = pathTracingMotionDepthImage_.get();
+        motionView = pathTracingMotionDepthView_->handle();
+    } else {
+        inputColorImage = graph.ownedImage(graphUpscalingSourceImage_);
+        depthImage = graph.ownedImage(graphDepthImage_);
+        depthView = graph.imageView(graphDepthImage_);
+        motionImage = graph.ownedImage(graphMotionImage_);
+        motionView = graph.imageView(graphMotionImage_);
+    }
+    if (inputColorImage == nullptr || depthImage == nullptr || motionImage == nullptr ||
+        inputColorView == VK_NULL_HANDLE || depthView == VK_NULL_HANDLE ||
+        motionView == VK_NULL_HANDLE) {
+        throw std::runtime_error("DLSS input images are incomplete");
+    }
+
+    const temporal::CameraMatrices& currentCamera = temporalState_.current();
+    const temporal::CameraMatrices& previousCamera = temporalState_.previousForRendering();
+    const glm::mat4 clipToPrevClip =
+        previousCamera.unjitteredViewProjection *
+        glm::inverse(currentCamera.unjitteredViewProjection);
+    const glm::mat4 prevClipToClip = glm::inverse(clipToPrevClip);
+    const glm::vec3 forward = cameraForward(cameraYaw_, cameraPitch_);
+    constexpr glm::vec3 worldUp{0.0F, 1.0F, 0.0F};
+    const glm::vec3 right = glm::normalize(glm::cross(forward, worldUp));
+    const glm::vec3 up = glm::normalize(glm::cross(right, forward));
+    const VkExtent2D internalExtent = renderExtent();
+
+    const nvidia::DlssFrame dlssFrame{
+        .frameIndex = static_cast<std::uint32_t>(renderedFrameCount_),
+        .commandBuffer = commandBuffer,
+        .quality = streamlineQuality(upscaler_->qualityMode()),
+        .inputColor = streamlineImage(*inputColorImage, inputColorView, inputLayout),
+        .outputColor = streamlineImage(*dlssOutputImage_, dlssOutputView_->handle(),
+                                       VK_IMAGE_LAYOUT_GENERAL),
+        .depth = streamlineImage(*depthImage, depthView, inputLayout),
+        .motionVectors = streamlineImage(*motionImage, motionView, inputLayout),
+        .cameraViewToClip = streamlineMatrix(currentCamera.unjitteredProjection),
+        .clipToCameraView = streamlineMatrix(glm::inverse(currentCamera.unjitteredProjection)),
+        .clipToPrevClip = streamlineMatrix(clipToPrevClip),
+        .prevClipToClip = streamlineMatrix(prevClipToClip),
+        .cameraPosition = {cameraPosition_.x, cameraPosition_.y, cameraPosition_.z},
+        .cameraUp = {up.x, up.y, up.z},
+        .cameraRight = {right.x, right.y, right.z},
+        .cameraForward = {forward.x, forward.y, forward.z},
+        .jitterX = upscalingFramePlan_.currentJitterPixels.x,
+        .jitterY = upscalingFramePlan_.currentJitterPixels.y,
+        .cameraNear = cameraNear_,
+        .cameraFar = cameraFar_,
+        .cameraFovRadians = cameraFovRadians_,
+        .cameraAspectRatio = static_cast<float>(internalExtent.width) /
+                             static_cast<float>(internalExtent.height),
+        .exposureScale = upscalingFramePlan_.exposureScale,
+        .resetHistory = upscalingFramePlan_.resetHistory,
+    };
+    if (rayReconstructionEnabled()) {
+        if (!rayReconstructionDiffuseAlbedoImage_ ||
+            !rayReconstructionDiffuseAlbedoView_ ||
+            !rayReconstructionSpecularAlbedoImage_ ||
+            !rayReconstructionSpecularAlbedoView_ ||
+            !rayReconstructionNormalRoughnessImage_ ||
+            !rayReconstructionNormalRoughnessView_ ||
+            !rayReconstructionSpecularHitDistanceImage_ ||
+            !rayReconstructionSpecularHitDistanceView_) {
+            throw std::runtime_error("DLSS Ray Reconstruction guide images are incomplete");
+        }
+        streamlineRuntime_->evaluateRayReconstruction({
+            .dlss = dlssFrame,
+            .diffuseAlbedo = streamlineImage(
+                *rayReconstructionDiffuseAlbedoImage_,
+                rayReconstructionDiffuseAlbedoView_->handle(), inputLayout),
+            .specularAlbedo = streamlineImage(
+                *rayReconstructionSpecularAlbedoImage_,
+                rayReconstructionSpecularAlbedoView_->handle(), inputLayout),
+            .normalRoughness = streamlineImage(
+                *rayReconstructionNormalRoughnessImage_,
+                rayReconstructionNormalRoughnessView_->handle(), inputLayout),
+            .specularHitDistance = streamlineImage(
+                *rayReconstructionSpecularHitDistanceImage_,
+                rayReconstructionSpecularHitDistanceView_->handle(), inputLayout),
+            .worldToCameraView = streamlineMatrix(currentCamera.view),
+            .cameraViewToWorld = streamlineMatrix(glm::inverse(currentCamera.view)),
+        });
+    } else {
+        streamlineRuntime_->evaluateDlss(dlssFrame);
+    }
+#else
+    (void)commandBuffer;
+    (void)graph;
+    (void)context;
+    throw std::runtime_error("DLSS is not included in this Genesis build");
+#endif
 }
 
 void Renderer::recordPbrPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
@@ -7747,10 +9145,8 @@ void Renderer::writePathAovExport() const {
     }
     pathAovReadbackBuffer_->invalidate();
     const VkExtent2D extent = renderExtent();
-    const std::size_t pixelCount =
-        static_cast<std::size_t>(extent.width) * extent.height;
-    const auto* source =
-        static_cast<const std::byte*>(pathAovReadbackBuffer_->mappedData());
+    const std::size_t pixelCount = static_cast<std::size_t>(extent.width) * extent.height;
+    const auto* source = static_cast<const std::byte*>(pathAovReadbackBuffer_->mappedData());
     const auto targetIndex = [](PathAovReadbackTarget target) {
         return static_cast<std::size_t>(target);
     };
@@ -7768,21 +9164,18 @@ void Renderer::writePathAovExport() const {
         std::uint16_t bits = 0U;
         const VkDeviceSize byteOffset =
             pathAovReadbackOffsets_[targetIndex(target)] +
-            static_cast<VkDeviceSize>((pixel * components + component) *
-                                      sizeof(std::uint16_t));
+            static_cast<VkDeviceSize>((pixel * components + component) * sizeof(std::uint16_t));
         std::memcpy(&bits, source + static_cast<std::size_t>(byteOffset), sizeof(bits));
         return glm::unpackHalf1x16(bits);
     };
-    const auto makePlane = [pixelCount](output::AovSemantic semantic,
-                                        std::uint32_t channels) {
+    const auto makePlane = [pixelCount](output::AovSemantic semantic, std::uint32_t channels) {
         return output::AovPlane{
             .semantic = semantic,
             .channels = channels,
             .pixels = std::vector<float>(pixelCount * channels, 0.0F),
         };
     };
-    const auto storeRgb = [](output::AovPlane& plane, std::size_t pixel,
-                             const glm::vec3& value) {
+    const auto storeRgb = [](output::AovPlane& plane, std::size_t pixel, const glm::vec3& value) {
         const std::size_t offset = pixel * 3U;
         plane.pixels[offset] = value.x;
         plane.pixels[offset + 1U] = value.y;
@@ -7792,8 +9185,7 @@ void Renderer::writePathAovExport() const {
         glm::vec2 value = encoded * 2.0F - 1.0F;
         glm::vec3 normal(value, 1.0F - std::abs(value.x) - std::abs(value.y));
         if (normal.z < 0.0F) {
-            const glm::vec2 signs(normal.x >= 0.0F ? 1.0F : -1.0F,
-                                  normal.y >= 0.0F ? 1.0F : -1.0F);
+            const glm::vec2 signs(normal.x >= 0.0F ? 1.0F : -1.0F, normal.y >= 0.0F ? 1.0F : -1.0F);
             normal.x = (1.0F - std::abs(value.y)) * signs.x;
             normal.y = (1.0F - std::abs(value.x)) * signs.y;
         }
@@ -7803,57 +9195,47 @@ void Renderer::writePathAovExport() const {
 
     output::AovPlane beauty = makePlane(output::AovSemantic::beauty, 3U);
     output::AovPlane rawBeauty = makePlane(output::AovSemantic::rawBeauty, 3U);
-    output::AovPlane temporalBeauty =
-        makePlane(output::AovSemantic::temporalBeauty, 3U);
+    output::AovPlane temporalBeauty = makePlane(output::AovSemantic::temporalBeauty, 3U);
     output::AovPlane direct = makePlane(output::AovSemantic::directLighting, 3U);
     output::AovPlane indirect = makePlane(output::AovSemantic::indirectLighting, 3U);
     output::AovPlane albedo = makePlane(output::AovSemantic::albedo, 3U);
     output::AovPlane roughness = makePlane(output::AovSemantic::roughness, 1U);
-    output::AovPlane geometricNormal =
-        makePlane(output::AovSemantic::geometricNormal, 3U);
-    output::AovPlane shadingNormal =
-        makePlane(output::AovSemantic::shadingNormal, 3U);
+    output::AovPlane geometricNormal = makePlane(output::AovSemantic::geometricNormal, 3U);
+    output::AovPlane shadingNormal = makePlane(output::AovSemantic::shadingNormal, 3U);
     output::AovPlane motion = makePlane(output::AovSemantic::motion, 3U);
     output::AovPlane expectedPreviousDepth =
         makePlane(output::AovSemantic::expectedPreviousDepth, 1U);
     output::AovPlane depth = makePlane(output::AovSemantic::depth, 1U);
     output::AovPlane hitDistance = makePlane(output::AovSemantic::hitDistance, 1U);
-    output::AovPlane historyValidity =
-        makePlane(output::AovSemantic::historyValidity, 1U);
+    output::AovPlane historyValidity = makePlane(output::AovSemantic::historyValidity, 1U);
     output::AovPlane variance = makePlane(output::AovSemantic::variance, 1U);
 
     for (std::size_t pixel = 0U; pixel < pixelCount; ++pixel) {
-        const glm::vec3 raw(
-            readFloat(PathAovReadbackTarget::rawBeauty, pixel, 0U, 4U),
-            readFloat(PathAovReadbackTarget::rawBeauty, pixel, 1U, 4U),
-            readFloat(PathAovReadbackTarget::rawBeauty, pixel, 2U, 4U));
+        const glm::vec3 raw(readFloat(PathAovReadbackTarget::rawBeauty, pixel, 0U, 4U),
+                            readFloat(PathAovReadbackTarget::rawBeauty, pixel, 1U, 4U),
+                            readFloat(PathAovReadbackTarget::rawBeauty, pixel, 2U, 4U));
         const glm::vec3 directValue(
             readFloat(PathAovReadbackTarget::directLighting, pixel, 0U, 4U),
             readFloat(PathAovReadbackTarget::directLighting, pixel, 1U, 4U),
             readFloat(PathAovReadbackTarget::directLighting, pixel, 2U, 4U));
-        const glm::vec4 surface(
-            readHalf(PathAovReadbackTarget::surface, pixel, 0U, 4U),
-            readHalf(PathAovReadbackTarget::surface, pixel, 1U, 4U),
-            readHalf(PathAovReadbackTarget::surface, pixel, 2U, 4U),
-            readHalf(PathAovReadbackTarget::surface, pixel, 3U, 4U));
-        const glm::vec4 packedNormals(
-            readHalf(PathAovReadbackTarget::normals, pixel, 0U, 4U),
-            readHalf(PathAovReadbackTarget::normals, pixel, 1U, 4U),
-            readHalf(PathAovReadbackTarget::normals, pixel, 2U, 4U),
-            readHalf(PathAovReadbackTarget::normals, pixel, 3U, 4U));
-        const glm::vec4 motionDepth(
-            readFloat(PathAovReadbackTarget::motionDepth, pixel, 0U, 4U),
-            readFloat(PathAovReadbackTarget::motionDepth, pixel, 1U, 4U),
-            readFloat(PathAovReadbackTarget::motionDepth, pixel, 2U, 4U),
-            readFloat(PathAovReadbackTarget::motionDepth, pixel, 3U, 4U));
-        const glm::vec3 temporal(
-            readHalf(PathAovReadbackTarget::temporalBeauty, pixel, 0U, 4U),
-            readHalf(PathAovReadbackTarget::temporalBeauty, pixel, 1U, 4U),
-            readHalf(PathAovReadbackTarget::temporalBeauty, pixel, 2U, 4U));
-        const glm::vec3 finalBeauty(
-            readHalf(PathAovReadbackTarget::beauty, pixel, 0U, 4U),
-            readHalf(PathAovReadbackTarget::beauty, pixel, 1U, 4U),
-            readHalf(PathAovReadbackTarget::beauty, pixel, 2U, 4U));
+        const glm::vec4 surface(readHalf(PathAovReadbackTarget::surface, pixel, 0U, 4U),
+                                readHalf(PathAovReadbackTarget::surface, pixel, 1U, 4U),
+                                readHalf(PathAovReadbackTarget::surface, pixel, 2U, 4U),
+                                readHalf(PathAovReadbackTarget::surface, pixel, 3U, 4U));
+        const glm::vec4 packedNormals(readHalf(PathAovReadbackTarget::normals, pixel, 0U, 4U),
+                                      readHalf(PathAovReadbackTarget::normals, pixel, 1U, 4U),
+                                      readHalf(PathAovReadbackTarget::normals, pixel, 2U, 4U),
+                                      readHalf(PathAovReadbackTarget::normals, pixel, 3U, 4U));
+        const glm::vec4 motionDepth(readFloat(PathAovReadbackTarget::motionDepth, pixel, 0U, 4U),
+                                    readFloat(PathAovReadbackTarget::motionDepth, pixel, 1U, 4U),
+                                    readFloat(PathAovReadbackTarget::motionDepth, pixel, 2U, 4U),
+                                    readFloat(PathAovReadbackTarget::motionDepth, pixel, 3U, 4U));
+        const glm::vec3 temporal(readHalf(PathAovReadbackTarget::temporalBeauty, pixel, 0U, 4U),
+                                 readHalf(PathAovReadbackTarget::temporalBeauty, pixel, 1U, 4U),
+                                 readHalf(PathAovReadbackTarget::temporalBeauty, pixel, 2U, 4U));
+        const glm::vec3 finalBeauty(readHalf(PathAovReadbackTarget::beauty, pixel, 0U, 4U),
+                                    readHalf(PathAovReadbackTarget::beauty, pixel, 1U, 4U),
+                                    readHalf(PathAovReadbackTarget::beauty, pixel, 2U, 4U));
         const bool surfaceHit = motionDepth.w > 0.0F;
 
         storeRgb(beauty, pixel, finalBeauty);
@@ -7864,21 +9246,17 @@ void Renderer::writePathAovExport() const {
         storeRgb(albedo, pixel, glm::vec3(surface));
         roughness.pixels[pixel] = surface.w;
         storeRgb(geometricNormal, pixel,
-                 surfaceHit ? decodeOctahedralNormal(glm::vec2(packedNormals))
-                            : glm::vec3(0.0F));
+                 surfaceHit ? decodeOctahedralNormal(glm::vec2(packedNormals)) : glm::vec3(0.0F));
         storeRgb(shadingNormal, pixel,
-                 surfaceHit ? decodeOctahedralNormal(glm::vec2(packedNormals.z,
-                                                                packedNormals.w))
+                 surfaceHit ? decodeOctahedralNormal(glm::vec2(packedNormals.z, packedNormals.w))
                             : glm::vec3(0.0F));
         storeRgb(motion, pixel, glm::vec3(motionDepth.x, motionDepth.y, 0.0F));
         expectedPreviousDepth.pixels[pixel] = motionDepth.z;
-        depth.pixels[pixel] =
-            readFloat(PathAovReadbackTarget::depth, pixel, 0U, 1U);
+        depth.pixels[pixel] = readFloat(PathAovReadbackTarget::depth, pixel, 0U, 1U);
         hitDistance.pixels[pixel] = motionDepth.w;
         historyValidity.pixels[pixel] =
             readFloat(PathAovReadbackTarget::historyValidity, pixel, 0U, 1U);
-        variance.pixels[pixel] =
-            readHalf(PathAovReadbackTarget::beauty, pixel, 3U, 4U);
+        variance.pixels[pixel] = readHalf(PathAovReadbackTarget::beauty, pixel, 3U, 4U);
     }
 
     output::AovFrame frame{
@@ -7905,9 +9283,8 @@ void Renderer::writePathAovExport() const {
     frame.planes.push_back(std::move(historyValidity));
     frame.planes.push_back(std::move(variance));
     config_.aovFrameSink->consume(std::move(frame));
-    core::log(core::LogLevel::info, "Exported path AOV frame ", config_.aovExportFrame,
-              " with ", pathTracingSampleIndex_,
-              " accumulated sample(s) through renderer-neutral sink");
+    core::log(core::LogLevel::info, "Exported path AOV frame ", config_.aovExportFrame, " with ",
+              pathTracingSampleIndex_, " accumulated sample(s) through renderer-neutral sink");
 }
 
 } // namespace renderer

@@ -76,6 +76,7 @@ struct ComputePipelineCreateInfo {
     VkPipelineCache cache = VK_NULL_HANDLE;
     std::span<const VkDescriptorSetLayout> descriptorSetLayouts{};
     std::span<const VkPushConstantRange> pushConstantRanges{};
+    const char* entryPoint = "main";
 };
 
 class ComputePipeline final {
@@ -101,6 +102,9 @@ struct RayTracingPipelineCreateInfo {
     // Null entries create shaderless hit groups, which are useful for shadow rays
     // traced with VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR.
     std::span<const ShaderModule* const> closestHitShaders{};
+    // Empty means no any-hit stages. Otherwise this must have one entry per
+    // closest-hit group; null entries keep that group opaque-only.
+    std::span<const ShaderModule* const> anyHitShaders{};
     std::uint32_t maxRecursionDepth = 1;
     VkPipelineCache cache = VK_NULL_HANDLE;
     std::span<const VkDescriptorSetLayout> descriptorSetLayouts{};
@@ -121,12 +125,8 @@ class RayTracingPipeline final {
     [[nodiscard]] const VkStridedDeviceAddressRegionKHR& rayGenerationRegion() const {
         return rayGenerationRegion_;
     }
-    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& missRegion() const {
-        return missRegion_;
-    }
-    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& hitRegion() const {
-        return hitRegion_;
-    }
+    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& missRegion() const { return missRegion_; }
+    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& hitRegion() const { return hitRegion_; }
     [[nodiscard]] const VkStridedDeviceAddressRegionKHR& callableRegion() const {
         return callableRegion_;
     }

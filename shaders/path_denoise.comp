@@ -2,18 +2,27 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) uniform sampler2D temporalRadiance;
-layout(set = 0, binding = 1) uniform sampler2D surfaceAov;
-layout(set = 0, binding = 2) uniform sampler2D normalAov;
-layout(set = 0, binding = 3) uniform sampler2D motionDepthAov;
-layout(set = 0, binding = 4) uniform sampler2D depthAov;
-layout(set = 0, binding = 5) uniform sampler2D temporalMoments;
+// Pass zero receives accumulated direct radiance and temporally reconstructed
+// beauty. Later passes receive the separated direct and indirect signals.
+layout(set = 0, binding = 0) uniform sampler2D directInput;
+layout(set = 0, binding = 1) uniform sampler2D indirectOrBeautyInput;
+layout(set = 0, binding = 2) uniform sampler2D surfaceAov;
+layout(set = 0, binding = 3) uniform sampler2D normalAov;
+layout(set = 0, binding = 4) uniform sampler2D motionDepthAov;
+layout(set = 0, binding = 5) uniform sampler2D depthAov;
+layout(set = 0, binding = 6) uniform sampler2D temporalMoments;
+layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D outputDirect;
+layout(rgba16f, set = 0, binding = 8) uniform writeonly image2D outputIndirect;
 // Alpha stores temporal luminance variance for diagnostics.
-layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D outputRadiance;
+layout(rgba16f, set = 0, binding = 9) uniform writeonly image2D outputRadiance;
 
 layout(push_constant) uniform PathDenoisingControls
 {
     uint sampleIndex;
+    uint stepWidth;
+    uint passIndex;
+    uint passCount;
+    uint samplesThisFrame;
 } controls;
 
 bool finiteVector(vec4 value)
@@ -38,10 +47,25 @@ float luminance(vec3 color)
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
 
-vec3 sanitizedRadiance(ivec2 coordinate)
+vec3 sanitizedRadiance(sampler2D source, ivec2 coordinate)
 {
-    vec4 radiance = texelFetch(temporalRadiance, coordinate, 0);
+    vec4 radiance = texelFetch(source, coordinate, 0);
     return finiteVector(radiance) ? max(radiance.rgb, vec3(0.0)) : vec3(0.0);
+}
+
+void separatedRadiance(ivec2 coordinate, out vec3 direct, out vec3 indirect)
+{
+    direct = sanitizedRadiance(directInput, coordinate);
+    vec3 indirectOrBeauty = sanitizedRadiance(indirectOrBeautyInput, coordinate);
+    if (controls.passIndex == 0u) {
+        // Temporal clipping can make the reconstructed beauty slightly dimmer
+        // than its progressively accumulated direct component.  Keep the split
+        // energy preserving instead of introducing that difference as new light.
+        direct = min(direct, indirectOrBeauty);
+        indirect = max(indirectOrBeauty - direct, vec3(0.0));
+    } else {
+        indirect = indirectOrBeauty;
+    }
 }
 
 float temporalVariance(ivec2 coordinate)
@@ -61,72 +85,155 @@ void main()
         return;
     }
 
-    vec3 centerColor = sanitizedRadiance(coordinate);
+    vec3 centerDirect;
+    vec3 centerIndirect;
+    separatedRadiance(coordinate, centerDirect, centerIndirect);
+    vec3 centerBeauty = centerDirect + centerIndirect;
     vec4 centerSurface = texelFetch(surfaceAov, coordinate, 0);
     vec4 centerNormalPacked = texelFetch(normalAov, coordinate, 0);
     vec4 centerMotionDepth = texelFetch(motionDepthAov, coordinate, 0);
     float centerDepth = texelFetch(depthAov, coordinate, 0).r;
     bool centerIsSurface = finiteVector(centerMotionDepth) && centerMotionDepth.w > 0.0;
     float centerVariance = temporalVariance(coordinate);
-    float centerLuminance = luminance(centerColor);
     vec3 centerNormal = centerIsSurface && finiteVector(centerNormalPacked)
                             ? decodeOctahedralNormal(centerNormalPacked.xy)
                             : vec3(0.0, 0.0, 1.0);
+    float motionPixels = length(centerMotionDepth.xy * vec2(size));
+    float interactiveMotion = controls.sampleIndex == 0u
+        ? smoothstep(0.05, 1.5, motionPixels)
+        : 0.0;
 
-    vec3 filtered = vec3(0.0);
-    float totalWeight = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            ivec2 neighbor = clamp(coordinate + ivec2(x, y), ivec2(0), size - 1);
-            vec3 neighborColor = sanitizedRadiance(neighbor);
-            vec4 neighborSurface = texelFetch(surfaceAov, neighbor, 0);
-            vec4 neighborNormalPacked = texelFetch(normalAov, neighbor, 0);
-            vec4 neighborMotionDepth = texelFetch(motionDepthAov, neighbor, 0);
-            float neighborDepth = texelFetch(depthAov, neighbor, 0).r;
-            bool neighborIsSurface = finiteVector(neighborMotionDepth) &&
-                                     neighborMotionDepth.w > 0.0;
-            if (centerIsSurface != neighborIsSurface) {
-                continue;
-            }
+    vec3 filteredDirect = centerDirect;
+    vec3 filteredIndirect = centerIndirect;
+    if (centerIsSurface && finiteVector(centerSurface) &&
+        finiteVector(centerNormalPacked) && !isnan(centerDepth) &&
+        !isinf(centerDepth)) {
+        filteredDirect = vec3(0.0);
+        filteredIndirect = vec3(0.0);
+        float directWeightSum = 0.0;
+        float indirectWeightSum = 0.0;
+        float centerDirectLuminance = luminance(centerDirect);
+        float centerIndirectLuminance = luminance(centerIndirect);
+        int stepWidth = int(max(controls.stepWidth, 1u));
 
-            float kernelWeight = (x == 0 && y == 0) ? 1.0
-                               : (x == 0 || y == 0) ? 0.5
-                                                    : 0.25;
-            float neighborVariance = temporalVariance(neighbor);
-            float neighborLuminance = luminance(neighborColor);
-            float luminanceScale = 0.10 +
-                0.35 * max(centerLuminance, neighborLuminance) +
-                4.0 * sqrt(max(centerVariance, neighborVariance) + 1.0e-5);
-            float weight = kernelWeight *
-                exp(-abs(neighborLuminance - centerLuminance) /
-                    max(luminanceScale, 1.0e-4));
-
-            if (centerIsSurface) {
-                if (!finiteVector(centerSurface) || !finiteVector(neighborSurface) ||
-                    !finiteVector(neighborNormalPacked) || isnan(centerDepth) ||
-                    isinf(centerDepth) || isnan(neighborDepth) || isinf(neighborDepth)) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                ivec2 neighbor = clamp(coordinate + ivec2(x, y) * stepWidth,
+                                       ivec2(0), size - 1);
+                vec3 neighborDirect;
+                vec3 neighborIndirect;
+                separatedRadiance(neighbor, neighborDirect, neighborIndirect);
+                vec4 neighborSurface = texelFetch(surfaceAov, neighbor, 0);
+                vec4 neighborNormalPacked = texelFetch(normalAov, neighbor, 0);
+                vec4 neighborMotionDepth = texelFetch(motionDepthAov, neighbor, 0);
+                float neighborDepth = texelFetch(depthAov, neighbor, 0).r;
+                bool neighborIsSurface = finiteVector(neighborMotionDepth) &&
+                                         neighborMotionDepth.w > 0.0;
+                if (!neighborIsSurface || !finiteVector(neighborSurface) ||
+                    !finiteVector(neighborNormalPacked) || isnan(neighborDepth) ||
+                    isinf(neighborDepth)) {
                     continue;
                 }
+
                 vec3 neighborNormal = decodeOctahedralNormal(neighborNormalPacked.xy);
-                float normalWeight = exp(-max(1.0 - dot(centerNormal, neighborNormal), 0.0) * 64.0);
-                float albedoWeight = exp(-length(centerSurface.rgb - neighborSurface.rgb) * 6.0);
-                float roughnessWeight = exp(-abs(centerSurface.a - neighborSurface.a) * 4.0);
-                float depthWeight = exp(-abs(centerDepth - neighborDepth) / 0.0015);
-                float distanceScale = max(centerMotionDepth.w * 0.05, 1.0e-3);
+                float normalWeight = exp(-max(1.0 - dot(centerNormal, neighborNormal), 0.0) * 80.0);
+                float albedoWeight = exp(-length(centerSurface.rgb - neighborSurface.rgb) * 8.0);
+                float roughnessWeight = exp(-abs(centerSurface.a - neighborSurface.a) * 8.0);
+                // Fine material texture is deterministic detail when the camera
+                // is still, but at one moving sample it blocks the spatial reuse
+                // needed to suppress stochastic lighting. Preserve geometry and
+                // normal boundaries while allowing temporarily softer texture.
+                albedoWeight = mix(albedoWeight, 1.0, interactiveMotion * 0.95);
+                roughnessWeight = mix(roughnessWeight, 1.0, interactiveMotion * 0.95);
+                float depthWeight = exp(-abs(centerDepth - neighborDepth) /
+                                        (0.00125 * float(stepWidth)));
+                float distanceScale = max(max(centerMotionDepth.w, neighborMotionDepth.w) *
+                                              0.035 * float(stepWidth),
+                                          1.0e-3);
                 float distanceWeight = exp(-abs(centerMotionDepth.w - neighborMotionDepth.w) /
                                            distanceScale);
-                weight *= normalWeight * albedoWeight * roughnessWeight *
-                          depthWeight * distanceWeight;
-            }
+                float kernelWeight = (x == 0 && y == 0) ? 1.0
+                                   : (x == 0 || y == 0) ? 0.5
+                                                        : 0.25;
+                float geometryWeight = kernelWeight * normalWeight * albedoWeight *
+                                       roughnessWeight * depthWeight * distanceWeight;
+                float neighborVariance = temporalVariance(neighbor);
+                float varianceScale = sqrt(max(centerVariance, neighborVariance) + 1.0e-5);
 
-            filtered += neighborColor * weight;
-            totalWeight += weight;
+                float neighborDirectLuminance = luminance(neighborDirect);
+                float directScale = 0.05 +
+                    0.20 * max(centerDirectLuminance, neighborDirectLuminance) +
+                    2.0 * varianceScale;
+                float directRangeWeight =
+                    exp(-abs(neighborDirectLuminance - centerDirectLuminance) /
+                        max(directScale, 1.0e-4));
+                // During motion, radiance disagreement is predominantly Monte
+                // Carlo variance rather than an image edge. Geometry, normal,
+                // albedo, roughness, and depth still keep the filter on the
+                // same surface while allowing bright outliers to be averaged.
+                directRangeWeight = mix(directRangeWeight, 1.0,
+                                        interactiveMotion * 0.90);
+                float directWeight = geometryWeight * directRangeWeight;
+                filteredDirect += neighborDirect * directWeight;
+                directWeightSum += directWeight;
+
+                float neighborIndirectLuminance = luminance(neighborIndirect);
+                float indirectScale = 0.10 +
+                    0.40 * max(centerIndirectLuminance, neighborIndirectLuminance) +
+                    5.0 * varianceScale;
+                float indirectRangeWeight =
+                    exp(-abs(neighborIndirectLuminance - centerIndirectLuminance) /
+                        max(indirectScale, 1.0e-4));
+                indirectRangeWeight = mix(indirectRangeWeight, 1.0,
+                                          interactiveMotion * 0.80);
+                float indirectWeight = geometryWeight * indirectRangeWeight;
+                filteredIndirect += neighborIndirect * indirectWeight;
+                indirectWeightSum += indirectWeight;
+            }
         }
+
+        filteredDirect = directWeightSum > 1.0e-6
+                             ? filteredDirect / directWeightSum
+                             : centerDirect;
+        filteredIndirect = indirectWeightSum > 1.0e-6
+                               ? filteredIndirect / indirectWeightSum
+                               : centerIndirect;
     }
 
-    filtered = totalWeight > 1.0e-6 ? filtered / totalWeight : centerColor;
-    float filterStrength = clamp(4.0 / (float(controls.sampleIndex) + 4.0), 0.0, 1.0);
-    vec3 result = mix(centerColor, filtered, filterStrength);
-    imageStore(outputRadiance, coordinate,
-               vec4(max(result, vec3(0.0)), centerVariance));
+    float sampleCount = float(controls.sampleIndex + controls.samplesThisFrame);
+    float convergenceStrength = 48.0 / (sampleCount + 48.0);
+    float relativeNoise = sqrt(centerVariance + 1.0e-5) /
+                          (0.05 + luminance(centerBeauty));
+    float earlyStrength = clamp(8.0 / sampleCount, 0.0, 1.0);
+    float varianceStrength = max(earlyStrength,
+                                 clamp(relativeNoise * 4.0, 0.10, 1.0));
+    float passStrength = 1.0 / (1.0 + 0.15 * float(controls.passIndex));
+    float roughness = centerIsSurface ? clamp(centerSurface.a, 0.0, 1.0) : 0.0;
+    float directMaterialStrength = mix(mix(0.35, 0.70, roughness),
+                                       mix(0.85, 1.0, roughness),
+                                       interactiveMotion);
+    float indirectMaterialStrength = mix(mix(0.50, 1.0, roughness),
+                                         mix(0.70, 1.0, roughness),
+                                         interactiveMotion);
+    float directStrength = convergenceStrength * varianceStrength * passStrength *
+                           directMaterialStrength;
+    float indirectStrength = convergenceStrength * varianceStrength * passStrength *
+                             indirectMaterialStrength;
+    directStrength = mix(directStrength, 1.0, interactiveMotion);
+    indirectStrength = mix(indirectStrength, 1.0, interactiveMotion);
+    if (!centerIsSurface) {
+        directStrength = 0.0;
+        indirectStrength = 0.0;
+    }
+    vec3 resultDirect = mix(centerDirect, filteredDirect, clamp(directStrength, 0.0, 1.0));
+    vec3 resultIndirect = mix(centerIndirect, filteredIndirect,
+                              clamp(indirectStrength, 0.0, 1.0));
+
+    if (controls.passIndex + 1u < controls.passCount) {
+        imageStore(outputDirect, coordinate, vec4(max(resultDirect, vec3(0.0)), 1.0));
+        imageStore(outputIndirect, coordinate, vec4(max(resultIndirect, vec3(0.0)), 1.0));
+    } else {
+        imageStore(outputRadiance, coordinate,
+                   vec4(max(resultDirect + resultIndirect, vec3(0.0)), centerVariance));
+    }
 }

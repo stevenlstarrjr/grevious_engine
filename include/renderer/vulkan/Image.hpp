@@ -35,10 +35,13 @@ class Image final {
     Image& operator=(const Image&) = delete;
 
     [[nodiscard]] VkImage handle() const { return image_; }
+    [[nodiscard]] VkDeviceMemory memory() const { return allocation_.memory(); }
     [[nodiscard]] VkFormat format() const { return format_; }
     [[nodiscard]] VkExtent3D extent() const { return extent_; }
     [[nodiscard]] std::uint32_t mipLevels() const { return mipLevels_; }
     [[nodiscard]] std::uint32_t arrayLayers() const { return arrayLayers_; }
+    [[nodiscard]] VkImageCreateFlags flags() const { return flags_; }
+    [[nodiscard]] VkImageUsageFlags usage() const { return usage_; }
 
   private:
     const Device& device_;
@@ -47,6 +50,8 @@ class Image final {
     VkExtent3D extent_{};
     std::uint32_t mipLevels_ = 0;
     std::uint32_t arrayLayers_ = 0;
+    VkImageCreateFlags flags_ = 0;
+    VkImageUsageFlags usage_ = 0;
     Allocation allocation_;
 };
 
