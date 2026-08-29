@@ -99,6 +99,8 @@ XeSS belongs behind the same renderer interface as FSR and DLSS:
 ```text
 IUpscaler
 ├── Native
+├── Spatial
+├── TemporalReference
 ├── FSR
 ├── XeSS
 └── DLSS
@@ -106,11 +108,17 @@ IUpscaler
 
 Genesis Render's temporal infrastructure should provide the common inputs required by temporal upscalers, including low-resolution color, motion vectors, depth, jitter, exposure information where required, and reset/history state.
 
-Current implementation status: the renderer-owned `IUpscaler` and strict 1:1
-`Native` backend are live in both raster and path graphs. They validate the
-common color/depth/motion/jitter/exposure/reset contract and separate render
-from output extent ownership. FSR, XeSS, DLSS, reactive masks, quality modes,
-and non-1:1 dispatch remain deferred backends rather than implied capabilities.
+Current implementation status: the renderer-owned `IUpscaler`, strict 1:1
+`Native`, portable `Spatial`, and portable `TemporalReference` backends are live
+in both raster and path graphs. Spatial and temporal accept a 0.5-1.0 render
+scale; temporal owns bounded output-resolution color/depth history and consumes
+the common color, depth, motion, jitter, exposure, and reset contract. Quality,
+balanced, and performance modes map to 2/3, 10/17, and 1/2 scale. The contract
+fixes linear-HDR color, Vulkan device depth, jitter-free UV motion, render-pixel
+jitter, exposure/reset data, reconstruction type, history/output ownership,
+reactive-mask, sharpening, dynamic-resolution capability, and supported scale.
+FSR, XeSS, DLSS, reactive-mask generation, and sharpening remain deferred
+backends rather than implied capabilities.
 
 ### Embree as a reference backend
 
@@ -169,6 +177,7 @@ The exact latency integrations should be evaluated independently because their A
 ```cpp
 IUpscaler
   NativeUpscaler
+  SpatialUpscaler
   FsrUpscaler
   XessUpscaler
   DlssUpscaler

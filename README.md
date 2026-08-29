@@ -68,10 +68,17 @@ real rendering pipeline rather than a collection of mockups. It includes:
   luminance moments and one bounded depth/normal/material-guided 3x3 spatial
   pass further reduce one-sample error and fade as progressive convergence grows;
   and
-- a renderer-owned upscaling boundary shared by raster and path modes. Its
-  first `native` backend preserves exact 1:1 render/output resolution while
-  carrying the color, depth, motion, jitter, exposure, and history-reset
-  contract required by later FSR, XeSS, and DLSS implementations.
+- a renderer-owned upscaling boundary shared by raster and path modes. The
+  default `native` backend preserves exact 1:1 output, while the portable
+  `spatial` backend renders at 0.5-1.0 scale and reconstructs a distinct
+  output-resolution linear-HDR target before tone mapping. The renderer-owned
+  `temporal` reference backend adds output-resolution color/depth history,
+  jitter-corrected motion reprojection, neighborhood clipping, and bounded
+  depth/motion-aware history rejection. Quality, balanced, and performance
+  modes map to 2/3, 10/17, and 1/2 render scale; an explicit `--render-scale`
+  retains custom testing. The backend contract names history and output
+  ownership, reconstruction type, optional features, and exact
+  color/depth/motion/jitter/exposure conventions without vendor types.
 
 Opaque and alpha-masked scenes now select ray-query sun shadows automatically
 when acceleration structures and ray queries are available. Unsupported devices
@@ -167,13 +174,32 @@ Some useful ways to explore it:
 # Validate object motion, accumulation resets, disocclusion, and exact repeats
 ./tools/validate_path_animation.sh build/release
 
-# Validate the native 1:1 upscaler contract, graph boundary, and resize handling
+# Validate native and spatial raster/path upscaling, timing, and resize handling
 ./tools/validate_upscaling.sh build/release
 
-# Select the current backend explicitly (native is also the default)
+# Validate temporal history, motion rejection, resize, timing, and repeatability
+./tools/validate_temporal_upscaling.sh build/release
+
+# Select the exact 1:1 backend explicitly (native is also the default)
 ./build/release/bin/genesis_render \
   --render-mode path-traced --ray-tracing required \
   --demo directional-shadow --upscaler native
+
+# Use the named half-resolution performance mode
+./build/release/bin/genesis_render \
+  --render-mode path-traced --ray-tracing required \
+  --demo directional-shadow --upscaler spatial \
+  --upscaler-quality performance
+
+# Use the portable temporal reference at half resolution
+./build/release/bin/genesis_render \
+  --render-mode path-traced --ray-tracing required \
+  --demo directional-shadow --upscaler temporal \
+  --upscaler-quality performance
+
+# Explicit render scale remains available as a custom diagnostic mode
+./build/release/bin/genesis_render \
+  --demo pbr-grid --upscaler spatial --render-scale 0.75
 
 # Inspect renderer-owned path outputs used by game reconstruction and VFX AOVs
 ./build/release/bin/genesis_render \
@@ -239,10 +265,18 @@ validated temporal history across accepted moving surfaces. This proves the
 renderer-side animation/history boundary, not a host-facing production
 animation system.
 
-Both live render modes now converge on `IUpscaler` before tone mapping. The
-current native implementation is an identity boundary and therefore does not
-yet improve performance or image resolution; reduced internal resolution and
-FSR/XeSS/DLSS backends are the next upscaling work.
+Both live render modes now converge on `IUpscaler` before tone mapping. Native
+remains the exact identity control. Spatial is the first real scaled path: it
+allocates an output-resolution HDR target and performs a hardware-linear
+fullscreen reconstruction from a configurable 0.5-1.0 render scale (default
+quality mode at 2/3). Named quality, balanced, and performance modes are stable
+at 2/3, 10/17, and 1/2 scale. Backend capabilities explicitly describe
+identity/spatial/temporal reconstruction, history and output ownership,
+reactive-mask, sharpening, dynamic-resolution support, and canonical temporal
+input conventions. Spatial establishes portable resource and scheduling
+semantics, not the image quality of a temporal upscaler. A renderer-owned
+temporal reference backend, reactive inputs, and FSR/XeSS/DLSS implementations
+remain future work.
 
 Production animation ingestion, alpha/transmission path
 materials, more complete transport, RT scene scaling, skinning, morph targets,

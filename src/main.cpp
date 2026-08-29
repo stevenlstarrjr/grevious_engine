@@ -51,6 +51,11 @@ struct Options {
     renderer::RenderMode renderMode = renderer::RenderMode::rasterized;
     renderer::upscaling::Backend upscalingBackend =
         renderer::upscaling::Backend::native;
+    renderer::upscaling::QualityMode upscalingQualityMode =
+        renderer::upscaling::QualityMode::native;
+    bool upscalingQualityModeSpecified = false;
+    float upscalingRenderScale = 1.0F;
+    bool upscalingRenderScaleSpecified = false;
     bool pathEnvironmentImportanceSampling = true;
     bool pathEmissiveTriangleSampling = true;
     std::uint32_t pathMaxBounces = renderer::defaultPathBounceCount;
@@ -111,6 +116,17 @@ float parseBloomRadius(std::string_view text) {
     if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
         value < 0.25F || value > 16.0F) {
         throw std::runtime_error("--bloom-radius requires a finite value in [0.25, 16]");
+    }
+    return value;
+}
+
+float parseRenderScale(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < renderer::upscaling::minimumSpatialRenderScale ||
+        value > renderer::upscaling::maximumSpatialRenderScale) {
+        throw std::runtime_error("--render-scale requires a finite value in [0.5, 1.0]");
     }
     return value;
 }
@@ -231,7 +247,9 @@ Options parseOptions(int argc, char** argv) {
                          "[--bloom-radius VALUE] "
                          "[--shadows on|off] [--ray-tracing off|auto|required] "
                          "[--render-mode rasterized|path-traced] "
-                         "[--upscaler native] "
+                         "[--upscaler native|spatial|temporal] "
+                         "[--upscaler-quality quality|balanced|performance] "
+                         "[--render-scale 0.5..1.0] "
                          "[--path-environment-sampling importance|uniform] "
                          "[--path-emissive-sampling on|off] "
                          "[--path-max-bounces 1|2|3|4] "
@@ -395,9 +413,26 @@ Options parseOptions(int argc, char** argv) {
             const std::optional<renderer::upscaling::Backend> backend =
                 renderer::upscaling::parseBackend(value);
             if (!backend) {
-                throw std::runtime_error("--upscaler currently requires native");
+                throw std::runtime_error("--upscaler requires native, spatial, or temporal");
             }
             options.upscalingBackend = *backend;
+            continue;
+        }
+        if (argument == "--render-scale" && index + 1 < argc) {
+            options.upscalingRenderScale = parseRenderScale(argv[++index]);
+            options.upscalingRenderScaleSpecified = true;
+            continue;
+        }
+        if (argument == "--upscaler-quality" && index + 1 < argc) {
+            const std::optional<renderer::upscaling::QualityMode> qualityMode =
+                renderer::upscaling::parseQualityMode(argv[++index]);
+            if (!qualityMode || *qualityMode == renderer::upscaling::QualityMode::native ||
+                *qualityMode == renderer::upscaling::QualityMode::custom) {
+                throw std::runtime_error(
+                    "--upscaler-quality requires quality, balanced, or performance");
+            }
+            options.upscalingQualityMode = *qualityMode;
+            options.upscalingQualityModeSpecified = true;
             continue;
         }
         if (argument == "--path-debug" && index + 1 < argc) {
@@ -634,6 +669,32 @@ Options parseOptions(int argc, char** argv) {
         options.renderMode != renderer::RenderMode::pathTraced) {
         throw std::runtime_error("--aov-export requires --render-mode path-traced");
     }
+    if (options.upscalingQualityModeSpecified && options.upscalingRenderScaleSpecified) {
+        throw std::runtime_error(
+            "--upscaler-quality and --render-scale are mutually exclusive");
+    }
+    if (options.upscalingBackend == renderer::upscaling::Backend::spatial ||
+        options.upscalingBackend == renderer::upscaling::Backend::temporal) {
+        if (options.upscalingRenderScaleSpecified) {
+            options.upscalingQualityMode = renderer::upscaling::QualityMode::custom;
+        } else {
+            if (!options.upscalingQualityModeSpecified) {
+                options.upscalingQualityMode = renderer::upscaling::QualityMode::quality;
+            }
+            options.upscalingRenderScale =
+                renderer::upscaling::qualityModeRenderScale(options.upscalingQualityMode);
+        }
+    } else {
+        if (options.upscalingQualityModeSpecified) {
+            throw std::runtime_error(
+                "--upscaler-quality requires --upscaler spatial or temporal");
+        }
+        if (options.upscalingRenderScaleSpecified &&
+            std::abs(options.upscalingRenderScale - 1.0F) > 1.0e-6F) {
+            throw std::runtime_error("--upscaler native requires --render-scale 1.0");
+        }
+        options.upscalingQualityMode = renderer::upscaling::QualityMode::native;
+    }
     if ((options.emissiveSphereDemo || options.directionalShadowDemo || options.alphaShadowDemo) &&
         !options.scenePath.empty()) {
         throw std::runtime_error("Procedural --demo modes cannot be combined with --scene");
@@ -679,6 +740,8 @@ int run(const Options& options) {
                  .rayTracingTransformScript = options.rayTracingTransformScript,
                  .renderMode = options.renderMode,
                  .upscalingBackend = options.upscalingBackend,
+                 .upscalingQualityMode = options.upscalingQualityMode,
+                 .upscalingRenderScale = options.upscalingRenderScale,
                  .pathEnvironmentImportanceSampling =
                      options.pathEnvironmentImportanceSampling,
                  .pathEmissiveTriangleSampling = options.pathEmissiveTriangleSampling,

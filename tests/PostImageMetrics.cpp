@@ -40,6 +40,7 @@ DecodedImage load(std::string_view path) {
 
 void stats(const DecodedImage& image) {
     double total = 0.0;
+    std::array<double, 3> channelTotals{};
     double maximum = 0.0;
     double weightedX = 0.0;
     double weightedY = 0.0;
@@ -51,6 +52,9 @@ void stats(const DecodedImage& image) {
             finite = finite && std::isfinite(color[0]) && std::isfinite(color[1]) &&
                      std::isfinite(color[2]);
             total += value;
+            for (std::size_t channel = 0U; channel < channelTotals.size(); ++channel) {
+                channelTotals[channel] += color[channel];
+            }
             maximum = std::max(maximum, value);
             weightedX += value * static_cast<double>(x);
             weightedY += value * static_cast<double>(y);
@@ -59,6 +63,9 @@ void stats(const DecodedImage& image) {
     const double count = static_cast<double>(image.width) * image.height;
     std::cout << "width=" << image.width << " height=" << image.height
               << " finite=" << (finite ? 1 : 0) << " mean=" << total / count
+              << " mean_r=" << channelTotals[0] / count
+              << " mean_g=" << channelTotals[1] / count
+              << " mean_b=" << channelTotals[2] / count
               << " max=" << maximum << " total=" << total
               << " centroid_x=" << (total > 0.0 ? weightedX / total : 0.0)
               << " centroid_y=" << (total > 0.0 ? weightedY / total : 0.0) << '\n';

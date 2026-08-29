@@ -564,7 +564,11 @@ VkSamplerCreateInfo materialSamplerInfo(const scene::Sampler& sampler, std::uint
 Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
                    const vulkan::Device& device, RendererConfig config)
     : window_(window), instance_(instance), device_(device), config_(std::move(config)),
-      upscaler_(upscaling::createUpscaler(config_.upscalingBackend)),
+      upscaler_(upscaling::createUpscaler({
+          .backend = config_.upscalingBackend,
+          .qualityMode = config_.upscalingQualityMode,
+          .customRenderScale = config_.upscalingRenderScale,
+      })),
       mainView_(config_.view),
       swapchain_(createInitialSwapchain(instance, device, window, !config_.capturePath.empty())),
       memoryAllocator_(device), pipelineCache_(device, RENDERER_PIPELINE_CACHE_PATH),
@@ -594,6 +598,11 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         } else {
             core::log(core::LogLevel::info, "Render mode: rasterized");
         }
+        if (temporalUpscalingEnabled() && config_.taaEnabled) {
+            config_.taaEnabled = false;
+            core::log(core::LogLevel::info,
+                      "Raster TAA bypassed because the temporal upscaler owns output history");
+        }
         if (!config_.capturePath.empty() && config_.captureFrame == 0) {
             throw std::runtime_error("Capture frame must be greater than zero");
         }
@@ -610,11 +619,37 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         }
         const VkExtent2D initialRenderExtent = renderExtent();
         const VkExtent2D initialOutputExtent = swapchain_.extent();
-        core::log(core::LogLevel::info, "Upscaler: ", upscaler_->name(), " identity, render ",
+        core::log(core::LogLevel::info, "Upscaler: ", upscaler_->name(), ", quality ",
+                  upscaling::qualityModeName(upscaler_->qualityMode()), ", render ",
                   initialRenderExtent.width, "x", initialRenderExtent.height, " -> output ",
                   initialOutputExtent.width, "x", initialOutputExtent.height,
-                  "; color/depth/motion/jitter/exposure/reset contract enabled, reactive mask "
-                  "unavailable");
+                  "; configured scale ", upscaler_->renderScale(),
+                  spatialUpscalingEnabled()
+                      ? "; spatial linear-HDR dispatch enabled"
+                  : temporalUpscalingEnabled()
+                      ? "; temporal linear-HDR reconstruction enabled"
+                      : "; identity dispatch skipped");
+        const upscaling::BackendCapabilities upscalingCapabilities =
+            upscaler_->capabilities();
+        core::log(core::LogLevel::info, "Upscaler capabilities: reconstruction=",
+                  upscaling::reconstructionTypeName(upscalingCapabilities.reconstruction),
+                  ", history=",
+                  upscaling::historyOwnershipName(upscalingCapabilities.historyOwnership),
+                  ", output=",
+                  upscaling::outputOwnershipName(upscalingCapabilities.outputOwnership),
+                  ", reactive-mask=", upscalingCapabilities.reactiveMask,
+                  ", sharpening=", upscalingCapabilities.sharpening,
+                  ", dynamic-resolution=", upscalingCapabilities.dynamicResolution);
+        const upscaling::InputConventions upscalingConventions =
+            upscaler_->inputConventions();
+        core::log(core::LogLevel::info, "Upscaler input conventions: color=",
+                  upscaling::colorConventionName(upscalingConventions.color), ", depth=",
+                  upscaling::depthConventionName(upscalingConventions.depth), ", motion=",
+                  upscaling::motionVectorConventionName(upscalingConventions.motionVectors),
+                  ", jitter=", upscaling::jitterConventionName(upscalingConventions.jitter),
+                  ", exposure=",
+                  upscaling::exposureConventionName(upscalingConventions.exposure),
+                  ", motion-excludes-jitter=", upscalingConventions.motionVectorsExcludeJitter);
         const vulkan::OptionalCapabilities& optional = device_.optionalCapabilities();
         const std::uint32_t requiredPathRecursionDepth = config_.pathMaxBounces + 2U;
         if (pathTracingEnabled() &&
@@ -707,6 +742,7 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         createCaptureBuffer();
         createSceneResources();
         createTemporalResources();
+        createUpscalingHistoryResources();
         createPathTracingResources();
         createGraphicsPipelines();
         createRenderGraph();
@@ -718,6 +754,7 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         } else {
             updateShadowDescriptor();
         }
+        updateUpscalingDescriptor();
         updateToneMappingDescriptor();
         if (!pathTracingEnabled()) {
             updateHiZDescriptors();
@@ -855,6 +892,7 @@ void Renderer::drawFrame() {
     sceneUploadPending_ = false;
     temporalState_.commitFrame();
     temporalImageLayoutsInitialized_ = config_.taaEnabled;
+    upscalingHistoryLayoutsInitialized_ = temporalUpscalingEnabled();
     if (pathTracingEnabled()) {
         pathTracingImageInitialized_ = true;
         pathHistoryLayoutsInitialized_ = true;
@@ -948,7 +986,7 @@ void Renderer::writeGpuTimestamp(VkCommandBuffer commandBuffer, std::size_t fram
     } else if (pass == GpuTimingPass::pathAovReadback) {
         stage = VK_PIPELINE_STAGE_2_COPY_BIT;
     } else if (pass == GpuTimingPass::upscaling) {
-        stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     }
     vkCmdWriteTimestamp2(commandBuffer, stage, timestampQueryPool_, query);
 }
@@ -998,7 +1036,7 @@ void Renderer::writeGpuTimingReport() {
                                "bloom extraction/downsample",
                                "bloom horizontal blur",
                                "bloom vertical blur",
-                               "native upscaling boundary",
+                               "upscaling",
                                "composite/exposure/tone mapping"};
     static_assert(names.size() == gpuTimingPassCount);
     VkPhysicalDeviceProperties properties{};
@@ -1040,6 +1078,8 @@ void Renderer::writeGpuTimingReport() {
            << "Resolution: " << outputExtent.width << 'x' << outputExtent.height << '\n'
            << "Render resolution: " << internalExtent.width << 'x' << internalExtent.height << '\n'
            << "Upscaler: " << upscaler_->name() << '\n'
+           << "Upscaler quality: " << upscaling::qualityModeName(upscaler_->qualityMode()) << '\n'
+           << "Render scale: " << upscaler_->renderScale() << '\n'
            << "Directional shadows: " << (config_.shadowsEnabled ? "on" : "off") << '\n'
            << "Directional shadow backend: "
            << (pathTracingEnabled() ? "ray pipeline"
@@ -1241,6 +1281,59 @@ void Renderer::createTemporalResources() {
               static_cast<double>(colorHistoryBytes + depthHistoryBytes + normalHistoryBytes) /
                   bytesPerMiB,
               " MiB");
+}
+
+void Renderer::createUpscalingHistoryResources() {
+    for (auto& view : upscalingHistoryColorViews_) {
+        view.reset();
+    }
+    for (auto& image : upscalingHistoryColorImages_) {
+        image.reset();
+    }
+    for (auto& view : upscalingHistoryDepthViews_) {
+        view.reset();
+    }
+    for (auto& image : upscalingHistoryDepthImages_) {
+        image.reset();
+    }
+    upscalingHistoryLayoutsInitialized_ = false;
+    if (!temporalUpscalingEnabled()) {
+        return;
+    }
+
+    const VkExtent2D extent = swapchain_.extent();
+    for (std::size_t index = 0U; index < framesInFlight; ++index) {
+        upscalingHistoryColorImages_[index] = std::make_unique<vulkan::Image>(
+            device_, memoryAllocator_,
+            vulkan::ImageCreateInfo{
+                .extent = {extent.width, extent.height, 1U},
+                .format = hdrFormat_,
+                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            });
+        upscalingHistoryColorViews_[index] = std::make_unique<vulkan::ImageView>(
+            device_, *upscalingHistoryColorImages_[index]);
+        upscalingHistoryDepthImages_[index] = std::make_unique<vulkan::Image>(
+            device_, memoryAllocator_,
+            vulkan::ImageCreateInfo{
+                .extent = {extent.width, extent.height, 1U},
+                .format = temporalDepthFormat_,
+                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            });
+        upscalingHistoryDepthViews_[index] = std::make_unique<vulkan::ImageView>(
+            device_, *upscalingHistoryDepthImages_[index]);
+    }
+
+    const std::uint64_t pixelCount = static_cast<std::uint64_t>(extent.width) * extent.height;
+    const std::uint64_t colorBytes = pixelCount * 8U * framesInFlight;
+    const std::uint64_t depthBytes = pixelCount * 4U * framesInFlight;
+    constexpr double bytesPerMiB = 1024.0 * 1024.0;
+    core::log(core::LogLevel::info, "Temporal upscaling history at ", extent.width, "x",
+              extent.height, ": HDR color ",
+              static_cast<double>(colorBytes) / bytesPerMiB, " MiB, depth ",
+              static_cast<double>(depthBytes) / bytesPerMiB, " MiB; persistent total ",
+              static_cast<double>(colorBytes + depthBytes) / bytesPerMiB, " MiB");
 }
 
 void Renderer::createPathTracingResources() {
@@ -1975,6 +2068,10 @@ void Renderer::createSceneResources() {
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "bloom_blur_h.frag.spv");
     bloomBlurVerticalShader_ =
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "bloom_blur_v.frag.spv");
+    spatialUpscalingFragmentShader_ = std::make_unique<vulkan::ShaderModule>(
+        device_, shaderDirectory / "upscale_spatial.frag.spv");
+    temporalUpscalingFragmentShader_ = std::make_unique<vulkan::ShaderModule>(
+        device_, shaderDirectory / "upscale_temporal.frag.spv");
     toneMappingVertexShader_ =
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "tonemap.vert.spv");
     toneMappingFragmentShader_ =
@@ -2206,6 +2303,39 @@ void Renderer::createSceneResources() {
         std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, bloomBindings);
     bloomDescriptorPool_ =
         std::make_unique<vulkan::DescriptorPool>(device_, *bloomDescriptorSetLayout_, 4);
+
+    const auto& upscalingBindings =
+        spatialUpscalingFragmentShader_->reflection().descriptorBindings;
+    if (spatialUpscalingFragmentShader_->reflection().stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
+        upscalingBindings.size() != 1U || upscalingBindings[0].set != 0U ||
+        upscalingBindings[0].binding != 0U ||
+        upscalingBindings[0].type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+        upscalingBindings[0].count != 1U) {
+        throw std::runtime_error("Shader reflection does not match spatial upscaling");
+    }
+    upscalingDescriptorSetLayout_ =
+        std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, upscalingBindings);
+    upscalingDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
+        device_, *upscalingDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
+
+    const auto& temporalUpscalingBindings =
+        temporalUpscalingFragmentShader_->reflection().descriptorBindings;
+    if (temporalUpscalingFragmentShader_->reflection().stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
+        temporalUpscalingBindings.size() != 5U) {
+        throw std::runtime_error("Shader reflection does not match temporal upscaling");
+    }
+    for (std::size_t index = 0U; index < temporalUpscalingBindings.size(); ++index) {
+        const vulkan::DescriptorBinding& binding = temporalUpscalingBindings[index];
+        if (binding.set != 0U || binding.binding != index ||
+            binding.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || binding.count != 1U) {
+            throw std::runtime_error("Temporal upscaling descriptor reflection is invalid");
+        }
+    }
+    temporalUpscalingDescriptorSetLayout_ = std::make_unique<vulkan::DescriptorSetLayout>(
+        device_, 0U, temporalUpscalingBindings);
+    temporalUpscalingDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
+        device_, *temporalUpscalingDescriptorSetLayout_,
+        static_cast<std::uint32_t>(framesInFlight));
 
     const std::array<const vulkan::ShaderReflection*, 2> taaReflections{
         &toneMappingVertexShader_->reflection(), &taaFragmentShader_->reflection()};
@@ -3703,6 +3833,37 @@ void Renderer::createGraphicsPipelines() {
                      .descriptorSetLayouts = std::span(&taaSetLayout, 1),
                  });
 
+    const VkDescriptorSetLayout upscalingSetLayout = upscalingDescriptorSetLayout_->handle();
+    spatialUpscalingPipeline_ = std::make_unique<vulkan::GraphicsPipeline>(
+        device_, vulkan::GraphicsPipelineCreateInfo{
+                     .vertexShader = toneMappingVertexShader_.get(),
+                     .fragmentShader = spatialUpscalingFragmentShader_.get(),
+                     .colorFormat = hdrFormat_,
+                     .cullMode = VK_CULL_MODE_NONE,
+                     .cache = pipelineCache_.handle(),
+                     .descriptorSetLayouts = std::span(&upscalingSetLayout, 1),
+                 });
+
+    const VkDescriptorSetLayout temporalUpscalingSetLayout =
+        temporalUpscalingDescriptorSetLayout_->handle();
+    constexpr VkPushConstantRange temporalUpscalingPush{
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0U,
+        .size = sizeof(glm::vec4) + sizeof(glm::uvec4),
+    };
+    const std::array temporalUpscalingAttachmentFormats{temporalDepthFormat_};
+    temporalUpscalingPipeline_ = std::make_unique<vulkan::GraphicsPipeline>(
+        device_, vulkan::GraphicsPipelineCreateInfo{
+                     .vertexShader = toneMappingVertexShader_.get(),
+                     .fragmentShader = temporalUpscalingFragmentShader_.get(),
+                     .colorFormat = hdrFormat_,
+                     .additionalColorFormats = temporalUpscalingAttachmentFormats,
+                     .cullMode = VK_CULL_MODE_NONE,
+                     .cache = pipelineCache_.handle(),
+                     .descriptorSetLayouts = std::span(&temporalUpscalingSetLayout, 1),
+                     .pushConstantRanges = std::span(&temporalUpscalingPush, 1),
+                 });
+
     const VkDescriptorSetLayout toneMappingSetLayout = toneMappingDescriptorSetLayout_->handle();
     toneMappingPipeline_ = std::make_unique<vulkan::GraphicsPipeline>(
         device_, vulkan::GraphicsPipelineCreateInfo{
@@ -3784,6 +3945,40 @@ void Renderer::createGraphicsPipelines() {
     }
 }
 
+void Renderer::importUpscalingHistoryImages() {
+    graphUpscalingHistoryColorReadImage_ = {};
+    graphUpscalingHistoryColorWriteImage_ = {};
+    graphUpscalingHistoryDepthReadImage_ = {};
+    graphUpscalingHistoryDepthWriteImage_ = {};
+    if (!temporalUpscalingEnabled()) {
+        return;
+    }
+    if (!renderGraph_ || !upscalingHistoryColorImages_.front() ||
+        !upscalingHistoryColorImages_.back() || !upscalingHistoryDepthImages_.front() ||
+        !upscalingHistoryDepthImages_.back()) {
+        throw std::runtime_error("Temporal upscaling graph requires complete history resources");
+    }
+    constexpr VkImageSubresourceRange colorSubresource{
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel = 0U,
+        .levelCount = 1U,
+        .baseArrayLayer = 0U,
+        .layerCount = 1U,
+    };
+    graphUpscalingHistoryColorReadImage_ = renderGraph_->importImage(
+        "Upscaling color history read", VK_NULL_HANDLE, colorSubresource, {},
+        render_graph::QueueType::graphics);
+    graphUpscalingHistoryColorWriteImage_ = renderGraph_->importImage(
+        "Upscaling color history write", VK_NULL_HANDLE, colorSubresource, {},
+        render_graph::QueueType::graphics);
+    graphUpscalingHistoryDepthReadImage_ = renderGraph_->importImage(
+        "Upscaling depth history read", VK_NULL_HANDLE, colorSubresource, {},
+        render_graph::QueueType::graphics);
+    graphUpscalingHistoryDepthWriteImage_ = renderGraph_->importImage(
+        "Upscaling depth history write", VK_NULL_HANDLE, colorSubresource, {},
+        render_graph::QueueType::graphics);
+}
+
 void Renderer::createPathTracingRenderGraph() {
     using render_graph::BufferState;
     using render_graph::ImageState;
@@ -3809,6 +4004,7 @@ void Renderer::createPathTracingRenderGraph() {
         throw std::runtime_error("Path-tracing graph requires complete persistent resources");
     }
     renderGraph_ = std::make_unique<render_graph::RenderGraph>(device_, memoryAllocator_);
+    importUpscalingHistoryImages();
     constexpr VkImageSubresourceRange colorSubresource{
         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
         .baseMipLevel = 0U,
@@ -4118,26 +4314,124 @@ void Renderer::createPathTracingRenderGraph() {
             });
     }
 
-    graphUpscaledImage_ = graphPathDenoisedImage_;
+    graphUpscalingSourceImage_ = pathPresentationSourceImage();
+    graphUpscaledImage_ = graphUpscalingSourceImage_;
+    graphUpscaledDepthImage_ = {};
+    if (spatialUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        graphUpscaledImage_ = renderGraph_->createTransientImage(
+            "Upscaled HDR color",
+            vulkan::ImageCreateInfo{
+                .extent = {outputExtent.width, outputExtent.height, 1U},
+                .format = hdrFormat_,
+                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            },
+            vulkan::ImageViewCreateInfo{});
+    } else if (temporalUpscalingEnabled()) {
+        graphUpscaledImage_ = graphUpscalingHistoryColorWriteImage_;
+        graphUpscaledDepthImage_ = graphUpscalingHistoryDepthWriteImage_;
+    }
+    render_graph::PassHandle initializeUpscalingHistoryPass{};
+    if (temporalUpscalingEnabled()) {
+        initializeUpscalingHistoryPass = renderGraph_->addPass(
+            "Initialize temporal upscaling history", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                   const void*) {
+                if (upscalingHistoryLayoutsInitialized_) {
+                    return;
+                }
+                constexpr VkImageSubresourceRange range{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0U,
+                    .levelCount = 1U,
+                    .baseArrayLayer = 0U,
+                    .layerCount = 1U,
+                };
+                constexpr VkClearColorValue colorClear{{0.0F, 0.0F, 0.0F, 0.0F}};
+                constexpr VkClearColorValue depthClear{{1.0F, 0.0F, 0.0F, 0.0F}};
+                vkCmdClearColorImage(commandBuffer,
+                                     graph.image(graphUpscalingHistoryColorReadImage_),
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colorClear, 1U,
+                                     &range);
+                vkCmdClearColorImage(commandBuffer,
+                                     graph.image(graphUpscalingHistoryDepthReadImage_),
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &depthClear, 1U,
+                                     &range);
+            });
+        const ImageState clearState{
+            .stages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        };
+        renderGraph_->writeImage(initializeUpscalingHistoryPass,
+                                 graphUpscalingHistoryColorReadImage_, clearState);
+        renderGraph_->writeImage(initializeUpscalingHistoryPass,
+                                 graphUpscalingHistoryDepthReadImage_, clearState);
+    }
     const render_graph::PassHandle upscalingPass = renderGraph_->addPass(
-        "Native upscaling", QueueType::graphics,
-        [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+        spatialUpscalingEnabled()   ? "Spatial upscaling"
+        : temporalUpscalingEnabled() ? "Temporal upscaling"
+                                     : "Native upscaling",
+        QueueType::graphics,
+        [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
                const void* userData) {
             if (userData == nullptr) {
-                throw std::runtime_error("Native upscaling requires frame context");
+                throw std::runtime_error("Upscaling requires frame context");
             }
-            recordUpscalingPass(commandBuffer,
+            recordUpscalingPass(commandBuffer, graph,
                                 *static_cast<const GraphFrameContext*>(userData));
         });
+    if (temporalUpscalingEnabled()) {
+        renderGraph_->addDependency(initializeUpscalingHistoryPass, upscalingPass);
+    }
     constexpr ImageState upscalingReadState{
         .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         .layout = VK_IMAGE_LAYOUT_GENERAL,
     };
-    renderGraph_->readImage(upscalingPass, graphUpscaledImage_, upscalingReadState);
-    renderGraph_->readImage(upscalingPass, graphPathTracingDepthImage_, upscalingReadState);
-    renderGraph_->readImage(upscalingPass, graphPathTracingMotionDepthImage_,
-                            upscalingReadState);
+    renderGraph_->readImage(upscalingPass, graphUpscalingSourceImage_, upscalingReadState);
+    if (temporalUpscalingEnabled()) {
+        constexpr ImageState temporalHistoryReadState{
+            .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        renderGraph_->readImage(upscalingPass, graphPathTracingDepthImage_, upscalingReadState);
+        renderGraph_->readImage(upscalingPass, graphPathTracingMotionDepthImage_,
+                                upscalingReadState);
+        renderGraph_->readImage(upscalingPass, graphUpscalingHistoryColorReadImage_,
+                                temporalHistoryReadState);
+        renderGraph_->readImage(upscalingPass, graphUpscalingHistoryDepthReadImage_,
+                                temporalHistoryReadState);
+    }
+    if (upscalingDispatchEnabled()) {
+        renderGraph_->writeImage(
+            upscalingPass, graphUpscaledImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+    }
+    if (temporalUpscalingEnabled()) {
+        renderGraph_->writeImage(
+            upscalingPass, graphUpscaledDepthImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+        const render_graph::PassHandle preserveUpscalingDepthPass =
+            renderGraph_->addPass("Preserve temporal upscaling depth", QueueType::graphics);
+        renderGraph_->addDependency(upscalingPass, preserveUpscalingDepthPass);
+        renderGraph_->readImage(
+            preserveUpscalingDepthPass, graphUpscaledDepthImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            });
+    }
 
     const render_graph::PassHandle toneMappingPass = renderGraph_->addPass(
         "Tone mapping", QueueType::graphics,
@@ -4150,34 +4444,31 @@ void Renderer::createPathTracingRenderGraph() {
                                   *static_cast<const GraphFrameContext*>(userData));
         });
     renderGraph_->addDependency(upscalingPass, toneMappingPass);
-    renderGraph_->readImage(
-        toneMappingPass, graphPathTracingAccumulationImage_,
-        ImageState{
-            .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-            .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            .layout = VK_IMAGE_LAYOUT_GENERAL,
-        });
     constexpr ImageState pathDebugReadState{
         .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         .layout = VK_IMAGE_LAYOUT_GENERAL,
     };
-    renderGraph_->readImage(toneMappingPass, graphPathTracingDirectImage_,
-                            pathDebugReadState);
-    renderGraph_->readImage(toneMappingPass, graphPathTracingSurfaceImage_,
-                            pathDebugReadState);
-    renderGraph_->readImage(toneMappingPass, graphPathTracingNormalImage_,
-                            pathDebugReadState);
-    renderGraph_->readImage(toneMappingPass, graphPathTracingMotionDepthImage_,
-                            pathDebugReadState);
-    renderGraph_->readImage(toneMappingPass, graphPathTracingDepthImage_,
-                            pathDebugReadState);
-    renderGraph_->readImage(toneMappingPass, graphPathHistoryValidityImage_,
-                            pathDebugReadState);
-    renderGraph_->readImage(toneMappingPass, graphPathReconstructionWriteImage_,
-                            pathDebugReadState);
-    renderGraph_->readImage(toneMappingPass, graphUpscaledImage_,
-                            pathDebugReadState);
+    renderGraph_->readImage(
+        toneMappingPass, graphUpscaledImage_,
+        upscalingDispatchEnabled()
+            ? ImageState{
+                  .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                  .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+              }
+            : pathDebugReadState);
+    const std::array pathDebugImages{
+        graphPathTracingAccumulationImage_, graphPathTracingDirectImage_,
+        graphPathTracingSurfaceImage_,      graphPathTracingNormalImage_,
+        graphPathTracingMotionDepthImage_,  graphPathTracingDepthImage_,
+        graphPathHistoryValidityImage_,     graphPathReconstructionWriteImage_,
+    };
+    for (render_graph::ImageHandle image : pathDebugImages) {
+        if (image != graphUpscaledImage_) {
+            renderGraph_->readImage(toneMappingPass, image, pathDebugReadState);
+        }
+    }
     renderGraph_->readBuffer(
         toneMappingPass, graphUniformBuffer_,
         BufferState{
@@ -4230,8 +4521,20 @@ void Renderer::createPathTracingRenderGraph() {
               "Render graph compiled: TLAS update -> progressive path tracing -> path history "
               "validation -> path temporal reconstruction -> path spatial denoising",
               graphPathAovReadbackBuffer_ ? " -> path AOV readback" : "",
-              " -> Native upscaling -> tone mapping",
+              spatialUpscalingEnabled()
+                  ? " -> Spatial upscaling -> tone mapping"
+              : temporalUpscalingEnabled()
+                  ? " -> Temporal upscaling -> tone mapping"
+                  : " -> Native upscaling -> tone mapping",
               graphCaptureBuffer_ ? " -> Capture" : "", " -> Present");
+    if (spatialUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        const std::uint64_t outputBytes =
+            static_cast<std::uint64_t>(outputExtent.width) * outputExtent.height * 8U;
+        core::log(core::LogLevel::info, "Spatial upscaling HDR output at ",
+                  outputExtent.width, "x", outputExtent.height, ": ",
+                  static_cast<double>(outputBytes) / (1024.0 * 1024.0), " MiB transient");
+    }
 }
 
 void Renderer::createRenderGraph() {
@@ -4247,6 +4550,7 @@ void Renderer::createRenderGraph() {
     const bool rayQueryShadows =
         rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery;
     renderGraph_ = std::make_unique<render_graph::RenderGraph>(device_, memoryAllocator_);
+    importUpscalingHistoryImages();
     const bool concurrentUpload =
         device_.queueFamilies().graphics != device_.queueFamilies().transfer;
     constexpr VkImageSubresourceRange colorSubresource{
@@ -5015,21 +5319,109 @@ void Renderer::createRenderGraph() {
         renderGraph_->writeImage(bloomVerticalPass, bloomLevel.filtered, colorWriteState);
     }
 
-    graphUpscaledImage_ = postProcessSource;
+    graphUpscalingSourceImage_ = postProcessSource;
+    graphUpscaledImage_ = graphUpscalingSourceImage_;
+    graphUpscaledDepthImage_ = {};
+    if (spatialUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        graphUpscaledImage_ = renderGraph_->createTransientImage(
+            "Upscaled HDR color",
+            vulkan::ImageCreateInfo{
+                .extent = {outputExtent.width, outputExtent.height, 1U},
+                .format = hdrFormat_,
+                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            },
+            vulkan::ImageViewCreateInfo{});
+    } else if (temporalUpscalingEnabled()) {
+        graphUpscaledImage_ = graphUpscalingHistoryColorWriteImage_;
+        graphUpscaledDepthImage_ = graphUpscalingHistoryDepthWriteImage_;
+    }
+    render_graph::PassHandle initializeUpscalingHistoryPass{};
+    if (temporalUpscalingEnabled()) {
+        initializeUpscalingHistoryPass = renderGraph_->addPass(
+            "Initialize temporal upscaling history", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                   const void*) {
+                if (upscalingHistoryLayoutsInitialized_) {
+                    return;
+                }
+                constexpr VkImageSubresourceRange range{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = 0U,
+                    .levelCount = 1U,
+                    .baseArrayLayer = 0U,
+                    .layerCount = 1U,
+                };
+                constexpr VkClearColorValue colorClear{{0.0F, 0.0F, 0.0F, 0.0F}};
+                constexpr VkClearColorValue depthClear{{1.0F, 0.0F, 0.0F, 0.0F}};
+                vkCmdClearColorImage(commandBuffer,
+                                     graph.image(graphUpscalingHistoryColorReadImage_),
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &colorClear, 1U,
+                                     &range);
+                vkCmdClearColorImage(commandBuffer,
+                                     graph.image(graphUpscalingHistoryDepthReadImage_),
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &depthClear, 1U,
+                                     &range);
+            });
+        const ImageState clearState{
+            .stages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+            .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        };
+        renderGraph_->writeImage(initializeUpscalingHistoryPass,
+                                 graphUpscalingHistoryColorReadImage_, clearState);
+        renderGraph_->writeImage(initializeUpscalingHistoryPass,
+                                 graphUpscalingHistoryDepthReadImage_, clearState);
+    }
     const render_graph::PassHandle upscalingPass = renderGraph_->addPass(
-        "Native upscaling", QueueType::graphics,
-        [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+        spatialUpscalingEnabled()   ? "Spatial upscaling"
+        : temporalUpscalingEnabled() ? "Temporal upscaling"
+                                     : "Native upscaling",
+        QueueType::graphics,
+        [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
                const void* userData) {
             if (userData == nullptr) {
-                throw std::runtime_error("Native upscaling requires frame context");
+                throw std::runtime_error("Upscaling requires frame context");
             }
-            recordUpscalingPass(commandBuffer,
+            recordUpscalingPass(commandBuffer, graph,
                                 *static_cast<const GraphFrameContext*>(userData));
         });
-    renderGraph_->readImage(upscalingPass, graphUpscaledImage_,
+    if (temporalUpscalingEnabled()) {
+        renderGraph_->addDependency(initializeUpscalingHistoryPass, upscalingPass);
+    }
+    renderGraph_->readImage(upscalingPass, graphUpscalingSourceImage_,
                             config_.taaEnabled ? historySampledState : sampledImageState);
-    renderGraph_->readImage(upscalingPass, graphDepthImage_, sampledImageState);
-    renderGraph_->readImage(upscalingPass, graphMotionImage_, sampledImageState);
+    if (temporalUpscalingEnabled()) {
+        renderGraph_->readImage(upscalingPass, graphDepthImage_, sampledImageState);
+        renderGraph_->readImage(upscalingPass, graphMotionImage_, sampledImageState);
+        renderGraph_->readImage(upscalingPass, graphUpscalingHistoryColorReadImage_,
+                                sampledImageState);
+        renderGraph_->readImage(upscalingPass, graphUpscalingHistoryDepthReadImage_,
+                                sampledImageState);
+    }
+    if (upscalingDispatchEnabled()) {
+        renderGraph_->writeImage(
+            upscalingPass, graphUpscaledImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+    }
+    if (temporalUpscalingEnabled()) {
+        renderGraph_->writeImage(
+            upscalingPass, graphUpscaledDepthImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+        const render_graph::PassHandle preserveUpscalingDepthPass =
+            renderGraph_->addPass("Preserve temporal upscaling depth", QueueType::graphics);
+        renderGraph_->addDependency(upscalingPass, preserveUpscalingDepthPass);
+        renderGraph_->readImage(preserveUpscalingDepthPass, graphUpscaledDepthImage_,
+                                sampledImageState);
+    }
 
     const render_graph::PassHandle toneMappingPass = renderGraph_->addPass(
         "Tone mapping", QueueType::graphics,
@@ -5042,8 +5434,11 @@ void Renderer::createRenderGraph() {
                                   *static_cast<const GraphFrameContext*>(userData));
         });
     renderGraph_->addDependency(upscalingPass, toneMappingPass);
-    renderGraph_->readImage(toneMappingPass, graphUpscaledImage_,
-                            config_.taaEnabled ? historySampledState : sampledImageState);
+    renderGraph_->readImage(
+        toneMappingPass, graphUpscaledImage_,
+        upscalingDispatchEnabled() ? sampledImageState
+                                   : (config_.taaEnabled ? historySampledState
+                                                         : sampledImageState));
     if (config_.bloomEnabled) {
         renderGraph_->readImage(toneMappingPass, graphBloomLevels_.front().filtered,
                                 sampledImageState);
@@ -5107,8 +5502,21 @@ void Renderer::createRenderGraph() {
                            "Hi-Z build"),
               config_.taaEnabled ? " -> Temporal resolve" : "",
               config_.bloomEnabled ? " -> Bloom" : " -> Bloom skipped",
-              " -> Native upscaling -> Tone mapping",
+              spatialUpscalingEnabled()
+                  ? " -> Spatial upscaling -> Tone mapping"
+              : temporalUpscalingEnabled()
+                  ? " -> Temporal upscaling -> Tone mapping"
+                  : " -> Native upscaling -> Tone mapping",
               graphCaptureBuffer_ ? " -> Capture" : "", " -> Present");
+
+    if (spatialUpscalingEnabled()) {
+        const VkExtent2D outputExtent = swapchain_.extent();
+        const std::uint64_t outputBytes =
+            static_cast<std::uint64_t>(outputExtent.width) * outputExtent.height * 8U;
+        core::log(core::LogLevel::info, "Spatial upscaling HDR output at ",
+                  outputExtent.width, "x", outputExtent.height, ": ",
+                  static_cast<double>(outputBytes) / (1024.0 * 1024.0), " MiB transient");
+    }
 
     const post::ResourceMemory memory = post::resourceMemory(
         targetExtent.width, targetExtent.height, config_.bloomEnabled, config_.taaEnabled);
@@ -5475,50 +5883,171 @@ void Renderer::updatePathDenoisingDescriptors() {
     }
 }
 
+render_graph::ImageHandle Renderer::pathPresentationSourceImage() const {
+    switch (config_.pathDebugView) {
+    case PathDebugView::final:
+    case PathDebugView::variance:
+        return graphPathDenoisedImage_;
+    case PathDebugView::reconstructionWeight:
+    case PathDebugView::temporalRadiance:
+        return graphPathReconstructionWriteImage_;
+    case PathDebugView::direct:
+        return graphPathTracingDirectImage_;
+    case PathDebugView::indirect:
+    case PathDebugView::lightingResidual:
+    case PathDebugView::rawRadiance:
+        return graphPathTracingAccumulationImage_;
+    case PathDebugView::albedo:
+    case PathDebugView::roughness:
+        return graphPathTracingSurfaceImage_;
+    case PathDebugView::geometricNormal:
+    case PathDebugView::shadingNormal:
+        return graphPathTracingNormalImage_;
+    case PathDebugView::motion:
+    case PathDebugView::hitDistance:
+        return graphPathTracingMotionDepthImage_;
+    case PathDebugView::depth:
+        return graphPathTracingDepthImage_;
+    case PathDebugView::historyValidity:
+        return graphPathHistoryValidityImage_;
+    }
+    throw std::runtime_error("Unknown path presentation source");
+}
+
+const vulkan::ImageView&
+Renderer::pathPresentationSourceView(std::size_t frameIndex) const {
+    const vulkan::ImageView* selectedView = nullptr;
+    switch (config_.pathDebugView) {
+    case PathDebugView::final:
+    case PathDebugView::variance:
+        selectedView = pathDenoisedView_.get();
+        break;
+    case PathDebugView::reconstructionWeight:
+    case PathDebugView::temporalRadiance:
+        selectedView = pathReconstructionViews_.at(frameIndex).get();
+        break;
+    case PathDebugView::direct:
+        selectedView = pathTracingDirectView_.get();
+        break;
+    case PathDebugView::indirect:
+    case PathDebugView::lightingResidual:
+    case PathDebugView::rawRadiance:
+        selectedView = pathTracingAccumulationView_.get();
+        break;
+    case PathDebugView::albedo:
+    case PathDebugView::roughness:
+        selectedView = pathTracingSurfaceView_.get();
+        break;
+    case PathDebugView::geometricNormal:
+    case PathDebugView::shadingNormal:
+        selectedView = pathTracingNormalView_.get();
+        break;
+    case PathDebugView::motion:
+    case PathDebugView::hitDistance:
+        selectedView = pathTracingMotionDepthView_.get();
+        break;
+    case PathDebugView::depth:
+        selectedView = pathTracingDepthView_.get();
+        break;
+    case PathDebugView::historyValidity:
+        selectedView = pathHistoryValidityView_.get();
+        break;
+    }
+    if (selectedView == nullptr) {
+        throw std::runtime_error("Path presentation source view is incomplete");
+    }
+    return *selectedView;
+}
+
+void Renderer::updateUpscalingDescriptor() {
+    if (!upscalingDescriptorPool_ || !temporalUpscalingDescriptorPool_ ||
+        !brdfLutSampler_ || !hiZSampler_ || !renderGraph_) {
+        throw std::runtime_error("Upscaling descriptors require complete renderer resources");
+    }
+    for (std::size_t index = 0U; index < framesInFlight; ++index) {
+        VkImageView sourceView = VK_NULL_HANDLE;
+        VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        if (pathTracingEnabled()) {
+            sourceView = pathPresentationSourceView(index).handle();
+            sourceLayout = VK_IMAGE_LAYOUT_GENERAL;
+        } else if (config_.taaEnabled) {
+            sourceView = historyColorViews_[index]->handle();
+            sourceLayout = VK_IMAGE_LAYOUT_GENERAL;
+        } else {
+            sourceView = renderGraph_->imageView(graphHdrImage_);
+        }
+        const VkDescriptorImageInfo sourceInfo{
+            .sampler = brdfLutSampler_->handle(),
+            .imageView = sourceView,
+            .imageLayout = sourceLayout,
+        };
+        if (spatialUpscalingEnabled()) {
+            const VkWriteDescriptorSet write{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = upscalingDescriptorPool_->set(index),
+                .dstBinding = 0U,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &sourceInfo,
+            };
+            vkUpdateDescriptorSets(device_.handle(), 1U, &write, 0U, nullptr);
+        }
+        if (!temporalUpscalingEnabled()) {
+            continue;
+        }
+        const std::size_t historyReadIndex = 1U - index;
+        if (!upscalingHistoryColorViews_[historyReadIndex] ||
+            !upscalingHistoryDepthViews_[historyReadIndex]) {
+            throw std::runtime_error("Temporal upscaling descriptor history is incomplete");
+        }
+        const VkDescriptorImageInfo depthInfo{
+            .sampler = hiZSampler_->handle(),
+            .imageView = pathTracingEnabled() ? pathTracingDepthView_->handle()
+                                              : renderGraph_->imageView(graphDepthImage_),
+            .imageLayout = pathTracingEnabled() ? VK_IMAGE_LAYOUT_GENERAL
+                                                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo motionInfo{
+            .sampler = hiZSampler_->handle(),
+            .imageView = pathTracingEnabled() ? pathTracingMotionDepthView_->handle()
+                                              : renderGraph_->imageView(graphMotionImage_),
+            .imageLayout = pathTracingEnabled() ? VK_IMAGE_LAYOUT_GENERAL
+                                                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const std::array temporalInfos{
+            sourceInfo,
+            depthInfo,
+            motionInfo,
+            VkDescriptorImageInfo{
+                .sampler = brdfLutSampler_->handle(),
+                .imageView = upscalingHistoryColorViews_[historyReadIndex]->handle(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = hiZSampler_->handle(),
+                .imageView = upscalingHistoryDepthViews_[historyReadIndex]->handle(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+        };
+        std::array<VkWriteDescriptorSet, 5> writes{};
+        for (std::size_t bindingIndex = 0U; bindingIndex < writes.size(); ++bindingIndex) {
+            writes[bindingIndex] = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = temporalUpscalingDescriptorPool_->set(index),
+                .dstBinding = static_cast<std::uint32_t>(bindingIndex),
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &temporalInfos[bindingIndex],
+            };
+        }
+        vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
+                               writes.data(), 0U, nullptr);
+    }
+}
+
 void Renderer::updateToneMappingDescriptor() {
     if (pathTracingEnabled()) {
-        const vulkan::ImageView* selectedStaticView = pathTracingAccumulationView_.get();
-        switch (config_.pathDebugView) {
-        case PathDebugView::final:
-            selectedStaticView = pathDenoisedView_.get();
-            break;
-        case PathDebugView::reconstructionWeight:
-        case PathDebugView::temporalRadiance:
-            selectedStaticView = nullptr;
-            break;
-        case PathDebugView::variance:
-            selectedStaticView = pathDenoisedView_.get();
-            break;
-        case PathDebugView::direct:
-            selectedStaticView = pathTracingDirectView_.get();
-            break;
-        case PathDebugView::indirect:
-            break;
-        case PathDebugView::albedo:
-        case PathDebugView::roughness:
-            selectedStaticView = pathTracingSurfaceView_.get();
-            break;
-        case PathDebugView::geometricNormal:
-        case PathDebugView::shadingNormal:
-            selectedStaticView = pathTracingNormalView_.get();
-            break;
-        case PathDebugView::motion:
-        case PathDebugView::hitDistance:
-            selectedStaticView = pathTracingMotionDepthView_.get();
-            break;
-        case PathDebugView::depth:
-            selectedStaticView = pathTracingDepthView_.get();
-            break;
-        case PathDebugView::lightingResidual:
-            break;
-        case PathDebugView::historyValidity:
-            selectedStaticView = pathHistoryValidityView_.get();
-            break;
-        case PathDebugView::rawRadiance:
-            break;
-        }
-        if (pathTracingMotionDepthView_ == nullptr || pathTracingDepthView_ == nullptr ||
-            pathHistoryValidityView_ == nullptr || pathTracingDirectView_ == nullptr) {
+        if (pathTracingMotionDepthView_ == nullptr || pathTracingDirectView_ == nullptr) {
             throw std::runtime_error("Path debug view requires reconstruction resources");
         }
         const VkDescriptorImageInfo tertiaryInfo{
@@ -5527,24 +6056,30 @@ void Renderer::updateToneMappingDescriptor() {
             .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
         for (std::size_t index = 0; index < framesInFlight; ++index) {
-            const vulkan::ImageView* selectedView =
-                selectedStaticView != nullptr ? selectedStaticView
-                                              : pathReconstructionViews_[index].get();
-            if (selectedView == nullptr) {
-                throw std::runtime_error("Path reconstruction output view is incomplete");
-            }
+            const vulkan::ImageView& pathSource = pathPresentationSourceView(index);
+            const VkImageView selectedView = spatialUpscalingEnabled()
+                                                 ? renderGraph_->imageView(graphUpscaledImage_)
+                                             : temporalUpscalingEnabled()
+                                                 ? upscalingHistoryColorViews_[index]->handle()
+                                                 : pathSource.handle();
+            const VkImageLayout selectedLayout =
+                upscalingDispatchEnabled() ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                           : VK_IMAGE_LAYOUT_GENERAL;
             const VkDescriptorImageInfo selectedInfo{
                 .sampler = brdfLutSampler_->handle(),
-                .imageView = selectedView->handle(),
-                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .imageView = selectedView,
+                .imageLayout = selectedLayout,
             };
             const VkDescriptorImageInfo secondaryInfo{
                 .sampler = brdfLutSampler_->handle(),
                 .imageView = config_.pathDebugView == PathDebugView::indirect ||
                                      config_.pathDebugView == PathDebugView::lightingResidual
                                  ? pathTracingDirectView_->handle()
-                                 : selectedView->handle(),
-                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                 : selectedView,
+                .imageLayout = config_.pathDebugView == PathDebugView::indirect ||
+                                       config_.pathDebugView == PathDebugView::lightingResidual
+                                   ? VK_IMAGE_LAYOUT_GENERAL
+                                   : selectedLayout,
             };
             std::array<VkWriteDescriptorSet, 3> writes{};
             constexpr std::array bindings{0U, 2U, 3U};
@@ -5586,12 +6121,25 @@ void Renderer::updateToneMappingDescriptor() {
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     };
     for (std::size_t index = 0; index < framesInFlight; ++index) {
-        const VkDescriptorImageInfo postProcessInfo{
+        const VkDescriptorImageInfo bloomSourceInfo{
             .sampler = brdfLutSampler_->handle(),
             .imageView = config_.taaEnabled ? historyColorViews_[index]->handle()
                                             : currentColorInfo.imageView,
             .imageLayout = config_.taaEnabled ? VK_IMAGE_LAYOUT_GENERAL
                                               : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo postProcessInfo{
+            .sampler = brdfLutSampler_->handle(),
+            .imageView = spatialUpscalingEnabled()
+                             ? renderGraph_->imageView(graphUpscaledImage_)
+                         : temporalUpscalingEnabled()
+                             ? upscalingHistoryColorViews_[index]->handle()
+                             : (config_.taaEnabled ? historyColorViews_[index]->handle()
+                                                   : currentColorInfo.imageView),
+            .imageLayout = upscalingDispatchEnabled()
+                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                               : (config_.taaEnabled ? VK_IMAGE_LAYOUT_GENERAL
+                                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
         };
         const VkDescriptorImageInfo bloomInfo{
             .sampler = brdfLutSampler_->handle(),
@@ -5677,7 +6225,7 @@ void Renderer::updateToneMappingDescriptor() {
                 .dstBinding = 0,
                 .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                .pImageInfo = &postProcessInfo,
+                .pImageInfo = &bloomSourceInfo,
             };
             const VkWriteDescriptorSet bloomControlsWrite{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -6005,8 +6553,8 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
     glm::mat4 projection =
         glm::perspectiveRH_ZO(glm::radians(verticalFieldOfView), aspect, nearPlane, farPlane);
     projection[1][1] *= -1.0F;
-    const bool jitterEnabled =
-        config_.taaEnabled && config_.postTestPattern == post::TestPattern::none;
+    const bool jitterEnabled = (config_.taaEnabled || temporalUpscalingEnabled()) &&
+                               config_.postTestPattern == post::TestPattern::none;
     temporalState_.beginFrame(view, projection, extent.width, extent.height, renderedFrameCount_,
                               jitterEnabled);
     const temporal::CameraMatrices& currentCamera = temporalState_.current();
@@ -6169,7 +6717,8 @@ void Renderer::recreateSwapchain() {
     renderGraph_.reset();
     const VkExtent2D resizedRenderExtent = renderExtent();
     const VkExtent2D resizedOutputExtent = swapchain_.extent();
-    core::log(core::LogLevel::info, "Upscaler resize: ", upscaler_->name(), " identity, render ",
+    core::log(core::LogLevel::info, "Upscaler resize: ", upscaler_->name(), ", quality ",
+              upscaling::qualityModeName(upscaler_->qualityMode()), ", render ",
               resizedRenderExtent.width, "x", resizedRenderExtent.height, " -> output ",
               resizedOutputExtent.width, "x", resizedOutputExtent.height,
               "; reconstruction history reset");
@@ -6179,6 +6728,7 @@ void Renderer::recreateSwapchain() {
     }
     createCaptureBuffer();
     createTemporalResources();
+    createUpscalingHistoryResources();
     createPathTracingResources();
     createRenderGraph();
     if (pathTracingEnabled()) {
@@ -6189,6 +6739,7 @@ void Renderer::recreateSwapchain() {
     } else {
         updateShadowDescriptor();
     }
+    updateUpscalingDescriptor();
     updateToneMappingDescriptor();
     if (!pathTracingEnabled()) {
         updateHiZDescriptors();
@@ -6254,6 +6805,34 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                                          .access = VK_ACCESS_2_UNIFORM_READ_BIT,
                                      },
                                      render_graph::QueueType::graphics);
+    if (temporalUpscalingEnabled()) {
+        const std::size_t historyWriteIndex = frameIndex;
+        const std::size_t historyReadIndex = 1U - historyWriteIndex;
+        const render_graph::ImageState historyState =
+            upscalingHistoryLayoutsInitialized_
+                ? render_graph::ImageState{
+                      .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                      .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                      .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  }
+                : render_graph::ImageState{};
+        renderGraph_->bindImportedImage(
+            graphUpscalingHistoryColorReadImage_,
+            upscalingHistoryColorImages_[historyReadIndex]->handle(), historyState,
+            render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(
+            graphUpscalingHistoryColorWriteImage_,
+            upscalingHistoryColorImages_[historyWriteIndex]->handle(), historyState,
+            render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(
+            graphUpscalingHistoryDepthReadImage_,
+            upscalingHistoryDepthImages_[historyReadIndex]->handle(), historyState,
+            render_graph::QueueType::graphics);
+        renderGraph_->bindImportedImage(
+            graphUpscalingHistoryDepthWriteImage_,
+            upscalingHistoryDepthImages_[historyWriteIndex]->handle(), historyState,
+            render_graph::QueueType::graphics);
+    }
     if (pathTracingEnabled()) {
         if (pathAnimatedTransformBuffers_[frameIndex]) {
             renderGraph_->bindImportedBuffer(
@@ -6783,18 +7362,99 @@ void Renderer::recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
 }
 
 void Renderer::recordUpscalingPass(VkCommandBuffer commandBuffer,
+                                   const render_graph::RenderGraph& graph,
                                    const GraphFrameContext& context) {
     const VkExtent2D expectedRenderExtent = renderExtent();
     const VkExtent2D expectedOutputExtent = swapchain_.extent();
     if (!upscaler_ || upscalingFramePlan_.backend != upscaler_->backend() ||
+        upscalingFramePlan_.qualityMode != upscaler_->qualityMode() ||
         upscalingFramePlan_.renderExtent !=
             upscaling::Extent{expectedRenderExtent.width, expectedRenderExtent.height} ||
         upscalingFramePlan_.outputExtent !=
             upscaling::Extent{expectedOutputExtent.width, expectedOutputExtent.height} ||
-        upscalingFramePlan_.dispatchRequired) {
-        throw std::runtime_error("Native upscaling frame plan is inconsistent");
+        upscalingFramePlan_.dispatchRequired != upscalingDispatchEnabled()) {
+        throw std::runtime_error("Upscaling frame plan is inconsistent");
     }
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::upscaling, false);
+    if (!upscalingFramePlan_.dispatchRequired) {
+        writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::upscaling, true);
+        return;
+    }
+    if ((spatialUpscalingEnabled() &&
+         (!spatialUpscalingPipeline_ || !upscalingDescriptorPool_)) ||
+        (temporalUpscalingEnabled() &&
+         (!temporalUpscalingPipeline_ || !temporalUpscalingDescriptorPool_ ||
+          !upscalingHistoryColorViews_[context.frameIndex] ||
+          !upscalingHistoryDepthViews_[context.frameIndex]))) {
+        throw std::runtime_error("Upscaling pipeline resources are incomplete");
+    }
+    std::array<VkRenderingAttachmentInfo, 2> colorAttachments{};
+    colorAttachments[0] = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = spatialUpscalingEnabled()
+                         ? graph.imageView(graphUpscaledImage_)
+                         : upscalingHistoryColorViews_[context.frameIndex]->handle(),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    if (temporalUpscalingEnabled()) {
+        colorAttachments[1] = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = upscalingHistoryDepthViews_[context.frameIndex]->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        };
+    }
+    const VkRenderingInfo renderingInfo{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = {.offset = {0, 0}, .extent = expectedOutputExtent},
+        .layerCount = 1U,
+        .colorAttachmentCount = temporalUpscalingEnabled() ? 2U : 1U,
+        .pColorAttachments = colorAttachments.data(),
+    };
+    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    const VkViewport viewport{
+        .x = 0.0F,
+        .y = 0.0F,
+        .width = static_cast<float>(expectedOutputExtent.width),
+        .height = static_cast<float>(expectedOutputExtent.height),
+        .minDepth = 0.0F,
+        .maxDepth = 1.0F,
+    };
+    const VkRect2D scissor{.offset = {0, 0}, .extent = expectedOutputExtent};
+    vkCmdSetViewport(commandBuffer, 0U, 1U, &viewport);
+    vkCmdSetScissor(commandBuffer, 0U, 1U, &scissor);
+    const vulkan::GraphicsPipeline& pipeline = temporalUpscalingEnabled()
+                                                   ? *temporalUpscalingPipeline_
+                                                   : *spatialUpscalingPipeline_;
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle());
+    const VkDescriptorSet descriptorSet = temporalUpscalingEnabled()
+                                              ? temporalUpscalingDescriptorPool_->set(
+                                                    context.frameIndex)
+                                              : upscalingDescriptorPool_->set(context.frameIndex);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipeline.layout(), 0U, 1U, &descriptorSet, 0U, nullptr);
+    if (temporalUpscalingEnabled()) {
+        struct TemporalUpscalingControls {
+            glm::vec4 temporalJitter{0.0F};
+            glm::uvec4 flags{0U};
+        };
+        static_assert(sizeof(TemporalUpscalingControls) == sizeof(glm::vec4) +
+                                                               sizeof(glm::uvec4));
+        const TemporalUpscalingControls controls{
+            .temporalJitter = {upscalingFramePlan_.currentJitterPixels.x,
+                               upscalingFramePlan_.currentJitterPixels.y,
+                               upscalingFramePlan_.previousJitterPixels.x,
+                               upscalingFramePlan_.previousJitterPixels.y},
+            .flags = {upscalingFramePlan_.resetHistory ? 0U : 1U, 0U, 0U, 0U},
+        };
+        vkCmdPushConstants(commandBuffer, pipeline.layout(), VK_SHADER_STAGE_FRAGMENT_BIT, 0U,
+                           sizeof(controls), &controls);
+    }
+    vkCmdDraw(commandBuffer, 3U, 1U, 0U, 0U);
+    vkCmdEndRendering(commandBuffer);
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::upscaling, true);
 }
 

@@ -68,11 +68,18 @@ fallback contracts.
   moving frames reset progressive accumulation to one sample, and validated
   temporal history remains reusable on matching surfaces while disocclusions
   are rejected.
-- A renderer-owned `IUpscaler` contract with a `native` backend, separate
-  render/output extents, canonical color/depth/motion/jitter/exposure/reset
-  inputs, and one render-graph boundary shared by raster and path modes before
-  tone mapping. Native is deliberately strict 1:1 and performs no image
-  dispatch; its timestamp pair measures the boundary overhead.
+- A renderer-owned `IUpscaler` contract with strict 1:1 `native`, portable
+  `spatial`, and renderer-owned `temporal` reference backends, separate
+  render/output extents, canonical
+  color/depth/motion/jitter/exposure/reset inputs, and one render-graph boundary
+  shared by raster and path modes before tone mapping. Spatial accepts a
+  configurable 0.5-1.0 scale and hardware-linearly reconstructs a distinct
+  output-resolution linear-HDR target. Temporal adds output-resolution
+  color/depth history with jitter-corrected, clipped, depth/motion-aware reuse.
+  Quality/balanced/performance modes map to 2/3, 10/17, and 1/2 scale. The ABI
+  explicitly declares reconstruction type, history/output ownership, optional
+  features, and canonical temporal input conventions without vendor or Vulkan
+  types.
 
 ## Concrete Progress Numbers
 
@@ -137,8 +144,16 @@ These are tested examples, not final engine maximums:
 | RTX 1280x720 default-two-bounce path dispatch, 32-frame mean | 4.06463 ms |
 | RTX 1280x720 textured glTF path dispatch, 32-frame mean | 2.11111 ms |
 | Native implicit/explicit raster output RMSE | 0 |
-| Native raster upscaling boundary at 320x180 | 0.000016 ms |
-| Native animated-path upscaling boundary at 320x180 | 0.000116 ms |
+| Spatial repeated raster output RMSE | 0 |
+| Spatial quality dispatch, 213x120 to 320x180 | 0.00728 ms |
+| Spatial balanced dispatch, 188x106 to 320x180 | 0.006824 ms |
+| Spatial performance dispatch, 160x90 to 320x180 | 0.006848 ms |
+| Spatial custom 0.75 dispatch, 240x135 to 320x180 | 0.007184 ms |
+| Spatial animated-path performance dispatch | 0.007584 ms |
+| Native/spatial short animated path dispatch | 0.338204 / 0.218904 ms |
+| Temporal raster performance dispatch, 160x90 to 320x180 | 0.0157333 ms |
+| Temporal animated-path performance dispatch | 0.017624 ms |
+| Temporal output history at 320x180 | 1.31836 MiB |
 | Bindless texture descriptors | 64 current fixed capacity |
 | Debug tests | 18/18 passing |
 | Release tests | 18/18 passing |
@@ -253,12 +268,14 @@ Validated on NVIDIA RTX 2060 Super 8 GB with driver 595.84:
   automated captures. Two scripted swapchain recreations rebuild all radiance
   and first-hit targets, produce two explicit resets, and finish with 13 valid
   samples after the last reset.
-- The native upscaling gate proves implicit and explicit selection are exact
-  at RMSE 0, recreates 1279x719 and restored 640x360 render/output resources,
-  and carries eight animated path frames through matching GPU Scene/TLAS
-  updates. Core, synchronization, and best-practices validation are clean. The
-  timestamp-only boundary measures 0.000016 ms in raster and 0.000116 ms in animated
-  path mode at 320x180.
+- The upscaling gate proves implicit and explicit native selection are exact at
+  RMSE 0 and spatial repeats are exact at RMSE 0. It reconstructs 160x90 HDR to
+  320x180, recreates 640x360 render resources for an odd 1279x719 output and
+  restores 320x180 render resources for 640x360, and carries eight animated
+  path frames through matching GPU Scene/TLAS updates. Quality (213x120),
+  balanced (188x106), performance (160x90), and custom 0.75 (240x135) modes all
+  produce the 320x180 output under their timing budgets. TAA, bloom, core,
+  synchronization, and best-practices validation are clean.
 
 ## Milestone 8 Status
 
@@ -402,40 +419,62 @@ Not working yet:
   materials, and RT LOD/residency changes; the current CDF is rebuilt with the
   static scene.
 
-## Upscaling Baseline
+## Upscaling Baseline and Temporal Reference
 
 Implemented and hardware-validated:
 
-- `--upscaler native` selects the renderer-owned baseline; it is also the
-  default. Backend parsing and construction do not expose Vulkan or vendor SDK
-  types.
+- `--upscaler native` selects the strict 1:1 identity backend and remains the
+  default. `--upscaler spatial` selects the portable scaled backend and
+  `--upscaler temporal` selects the portable temporal reference;
+  `--upscaler-quality quality|balanced|performance` selects 2/3, 10/17, or 1/2
+  scale. Quality is the scaled-backend default. `--render-scale` accepts
+  0.5-1.0 as a mutually exclusive custom mode. Backend parsing and construction
+  do not expose Vulkan or vendor SDK types.
 - `FrameInput` carries render/output extents, color, depth, motion vectors,
   current/previous jitter, exposure, optional reactive-mask availability, and
   history reset. Invalid or incomplete native inputs fail deterministically.
+- `BackendCapabilities` declares reconstruction type, history/output ownership,
+  reactive-mask, sharpening, dynamic-resolution support, and supported scale.
+  `InputConventions` fixes scene-linear HDR before exposure, Vulkan `[0,1]`
+  device depth, jitter-free current-minus-previous UV motion, render-pixel
+  jitter, and a positive linear exposure multiplier.
 - Extent-bound raster, temporal, path, bloom, and AOV work now uses the render
   extent, while presentation and capture retain the output extent.
-- Raster and path graphs both schedule the same native upscaling boundary after
-  linear-HDR reconstruction/post work and before tone mapping.
+- Raster and path graphs schedule the same upscaling boundary after linear-HDR
+  reconstruction/post work and before tone mapping. Native aliases the source;
+  spatial dispatches into an output-resolution `RGBA16F` transient image;
+  temporal writes ping-ponged output-resolution `RGBA16F` color and `R32F`
+  depth history. Raster TAA is bypassed while temporal upscaling is active.
+- Temporal reprojects with jitter-corrected canonical motion, clips history to
+  the current 3x3 color neighborhood, and bounds reuse using depth variation,
+  disocclusion, motion, and explicit resets.
+- Bloom reads the render-resolution HDR result before scaled upscaling and
+  is composited during output-resolution tone mapping.
 - `tools/validate_upscaling.sh` certifies exact implicit/explicit native output,
-  odd-size resize/recovery, animated path reset/TLAS behavior, timestamp cost,
-  and clean Vulkan validation.
+  deterministic spatial output, every named extent plus custom 0.75, capability
+  and convention diagnostics, odd-size TAA/bloom resize recovery, animated path
+  reset/TLAS behavior, timestamp budgets, and clean Vulkan validation.
+- `tools/validate_temporal_upscaling.sh` certifies RMSE-0 repeats, first-frame and
+  teleport rejection, stationary history acceptance, finite output, odd resize,
+  bloom, animated path/TLAS updates, history memory, timestamp budgets, and
+  warning-free Vulkan validation.
 
 Not working yet:
 
-- Native remains strict 1:1. There is no reduced internal-resolution policy,
-  output-resolution reconstruction target, or scaling dispatch yet.
-- FSR, XeSS, DLSS, reactive-mask generation, and backend-specific quality modes
-  remain future implementations behind `IUpscaler`.
+- Spatial remains bilinear and spatial-only. The temporal reference establishes
+  portable correctness and integration behavior, not production vendor-upscaler
+  image quality.
+- Reactive-mask generation and sharpening are not live.
+- FSR, XeSS, and DLSS remain future implementations behind `IUpscaler`.
 
 ## Safest Next Steps
 
-1. Add a portable non-native scaling backend behind `IUpscaler`, allocate a
-   distinct output-resolution HDR target, and prove the first non-1:1 raster
-   and path dispatch without changing scene or reconstruction ownership.
-2. Establish named internal-resolution quality modes and certify motion, depth,
-   jitter, AOV, resize, and animated-instance conventions at each scale.
-3. Evaluate temporal FSR, XeSS, and DLSS only after the portable scaled path
-   fixes the common resource, scheduling, and reset contract.
+1. Define and certify reactive-mask generation and optional sharpening without
+   weakening the existing temporal validity and timing gates.
+2. Add the first vendor-neutral production adapter, with FSR as the practical
+   initial candidate, behind the existing resource and capability contract.
+3. Evaluate XeSS and DLSS adapters against the same deterministic captures,
+   capability negotiation, and timing gates.
 
 The ray-query timing, bounded transport, emissive-light, reconstruction-output,
 geometry-history validation, temporal-radiance, luminance-moment, and first

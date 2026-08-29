@@ -45,13 +45,136 @@ renderer::upscaling::FrameInput completeInput() {
 
 void testBackendIdentity() {
     using namespace renderer::upscaling;
-    require(parseBackend("native") == Backend::native && !parseBackend("dlss") &&
-                backendName(Backend::native) == "native",
+    require(parseBackend("native") == Backend::native &&
+                parseBackend("spatial") == Backend::spatial && !parseBackend("dlss") &&
+                parseBackend("temporal") == Backend::temporal &&
+                backendName(Backend::native) == "native" &&
+                backendName(Backend::spatial) == "spatial" &&
+                backendName(Backend::temporal) == "temporal",
             "Upscaling backend naming or parsing is incorrect");
     const std::unique_ptr<IUpscaler> upscaler = createUpscaler(Backend::native);
     require(upscaler && upscaler->backend() == Backend::native &&
                 upscaler->name() == "native",
             "Native upscaler factory returned the wrong backend");
+}
+
+void testQualityModes() {
+    using namespace renderer::upscaling;
+    require(parseQualityMode("quality") == QualityMode::quality &&
+                parseQualityMode("balanced") == QualityMode::balanced &&
+                parseQualityMode("performance") == QualityMode::performance &&
+                parseQualityMode("custom") == QualityMode::custom &&
+                !parseQualityMode("ultra") && qualityModeName(QualityMode::native) == "native" &&
+                qualityModeName(QualityMode::quality) == "quality" &&
+                qualityModeName(QualityMode::balanced) == "balanced" &&
+                qualityModeName(QualityMode::performance) == "performance" &&
+                qualityModeName(QualityMode::custom) == "custom",
+            "Upscaling quality naming or parsing is incorrect");
+    require(std::abs(qualityModeRenderScale(QualityMode::native) - 1.0F) < 1.0e-6F &&
+                std::abs(qualityModeRenderScale(QualityMode::quality) - 2.0F / 3.0F) < 1.0e-6F &&
+                std::abs(qualityModeRenderScale(QualityMode::balanced) - 10.0F / 17.0F) <
+                    1.0e-6F &&
+                std::abs(qualityModeRenderScale(QualityMode::performance) - 0.5F) < 1.0e-6F,
+            "Named upscaling quality modes use incorrect scales");
+    requireInvalid([&] { (void)qualityModeRenderScale(QualityMode::custom); },
+                   "Custom quality produced a scale without explicit configuration");
+}
+
+void testCapabilitiesAndConventions() {
+    using namespace renderer::upscaling;
+    const std::unique_ptr<IUpscaler> native = createUpscaler(Backend::native);
+    const std::unique_ptr<IUpscaler> spatial = createUpscaler({
+        .backend = Backend::spatial,
+        .qualityMode = QualityMode::quality,
+    });
+    const std::unique_ptr<IUpscaler> temporal = createUpscaler({
+        .backend = Backend::temporal,
+        .qualityMode = QualityMode::balanced,
+    });
+    const BackendCapabilities nativeCapabilities = native->capabilities();
+    const BackendCapabilities spatialCapabilities = spatial->capabilities();
+    require(nativeCapabilities.reconstruction == ReconstructionType::identity &&
+                nativeCapabilities.historyOwnership == HistoryOwnership::none &&
+                nativeCapabilities.outputOwnership == OutputOwnership::renderer &&
+                !nativeCapabilities.reactiveMask && !nativeCapabilities.sharpening &&
+                !nativeCapabilities.dynamicResolution &&
+                nativeCapabilities.minimumRenderScale == 1.0F &&
+                nativeCapabilities.maximumRenderScale == 1.0F,
+            "Native backend capabilities are incorrect");
+    require(spatialCapabilities.reconstruction == ReconstructionType::spatial &&
+                spatialCapabilities.historyOwnership == HistoryOwnership::none &&
+                spatialCapabilities.outputOwnership == OutputOwnership::renderer &&
+                !spatialCapabilities.reactiveMask && !spatialCapabilities.sharpening &&
+                !spatialCapabilities.dynamicResolution &&
+                spatialCapabilities.minimumRenderScale == minimumSpatialRenderScale &&
+                spatialCapabilities.maximumRenderScale == maximumSpatialRenderScale,
+            "Spatial backend capabilities are incorrect");
+    const BackendCapabilities temporalCapabilities = temporal->capabilities();
+    require(temporalCapabilities.reconstruction == ReconstructionType::temporal &&
+                temporalCapabilities.historyOwnership == HistoryOwnership::backend &&
+                temporalCapabilities.outputOwnership == OutputOwnership::renderer &&
+                !temporalCapabilities.reactiveMask && !temporalCapabilities.sharpening &&
+                !temporalCapabilities.dynamicResolution &&
+                temporalCapabilities.minimumRenderScale == minimumSpatialRenderScale &&
+                temporalCapabilities.maximumRenderScale == maximumSpatialRenderScale,
+            "Temporal backend capabilities are incorrect");
+    const InputConventions conventions = spatial->inputConventions();
+    require(conventions == native->inputConventions() &&
+                conventions.color == ColorConvention::linearHdrBeforeExposure &&
+                conventions.depth == DepthConvention::vulkanDeviceZeroToOne &&
+                conventions.motionVectors == MotionVectorConvention::currentMinusPreviousUv &&
+                conventions.jitter == JitterConvention::renderPixelOffsets &&
+                conventions.exposure == ExposureConvention::linearMultiplier &&
+                conventions.motionVectorsExcludeJitter,
+            "Canonical temporal input conventions are incorrect");
+    require(reconstructionTypeName(spatialCapabilities.reconstruction) == "spatial" &&
+                historyOwnershipName(spatialCapabilities.historyOwnership) == "none" &&
+                outputOwnershipName(spatialCapabilities.outputOwnership) == "renderer" &&
+                colorConventionName(conventions.color) == "linear-hdr-before-exposure" &&
+                depthConventionName(conventions.depth) == "vulkan-device-0-to-1" &&
+                motionVectorConventionName(conventions.motionVectors) ==
+                    "current-minus-previous-uv" &&
+                jitterConventionName(conventions.jitter) == "render-pixel-offsets" &&
+                exposureConventionName(conventions.exposure) == "linear-multiplier",
+            "Capability or convention diagnostic names are incorrect");
+}
+
+void testSpatialExtentPolicy() {
+    using namespace renderer::upscaling;
+    const std::unique_ptr<IUpscaler> upscaler =
+        createUpscaler({.backend = Backend::spatial, .qualityMode = QualityMode::quality});
+    require(upscaler->backend() == Backend::spatial && upscaler->name() == "spatial" &&
+                upscaler->qualityMode() == QualityMode::quality &&
+                std::abs(upscaler->renderScale() - defaultSpatialRenderScale) < 1.0e-6F,
+            "Spatial upscaler factory returned the wrong configuration");
+    require(upscaler->renderExtent({1920U, 1080U}) == Extent{1280U, 720U} &&
+                upscaler->renderExtent({1279U, 719U}) == Extent{853U, 479U},
+            "Spatial upscaling produced an incorrect rounded render extent");
+    requireInvalid([&] { (void)createUpscaler(Backend::spatial, 0.49F); },
+                   "Spatial upscaling accepted a scale below its supported range");
+    requireInvalid([&] { (void)createUpscaler(Backend::spatial, 1.01F); },
+                   "Spatial upscaling accepted a scale above its supported range");
+    requireInvalid([&] { (void)createUpscaler(Backend::native, 0.75F); },
+                   "Native upscaling accepted a reduced render scale");
+    requireInvalid(
+        [&] {
+            (void)createUpscaler(
+                {.backend = Backend::native, .qualityMode = QualityMode::quality});
+        },
+        "Native upscaling accepted a scaled quality mode");
+    requireInvalid(
+        [&] {
+            (void)createUpscaler(
+                {.backend = Backend::spatial, .qualityMode = QualityMode::native});
+        },
+        "Spatial upscaling accepted native quality");
+    const std::unique_ptr<IUpscaler> balanced = createUpscaler(
+        {.backend = Backend::spatial, .qualityMode = QualityMode::balanced});
+    const std::unique_ptr<IUpscaler> performance = createUpscaler(
+        {.backend = Backend::spatial, .qualityMode = QualityMode::performance});
+    require(balanced->renderExtent({1700U, 850U}) == Extent{1000U, 500U} &&
+                performance->renderExtent({1920U, 1080U}) == Extent{960U, 540U},
+            "Balanced or performance quality produced an incorrect extent");
 }
 
 void testNativeExtentPolicy() {
@@ -72,8 +195,10 @@ void testCanonicalInputsAndReset() {
             "Native upscaling does not expose the canonical reconstruction inputs");
     const FramePlan resetPlan = upscaler->prepareFrame(completeInput());
     require(resetPlan.backend == Backend::native && resetPlan.resetHistory &&
-                !resetPlan.dispatchRequired &&
-                resetPlan.renderExtent == resetPlan.outputExtent,
+                resetPlan.qualityMode == QualityMode::native && !resetPlan.dispatchRequired &&
+                resetPlan.renderExtent == resetPlan.outputExtent &&
+                resetPlan.currentJitterPixels.x == 0.25F &&
+                resetPlan.previousJitterPixels.y == 0.125F && resetPlan.exposureScale == 2.0F,
             "Native frame plan changed identity or reset semantics");
     FrameInput continued = completeInput();
     continued.resetHistory = false;
@@ -102,14 +227,70 @@ void testInvalidInputs() {
                    "Native upscaling accepted invalid exposure");
 }
 
+void testSpatialFramePlan() {
+    using namespace renderer::upscaling;
+    const std::unique_ptr<IUpscaler> upscaler = createUpscaler(Backend::spatial, 0.5F);
+    FrameInput input = completeInput();
+    input.renderExtent = {960U, 540U};
+    input.depthAvailable = false;
+    input.motionVectorsAvailable = false;
+    input.jitterAvailable = false;
+    input.exposureAvailable = false;
+    const FramePlan plan = upscaler->prepareFrame(input);
+    require(plan.backend == Backend::spatial && plan.qualityMode == QualityMode::custom &&
+                plan.dispatchRequired && plan.resetHistory &&
+                plan.renderExtent == Extent{960U, 540U} &&
+                plan.outputExtent == Extent{1920U, 1080U} && plan.inputs.color &&
+                !plan.inputs.depth && !plan.inputs.motionVectors && !plan.inputs.jitter &&
+                !plan.inputs.exposure,
+            "Spatial frame plan does not describe the color-only scaling dispatch");
+    input.renderExtent.width = 959U;
+    requireInvalid([&] { (void)upscaler->prepareFrame(input); },
+                   "Spatial upscaling accepted a render extent that disagrees with its scale");
+}
+
+void testTemporalFramePlan() {
+    using namespace renderer::upscaling;
+    const std::unique_ptr<IUpscaler> upscaler = createUpscaler({
+        .backend = Backend::temporal,
+        .qualityMode = QualityMode::performance,
+    });
+    FrameInput input = completeInput();
+    input.renderExtent = {960U, 540U};
+    input.resetHistory = false;
+    const FramePlan plan = upscaler->prepareFrame(input);
+    require(plan.backend == Backend::temporal &&
+                plan.qualityMode == QualityMode::performance && plan.dispatchRequired &&
+                !plan.resetHistory && plan.renderExtent == Extent{960U, 540U} &&
+                plan.outputExtent == Extent{1920U, 1080U} && plan.inputs.color &&
+                plan.inputs.depth && plan.inputs.motionVectors && plan.inputs.jitter &&
+                plan.inputs.exposure && !plan.inputs.reactiveMask &&
+                std::abs(plan.exposureScale - 2.0F) < 1.0e-6F,
+            "Temporal frame plan does not expose its full temporal contract");
+    input.motionVectorsAvailable = false;
+    requireInvalid([&] { (void)upscaler->prepareFrame(input); },
+                   "Temporal upscaling accepted missing motion vectors");
+    requireInvalid(
+        [&] {
+            (void)createUpscaler(
+                {.backend = Backend::temporal, .qualityMode = QualityMode::native});
+        },
+        "Temporal upscaling accepted native quality");
+}
+
 } // namespace
 
 int main() {
     try {
         testBackendIdentity();
+        testQualityModes();
+        testCapabilitiesAndConventions();
         testNativeExtentPolicy();
+        testSpatialExtentPolicy();
         testCanonicalInputsAndReset();
         testInvalidInputs();
+        testSpatialFramePlan();
+        testTemporalFramePlan();
         std::cout << "Upscaling tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

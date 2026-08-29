@@ -319,6 +319,8 @@ set(RENDERER_SHADER_SOURCES
     shaders/bloom_blur_h.frag
     shaders/bloom_blur_v.frag
     shaders/taa.frag
+    shaders/upscale_spatial.frag
+    shaders/upscale_temporal.frag
     shaders/tonemap.vert
     shaders/tonemap.frag
     shaders/path_trace.rgen

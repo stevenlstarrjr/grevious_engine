@@ -116,6 +116,8 @@ struct RendererConfig {
     RayTracingTransformScript rayTracingTransformScript = RayTracingTransformScript::none;
     RenderMode renderMode = RenderMode::rasterized;
     upscaling::Backend upscalingBackend = upscaling::Backend::native;
+    upscaling::QualityMode upscalingQualityMode = upscaling::QualityMode::native;
+    float upscalingRenderScale = 1.0F;
     bool pathEnvironmentImportanceSampling = true;
     bool pathEmissiveTriangleSampling = true;
     std::uint32_t pathMaxBounces = defaultPathBounceCount;
@@ -231,6 +233,7 @@ class Renderer final {
     void createFrameResources();
     void createCaptureBuffer();
     void createTemporalResources();
+    void createUpscalingHistoryResources();
     void createPathTracingResources();
     void destroyFrameResources();
     void createSceneResources();
@@ -240,6 +243,8 @@ class Renderer final {
     void createGraphicsPipelines();
     void createRenderGraph();
     void createPathTracingRenderGraph();
+    void importUpscalingHistoryImages();
+    void updateUpscalingDescriptor();
     void updateToneMappingDescriptor();
     void updatePathTracingDescriptors();
     void updatePathHistoryDescriptors();
@@ -266,6 +271,7 @@ class Renderer final {
     void recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
                                    const GraphFrameContext& context);
     void recordUpscalingPass(VkCommandBuffer commandBuffer,
+                             const render_graph::RenderGraph& graph,
                              const GraphFrameContext& context);
     void recordCullingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context);
     void recordShadowCullingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context,
@@ -315,7 +321,19 @@ class Renderer final {
     [[nodiscard]] bool pathTracingEnabled() const {
         return config_.renderMode == RenderMode::pathTraced;
     }
+    [[nodiscard]] bool upscalingDispatchEnabled() const {
+        return upscaler_ != nullptr && upscaler_->backend() != upscaling::Backend::native;
+    }
+    [[nodiscard]] bool spatialUpscalingEnabled() const {
+        return upscaler_ != nullptr && upscaler_->backend() == upscaling::Backend::spatial;
+    }
+    [[nodiscard]] bool temporalUpscalingEnabled() const {
+        return upscaler_ != nullptr && upscaler_->backend() == upscaling::Backend::temporal;
+    }
     [[nodiscard]] VkExtent2D renderExtent() const;
+    [[nodiscard]] render_graph::ImageHandle pathPresentationSourceImage() const;
+    [[nodiscard]] const vulkan::ImageView&
+    pathPresentationSourceView(std::size_t frameIndex) const;
 
     static constexpr std::size_t framesInFlight = 2;
     static constexpr std::uint32_t maxBindlessTextures = 64;
@@ -423,6 +441,14 @@ class Renderer final {
     std::array<std::unique_ptr<vulkan::ImageView>, 2> historyDepthViews_{};
     std::array<std::unique_ptr<vulkan::Image>, 2> historyNormalImages_{};
     std::array<std::unique_ptr<vulkan::ImageView>, 2> historyNormalViews_{};
+    std::array<std::unique_ptr<vulkan::Image>, framesInFlight>
+        upscalingHistoryColorImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, framesInFlight>
+        upscalingHistoryColorViews_{};
+    std::array<std::unique_ptr<vulkan::Image>, framesInFlight>
+        upscalingHistoryDepthImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, framesInFlight>
+        upscalingHistoryDepthViews_{};
     std::unique_ptr<vulkan::Sampler> iblSampler_;
     std::unique_ptr<vulkan::Sampler> brdfLutSampler_;
     std::unique_ptr<vulkan::Sampler> hiZSampler_;
@@ -442,6 +468,8 @@ class Renderer final {
     std::unique_ptr<vulkan::ShaderModule> bloomDownsampleShader_;
     std::unique_ptr<vulkan::ShaderModule> bloomBlurHorizontalShader_;
     std::unique_ptr<vulkan::ShaderModule> bloomBlurVerticalShader_;
+    std::unique_ptr<vulkan::ShaderModule> spatialUpscalingFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> temporalUpscalingFragmentShader_;
     std::unique_ptr<vulkan::ShaderModule> toneMappingVertexShader_;
     std::unique_ptr<vulkan::ShaderModule> toneMappingFragmentShader_;
     std::unique_ptr<vulkan::ShaderModule> taaFragmentShader_;
@@ -476,6 +504,10 @@ class Renderer final {
     std::unique_ptr<vulkan::DescriptorPool> bloomDescriptorPool_;
     std::unique_ptr<vulkan::DescriptorSetLayout> taaDescriptorSetLayout_;
     std::unique_ptr<vulkan::DescriptorPool> taaDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> upscalingDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> upscalingDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> temporalUpscalingDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> temporalUpscalingDescriptorPool_;
     std::unique_ptr<vulkan::DescriptorSetLayout> toneMappingDescriptorSetLayout_;
     std::unique_ptr<vulkan::DescriptorPool> toneMappingDescriptorPool_;
     std::unique_ptr<vulkan::GraphicsPipeline> graphicsPipeline_;
@@ -491,6 +523,8 @@ class Renderer final {
     std::unique_ptr<vulkan::GraphicsPipeline> bloomBlurHorizontalPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> bloomBlurVerticalPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> taaPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> spatialUpscalingPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> temporalUpscalingPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> toneMappingPipeline_;
     std::unique_ptr<vulkan::RayTracingPipeline> pathTracingPipeline_;
     std::unique_ptr<vulkan::ComputePipeline> pathHistoryPipeline_;
@@ -532,7 +566,13 @@ class Renderer final {
     render_graph::ImageHandle graphHistoryNormalWriteImage_;
     std::vector<BloomLevelGraphResources> graphBloomLevels_;
     render_graph::ImageHandle graphDepthImage_;
+    render_graph::ImageHandle graphUpscalingSourceImage_;
     render_graph::ImageHandle graphUpscaledImage_;
+    render_graph::ImageHandle graphUpscaledDepthImage_;
+    render_graph::ImageHandle graphUpscalingHistoryColorReadImage_;
+    render_graph::ImageHandle graphUpscalingHistoryColorWriteImage_;
+    render_graph::ImageHandle graphUpscalingHistoryDepthReadImage_;
+    render_graph::ImageHandle graphUpscalingHistoryDepthWriteImage_;
     std::vector<render_graph::ImageHandle> graphHiZImages_;
     std::vector<VkExtent2D> hiZExtents_;
     render_graph::BufferHandle graphVertexBuffer_;
@@ -598,6 +638,7 @@ class Renderer final {
     bool hiZReady_ = false;
     bool cameraMovedThisFrame_ = true;
     bool temporalImageLayoutsInitialized_ = false;
+    bool upscalingHistoryLayoutsInitialized_ = false;
     bool captureComplete_ = false;
     bool pathAovExportComplete_ = false;
     std::uint32_t pathTracingSampleIndex_ = 0;

@@ -79,6 +79,10 @@ int main() {
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "tonemap.frag.spv"));
         const auto taaFragment =
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "taa.frag.spv"));
+        const auto spatialUpscalingFragment = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "upscale_spatial.frag.spv"));
+        const auto temporalUpscalingFragment = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "upscale_temporal.frag.spv"));
         const auto pathRayGeneration = renderer::vulkan::reflectSpirv(
             readWords(shaderDirectory / "path_trace.rgen.spv"));
         const auto pathRadianceMiss = renderer::vulkan::reflectSpirv(
@@ -290,6 +294,25 @@ int main() {
                     toneMappingFragment.descriptorBindings[3].type ==
                         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 "Tone-mapping fragment reflection failed");
+        require(spatialUpscalingFragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
+                    spatialUpscalingFragment.descriptorBindings.size() == 1U &&
+                    spatialUpscalingFragment.descriptorBindings[0].set == 0U &&
+                    spatialUpscalingFragment.descriptorBindings[0].binding == 0U &&
+                    spatialUpscalingFragment.descriptorBindings[0].type ==
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                    spatialUpscalingFragment.descriptorBindings[0].count == 1U,
+                "Spatial-upscaling fragment reflection failed");
+        require(temporalUpscalingFragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
+                    temporalUpscalingFragment.descriptorBindings.size() == 5U,
+                "Temporal-upscaling fragment reflection failed");
+        for (std::size_t index = 0U;
+             index < temporalUpscalingFragment.descriptorBindings.size(); ++index) {
+            const auto& temporalBinding = temporalUpscalingFragment.descriptorBindings[index];
+            require(temporalBinding.set == 0U && temporalBinding.binding == index &&
+                        temporalBinding.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                        temporalBinding.count == 1U,
+                    "Temporal-upscaling descriptor reflection failed");
+        }
         require(pathRayGeneration.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR &&
                     pathRadianceMiss.stage == VK_SHADER_STAGE_MISS_BIT_KHR &&
                     pathShadowMiss.stage == VK_SHADER_STAGE_MISS_BIT_KHR &&

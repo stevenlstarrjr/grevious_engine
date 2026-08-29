@@ -1008,7 +1008,7 @@ morph transform updates, reactive masks, variance clipping, and temporal
 upscaling backends remain later milestones; their data must feed this same
 motion and history contract rather than create parallel temporal systems.
 
-## Upscaling boundary — native baseline
+## Upscaling boundary - native, spatial, and temporal reference
 
 `renderer::upscaling::IUpscaler` is the renderer-owned backend boundary. Its
 Vulkan-independent frame input declares render and output extents; color,
@@ -1018,25 +1018,62 @@ availability is explicit but false for the current renderer. Backends return a
 validated per-frame plan rather than leaking FSR, XeSS, DLSS, or Vulkan objects
 into renderer-facing configuration.
 
-The first `native` backend is intentionally strict: its render extent equals
+The ABI fixes the common temporal conventions: input color is scene-linear HDR
+before exposure; depth is Vulkan device depth in `[0,1]`; motion is unjittered
+current UV minus previous UV; current and previous jitter are render-pixel
+offsets; and exposure is a positive linear multiplier. `BackendCapabilities`
+declares identity/spatial/temporal reconstruction, history ownership, output
+ownership, reactive-mask support, sharpening, dynamic resolution, and the
+supported scale interval. Native and spatial own no private history. Temporal
+owns bounded output-resolution history. All three write renderer-owned output
+and advertise no reactive mask, sharpening, or dynamic resolution.
+
+The default `native` backend is intentionally strict: its render extent equals
 the swapchain/output extent, all canonical inputs must be valid, and it requests
-no dispatch. Raster and path render graphs nevertheless schedule the same
-timestamped native boundary after their linear-HDR reconstruction and bloom
-source is selected and before tone mapping. This makes the convergence point
-and dependency surface live without inserting a redundant image copy. Raster,
-temporal, path, bloom, and AOV allocations now derive from `renderExtent()`;
-presentation and capture remain output-extent operations. Swapchain recreation
-recomputes both extents and invalidates reconstruction history.
+no dispatch. The portable `spatial` backend accepts a 0.5-1.0 render scale,
+defaults to the `quality` mode at 2/3, and requests a fullscreen hardware-linear
+reconstruction into a distinct output-resolution `RGBA16F` transient image.
+`balanced` maps to 10/17 and `performance` to 1/2; `--render-scale` selects a
+validated custom 0.5-1.0 scale and is mutually exclusive with a named mode. The
+spatial plan only requires source color. The portable `temporal` reference uses
+the same scale modes and requires color, depth, motion, jitter, exposure, and
+reset state. It ping-pongs output-resolution `RGBA16F` color plus `R32F` depth,
+reprojects with the canonical motion and jitter convention, clips history to a
+3x3 current-color neighborhood, and reduces bounded reuse for disocclusion,
+depth variation, and motion. A reset, resize, or first frame rejects history.
+
+Raster and path render graphs schedule the same timestamped boundary after
+linear-HDR reconstruction and bloom source selection and before tone mapping.
+Native aliases its source without a redundant image copy; spatial writes a
+transient output-resolution HDR target; temporal writes the current history
+target while sampling the previous color/depth pair. Raster TAA is bypassed
+when temporal upscaling is active so there is one raster temporal accumulator.
+Raster, temporal, path, bloom, and AOV allocations derive from `renderExtent()`;
+presentation, upscaling history, and capture retain `outputExtent()`. Swapchain
+recreation recomputes both extents, recreates scaled and history resources, and
+invalidates reconstruction history. Bloom continues to consume the pre-upscale
+HDR source and is composited while tone mapping the reconstructed image.
 
 `tools/validate_upscaling.sh` compares implicit and explicit native raster
-captures exactly (`RMSE 0`), exercises a 1279x719 resize followed by 640x360
-recovery, and carries eight animated path frames through TLAS/accumulation
-resets under Vulkan core, synchronization, and best-practices validation. On the
-RTX 2060 Super, the timestamp-only boundary measures `0.000016 ms` in raster and
-`0.000116 ms` in the animated path run at 320x180. This is an interface and
-scheduling baseline, not an upscaling algorithm: no reduced internal
-resolution, output-resolution HDR target, reactive mask, FSR, XeSS, or DLSS
-backend exists yet.
+captures exactly (`RMSE 0`), proves spatial repeatability (`RMSE 0`), exercises
+a 1279x719 resize followed by 640x360 recovery with TAA and bloom, and carries
+eight animated path frames through TLAS/accumulation resets under Vulkan core,
+synchronization, and best-practices validation. On the RTX 2060 Super at a
+320x180 output, quality (213x120), balanced (188x106), performance (160x90),
+and custom 0.75 (240x135) dispatches measure `0.00728`, `0.006824`, `0.006848`,
+and `0.007184 ms`. Performance mode measures `0.007584 ms` in animated path mode;
+the short path dispatch changes from `0.338204 ms` native to `0.218904 ms` at
+half dimensions.
+
+`tools/validate_temporal_upscaling.sh` independently proves exact repeated
+captures (`RMSE 0`), first-frame and teleport history rejection, stationary
+history acceptance, odd-size resize recovery with bloom, eight animated
+GPU-Scene/TLAS updates, finite output, and warning-free Vulkan validation. At
+160x90 to 320x180, temporal reconstruction measures `0.0157333 ms` in raster
+and `0.017624 ms` in animated path mode; its two color/depth history pairs use
+`1.31836 MiB`. This is the portable correctness/reference backend, not a claim
+of FSR, XeSS, or DLSS image quality. Reactive masks, sharpening, and vendor
+implementations remain later work.
 
 ## Certified post-processing contract
 
@@ -1048,7 +1085,7 @@ Linear HDR PBR
     -> bloom extraction + downsample when enabled
     -> horizontal blur
     -> vertical blur
-    -> native/upscaler boundary
+    -> native/spatial/temporal upscaler boundary
     -> bloom composite
     -> exposure compensation
     -> ACES-fit tone mapping
@@ -1474,14 +1511,21 @@ dependency belongs in the renderer library itself.
   0.333075 ms spatial averages, a 4.06463 ms default-two-bounce path dispatch,
   a 0.371332 ms emissive dispatch at 640x360, and a 2.11111 ms five-texture
   Damaged Helmet dispatch at 1280x720.
-- The renderer-owned upscaling baseline is complete: `IUpscaler` and the
-  default `native` backend validate canonical reconstruction inputs, keep
-  render/output extents distinct in ownership, and converge raster and path
-  graphs at one timed pre-tone-mapping boundary. Implicit/explicit native output
-  is exact at RMSE 0, odd-size resize/recovery and animated path operation are
-  validation-clean, and the no-dispatch boundary measures at or below
-  0.000116 ms at 320x180. Native remains 1:1; the first scaled backend and
-  output-resolution HDR resource are the next gate.
+- The renderer-owned upscaling baseline is complete: `IUpscaler`, the default
+  strict 1:1 `native` backend, the portable `spatial` backend, and the portable
+  `temporal` reference keep
+  render/output extents distinct and converge raster and path graphs at one
+  timed pre-tone-mapping boundary. Spatial and temporal render at configurable
+  0.5-1.0 scale. Temporal owns ping-ponged output-resolution color/depth history
+  and performs jitter-corrected, clipped, motion/depth-aware reuse.
+  Native identity and spatial repeat captures are exact at RMSE 0; odd-size
+  TAA/bloom resize recovery and animated path operation are validation-clean.
+  Temporal repeats are also exact, and first-frame/stationary/teleport history
+  validity is certified. Spatial costs 0.006824-0.00728 ms and temporal costs
+  0.0157333-0.017624 ms at 320x180 output. The common ABI fixes reconstruction
+  capabilities, history/output ownership, and color/depth/motion/jitter/exposure
+  conventions without vendor types. Reactive-mask/sharpening policy and vendor
+  adapters are the next upscaling gates.
 
 Each milestone gets a measurable scene, automated smoke path, and validation
 evidence before the next begins.
