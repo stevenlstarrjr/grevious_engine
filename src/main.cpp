@@ -1,4 +1,5 @@
 #include "renderer/core/Log.hpp"
+#include "renderer/output/AovExport.hpp"
 #include "renderer/platform/Window.hpp"
 #include "renderer/renderer/Renderer.hpp"
 #include "renderer/vulkan/Device.hpp"
@@ -12,11 +13,13 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <numbers>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -31,6 +34,8 @@ struct Options {
     std::filesystem::path capturePath;
     std::filesystem::path timingOutputPath;
     std::uint64_t captureFrame = 8;
+    std::filesystem::path aovExportDirectory;
+    std::uint64_t aovExportFrame = 8;
     renderer::RenderLayerMask visibilityMask = renderer::defaultViewVisibilityMask;
     bool taaEnabled = true;
     bool bloomEnabled = true;
@@ -41,6 +46,15 @@ struct Options {
     bool alphaShadowDemo = false;
     bool shadowsEnabled = true;
     renderer::ray_tracing::Request rayTracingRequest = renderer::ray_tracing::Request::automatic;
+    renderer::RayTracingTransformScript rayTracingTransformScript =
+        renderer::RayTracingTransformScript::none;
+    renderer::RenderMode renderMode = renderer::RenderMode::rasterized;
+    renderer::upscaling::Backend upscalingBackend =
+        renderer::upscaling::Backend::native;
+    bool pathEnvironmentImportanceSampling = true;
+    bool pathEmissiveTriangleSampling = true;
+    std::uint32_t pathMaxBounces = renderer::defaultPathBounceCount;
+    renderer::PathDebugView pathDebugView = renderer::PathDebugView::final;
     bool occlusionCullingEnabled = true;
     renderer::post::TestPattern postTestPattern = renderer::post::TestPattern::none;
     float postTestSourceValue = 4.0F;
@@ -49,8 +63,10 @@ struct Options {
     std::uint32_t height = 720;
     renderer::TemporalDebugView temporalDebugView = renderer::TemporalDebugView::none;
     renderer::TemporalCameraScript temporalCameraScript = renderer::TemporalCameraScript::none;
+    bool interactiveCameraInput = true;
     ResizeScript resizeScript = ResizeScript::none;
     bool captureFrameSpecified = false;
+    bool aovExportFrameSpecified = false;
     renderer::vulkan::ValidationMode validation =
 #if RENDERER_VALIDATION_DEFAULT
         renderer::vulkan::ValidationMode::available;
@@ -114,6 +130,16 @@ std::uint32_t parseExtent(std::string_view text) {
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
     if (error != std::errc{} || end != text.data() + text.size() || value == 0U || value > 16384U) {
         throw std::runtime_error("--resolution requires dimensions in [1, 16384]");
+    }
+    return value;
+}
+
+std::uint32_t parsePathBounceCount(std::string_view text) {
+    std::uint32_t value = 0U;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0U ||
+        value > renderer::maximumPathBounceCount) {
+        throw std::runtime_error("--path-max-bounces requires an integer in [1, 4]");
     }
     return value;
 }
@@ -193,16 +219,27 @@ Options parseOptions(int argc, char** argv) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument(argv[index]);
         if (argument == "--help") {
-            std::cout << "Usage: renderer_demo [--frames N] "
+            std::cout << "Usage: genesis_render [--frames N] "
                          "[--validation off|available|required] "
                          "[--scene PATH] "
                          "[--environment PATH] [--environment-rotation DEGREES] "
                          "[--exposure-ev STOPS] [--capture PATH] "
                          "[--timing-output PATH] "
                          "[--capture-frame N] [--visibility-mask MASK] "
+                         "[--aov-export DIRECTORY] [--aov-frame N] "
                          "[--taa on|off] [--bloom on|off] [--bloom-intensity VALUE] "
                          "[--bloom-radius VALUE] "
                          "[--shadows on|off] [--ray-tracing off|auto|required] "
+                         "[--render-mode rasterized|path-traced] "
+                         "[--upscaler native] "
+                         "[--path-environment-sampling importance|uniform] "
+                         "[--path-emissive-sampling on|off] "
+                         "[--path-max-bounces 1|2|3|4] "
+                         "[--path-debug final|direct|indirect|albedo|roughness|"
+                         "geometric-normal|shading-normal|motion|depth|hit-distance|"
+                         "lighting-residual|history-validity|raw-radiance|"
+                         "reconstruction-weight|temporal-radiance|variance] "
+                         "[--rt-transform-script none|oscillate] "
                          "[--occlusion-culling on|off] "
                          "[--demo pbr-grid|emissive-sphere|directional-shadow|alpha-shadow] "
                          "[--debug-view final|motion|history-validity|bloom|hdr] "
@@ -210,6 +247,7 @@ Options parseOptions(int argc, char** argv) {
                          "[--post-position X Y] "
                          "[--resolution WIDTH HEIGHT] "
                          "[--camera-script none|translate|teleport|rotate|approach] "
+                         "[--camera-input on|off] "
                          "[--resize-script [standard|odd|stress]]\n";
             std::exit(0);
         }
@@ -271,6 +309,18 @@ Options parseOptions(int argc, char** argv) {
             options.captureFrameSpecified = true;
             continue;
         }
+        if (argument == "--aov-export" && index + 1 < argc) {
+            options.aovExportDirectory = argv[++index];
+            if (options.aovExportDirectory.empty()) {
+                throw std::runtime_error("--aov-export requires a non-empty directory");
+            }
+            continue;
+        }
+        if (argument == "--aov-frame" && index + 1 < argc) {
+            options.aovExportFrame = parseFrameCount(argv[++index]);
+            options.aovExportFrameSpecified = true;
+            continue;
+        }
         if (argument == "--visibility-mask" && index + 1 < argc) {
             options.visibilityMask = parseVisibilityMask(argv[++index]);
             continue;
@@ -329,6 +379,108 @@ Options parseOptions(int argc, char** argv) {
             }
             continue;
         }
+        if (argument == "--render-mode" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "rasterized") {
+                options.renderMode = renderer::RenderMode::rasterized;
+            } else if (value == "path-traced") {
+                options.renderMode = renderer::RenderMode::pathTraced;
+            } else {
+                throw std::runtime_error("--render-mode requires rasterized or path-traced");
+            }
+            continue;
+        }
+        if (argument == "--upscaler" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            const std::optional<renderer::upscaling::Backend> backend =
+                renderer::upscaling::parseBackend(value);
+            if (!backend) {
+                throw std::runtime_error("--upscaler currently requires native");
+            }
+            options.upscalingBackend = *backend;
+            continue;
+        }
+        if (argument == "--path-debug" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "final") {
+                options.pathDebugView = renderer::PathDebugView::final;
+            } else if (value == "direct") {
+                options.pathDebugView = renderer::PathDebugView::direct;
+            } else if (value == "indirect") {
+                options.pathDebugView = renderer::PathDebugView::indirect;
+            } else if (value == "albedo") {
+                options.pathDebugView = renderer::PathDebugView::albedo;
+            } else if (value == "roughness") {
+                options.pathDebugView = renderer::PathDebugView::roughness;
+            } else if (value == "geometric-normal") {
+                options.pathDebugView = renderer::PathDebugView::geometricNormal;
+            } else if (value == "shading-normal") {
+                options.pathDebugView = renderer::PathDebugView::shadingNormal;
+            } else if (value == "motion") {
+                options.pathDebugView = renderer::PathDebugView::motion;
+            } else if (value == "depth") {
+                options.pathDebugView = renderer::PathDebugView::depth;
+            } else if (value == "hit-distance") {
+                options.pathDebugView = renderer::PathDebugView::hitDistance;
+            } else if (value == "lighting-residual") {
+                options.pathDebugView = renderer::PathDebugView::lightingResidual;
+            } else if (value == "history-validity") {
+                options.pathDebugView = renderer::PathDebugView::historyValidity;
+            } else if (value == "raw-radiance") {
+                options.pathDebugView = renderer::PathDebugView::rawRadiance;
+            } else if (value == "reconstruction-weight") {
+                options.pathDebugView = renderer::PathDebugView::reconstructionWeight;
+            } else if (value == "temporal-radiance") {
+                options.pathDebugView = renderer::PathDebugView::temporalRadiance;
+            } else if (value == "variance") {
+                options.pathDebugView = renderer::PathDebugView::variance;
+            } else {
+                throw std::runtime_error(
+                    "--path-debug requires final, direct, indirect, albedo, roughness, "
+                    "geometric-normal, shading-normal, motion, depth, hit-distance, or "
+                    "lighting-residual, history-validity, raw-radiance, or "
+                    "reconstruction-weight, temporal-radiance, or variance");
+            }
+            continue;
+        }
+        if (argument == "--path-environment-sampling" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "importance") {
+                options.pathEnvironmentImportanceSampling = true;
+            } else if (value == "uniform") {
+                options.pathEnvironmentImportanceSampling = false;
+            } else {
+                throw std::runtime_error(
+                    "--path-environment-sampling requires importance or uniform");
+            }
+            continue;
+        }
+        if (argument == "--path-emissive-sampling" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.pathEmissiveTriangleSampling = true;
+            } else if (value == "off") {
+                options.pathEmissiveTriangleSampling = false;
+            } else {
+                throw std::runtime_error("--path-emissive-sampling requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--path-max-bounces" && index + 1 < argc) {
+            options.pathMaxBounces = parsePathBounceCount(argv[++index]);
+            continue;
+        }
+        if (argument == "--rt-transform-script" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "none") {
+                options.rayTracingTransformScript = renderer::RayTracingTransformScript::none;
+            } else if (value == "oscillate") {
+                options.rayTracingTransformScript = renderer::RayTracingTransformScript::oscillate;
+            } else {
+                throw std::runtime_error("--rt-transform-script requires none or oscillate");
+            }
+            continue;
+        }
         if (argument == "--occlusion-culling" && index + 1 < argc) {
             const std::string_view value(argv[++index]);
             if (value == "on") {
@@ -337,6 +489,17 @@ Options parseOptions(int argc, char** argv) {
                 options.occlusionCullingEnabled = false;
             } else {
                 throw std::runtime_error("--occlusion-culling requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--camera-input" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.interactiveCameraInput = true;
+            } else if (value == "off") {
+                options.interactiveCameraInput = false;
+            } else {
+                throw std::runtime_error("--camera-input requires on or off");
             }
             continue;
         }
@@ -437,9 +600,16 @@ Options parseOptions(int argc, char** argv) {
     if (options.captureFrameSpecified && options.capturePath.empty()) {
         throw std::runtime_error("--capture-frame requires --capture");
     }
+    if (options.aovExportFrameSpecified && options.aovExportDirectory.empty()) {
+        throw std::runtime_error("--aov-frame requires --aov-export");
+    }
     if (!options.capturePath.empty() && options.frameLimit.has_value() &&
         *options.frameLimit < options.captureFrame) {
         throw std::runtime_error("--frames must reach the requested capture frame");
+    }
+    if (!options.aovExportDirectory.empty() && options.frameLimit.has_value() &&
+        *options.frameLimit < options.aovExportFrame) {
+        throw std::runtime_error("--frames must reach the requested AOV export frame");
     }
     if (!options.taaEnabled &&
         options.temporalDebugView == renderer::TemporalDebugView::historyValidity) {
@@ -447,6 +617,22 @@ Options parseOptions(int argc, char** argv) {
     }
     if (!options.bloomEnabled && options.temporalDebugView == renderer::TemporalDebugView::bloom) {
         throw std::runtime_error("bloom debug view requires --bloom on");
+    }
+    if (options.renderMode == renderer::RenderMode::pathTraced) {
+        if (options.rayTracingRequest == renderer::ray_tracing::Request::disabled) {
+            throw std::runtime_error("--render-mode path-traced cannot use --ray-tracing off");
+        }
+        if (options.postTestPattern != renderer::post::TestPattern::none ||
+            options.temporalDebugView != renderer::TemporalDebugView::none) {
+            throw std::runtime_error(
+                "--render-mode path-traced requires --post-test off and --debug-view final");
+        }
+    } else if (options.pathDebugView != renderer::PathDebugView::final) {
+        throw std::runtime_error("--path-debug requires --render-mode path-traced");
+    }
+    if (!options.aovExportDirectory.empty() &&
+        options.renderMode != renderer::RenderMode::pathTraced) {
+        throw std::runtime_error("--aov-export requires --render-mode path-traced");
     }
     if ((options.emissiveSphereDemo || options.directionalShadowDemo || options.alphaShadowDemo) &&
         !options.scenePath.empty()) {
@@ -457,12 +643,17 @@ Options parseOptions(int argc, char** argv) {
 
 int run(const Options& options) {
     renderer::platform::Window window(options.width, options.height,
-                                      "Bloxel Renderer — Vulkan 1.3");
+                                      "Genesis Render — Vulkan 1.3");
     renderer::vulkan::Instance instance(window, options.validation);
     std::uint64_t frameCount = 0;
     {
         renderer::vulkan::Device device(instance);
         {
+            std::shared_ptr<renderer::output::AovFrameSink> aovFrameSink;
+            if (!options.aovExportDirectory.empty()) {
+                aovFrameSink = std::make_shared<renderer::output::PfmAovDirectorySink>(
+                    options.aovExportDirectory);
+            }
             renderer::Renderer renderer(
                 window, instance, device,
                 {.scenePath = options.scenePath,
@@ -473,6 +664,8 @@ int run(const Options& options) {
                  .capturePath = options.capturePath,
                  .timingOutputPath = options.timingOutputPath,
                  .captureFrame = options.captureFrame,
+                 .aovFrameSink = std::move(aovFrameSink),
+                 .aovExportFrame = options.aovExportFrame,
                  .view = {.visibilityMask = options.visibilityMask},
                  .taaEnabled = options.taaEnabled,
                  .bloomEnabled = options.bloomEnabled,
@@ -483,12 +676,21 @@ int run(const Options& options) {
                  .alphaShadowDemo = options.alphaShadowDemo,
                  .shadowsEnabled = options.shadowsEnabled,
                  .rayTracingRequest = options.rayTracingRequest,
+                 .rayTracingTransformScript = options.rayTracingTransformScript,
+                 .renderMode = options.renderMode,
+                 .upscalingBackend = options.upscalingBackend,
+                 .pathEnvironmentImportanceSampling =
+                     options.pathEnvironmentImportanceSampling,
+                 .pathEmissiveTriangleSampling = options.pathEmissiveTriangleSampling,
+                 .pathMaxBounces = options.pathMaxBounces,
+                 .pathDebugView = options.pathDebugView,
                  .occlusionCullingEnabled = options.occlusionCullingEnabled,
                  .postTestPattern = options.postTestPattern,
                  .postTestSourceValue = options.postTestSourceValue,
                  .postTestPosition = options.postTestPosition,
                  .temporalDebugView = options.temporalDebugView,
-                 .temporalCameraScript = options.temporalCameraScript});
+                 .temporalCameraScript = options.temporalCameraScript,
+                 .interactiveCameraInput = options.interactiveCameraInput});
             while (!window.shouldClose() &&
                    (!options.frameLimit.has_value() || frameCount < *options.frameLimit)) {
                 window.pollEvents();

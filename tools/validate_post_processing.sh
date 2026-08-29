@@ -5,7 +5,7 @@ renderer_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 reference_root="${renderer_root}/reference"
 build_dir="${1:-${renderer_root}/build/debug}"
 output_dir="${2:-${renderer_root}/captures/current/post_processing}"
-renderer="${build_dir}/bin/renderer_demo"
+renderer="${build_dir}/bin/genesis_render"
 metrics="${build_dir}/post_image_metrics"
 report="${output_dir}/certification_results.txt"
 

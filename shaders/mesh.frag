@@ -1,9 +1,14 @@
 #version 460
 #extension GL_EXT_nonuniform_qualifier : require
+#ifdef RENDERER_RAY_QUERY_SHADOWS
+#extension GL_EXT_ray_query : require
+#endif
 
 #include "include/pbr.glsl"
 #include "include/ibl.glsl"
+#ifndef RENDERER_RAY_QUERY_SHADOWS
 #include "include/shadows.glsl"
+#endif
 
 layout(set = 0, binding = 0) uniform FrameData
 {
@@ -33,7 +38,11 @@ layout(set = 0, binding = 0) uniform FrameData
 layout(set = 0, binding = 2) uniform sampler2D diffuseIrradianceMap;
 layout(set = 0, binding = 3) uniform sampler2D prefilteredSpecularMap;
 layout(set = 0, binding = 4) uniform sampler2D brdfIntegrationLut;
+#ifdef RENDERER_RAY_QUERY_SHADOWS
+layout(set = 0, binding = 11) uniform accelerationStructureEXT sceneTlas;
+#else
 layout(set = 0, binding = 10) uniform sampler2DShadow directionalShadowMaps[3];
+#endif
 layout(set = 1, binding = 0) uniform sampler2D materialTextures[];
 
 struct MaterialRecord
@@ -49,6 +58,35 @@ layout(std430, set = 0, binding = 8) readonly buffer Materials
 {
     MaterialRecord materials[];
 };
+
+#ifdef RENDERER_RAY_QUERY_SHADOWS
+struct RayInstanceRecord
+{
+    vec4 centerRadius;
+    uvec4 meshMaterial;
+    uvec4 visibilityLayer;
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer RayInstances
+{
+    RayInstanceRecord rayInstances[];
+};
+
+layout(std430, set = 0, binding = 12) readonly buffer RayVertices
+{
+    float rayVertexData[];
+};
+
+layout(std430, set = 0, binding = 13) readonly buffer RayIndices
+{
+    uint rayIndices[];
+};
+
+layout(std430, set = 0, binding = 14) readonly buffer RayGeometries
+{
+    uvec4 rayGeometryRanges[];
+};
+#endif
 
 layout(location = 0) in vec3 worldPosition;
 layout(location = 1) in vec3 worldNormal;
@@ -68,11 +106,56 @@ const uint NORMAL_TEXTURE_BIT = 1u << 2u;
 const uint OCCLUSION_TEXTURE_BIT = 1u << 3u;
 const uint EMISSIVE_TEXTURE_BIT = 1u << 4u;
 const uint ALPHA_MASK_MATERIAL_BIT = 1u << 0u;
+const uint ALPHA_BLEND_MATERIAL_BIT = 1u << 1u;
+const uint ADDITIVE_MATERIAL_BIT = 1u << 3u;
 
 vec2 materialUv(MaterialRecord material, uint textureBit)
 {
     return (material.textureState.w & textureBit) != 0u ? uv1 : uv;
 }
+
+#ifdef RENDERER_RAY_QUERY_SHADOWS
+vec2 rayVertexUv(uint vertexIndex, bool useUv1)
+{
+    uint firstComponent = vertexIndex * 14u + (useUv1 ? 12u : 6u);
+    return vec2(rayVertexData[firstComponent], rayVertexData[firstComponent + 1u]);
+}
+
+bool rayCandidateBlocksLight(uint instanceIndex, uint primitiveIndex, vec2 barycentrics)
+{
+    RayInstanceRecord instance = rayInstances[instanceIndex];
+    MaterialRecord material = materials[instance.meshMaterial.y];
+    uint materialFlags = material.textureState.z;
+    if ((materialFlags & (ALPHA_BLEND_MATERIAL_BIT | ADDITIVE_MATERIAL_BIT)) != 0u) {
+        return false;
+    }
+    if ((materialFlags & ALPHA_MASK_MATERIAL_BIT) == 0u) {
+        return true;
+    }
+
+    float alpha = material.baseColorFactor.a;
+    if ((material.textureState.y & BASE_COLOR_TEXTURE_BIT) == 0u) {
+        return alpha >= material.emissiveAlphaCutoff.a;
+    }
+
+    uvec4 geometry = rayGeometryRanges[instance.meshMaterial.x];
+    uint triangleFirstIndex = geometry.x + primitiveIndex * 3u;
+    uvec3 triangle =
+        uvec3(rayIndices[triangleFirstIndex], rayIndices[triangleFirstIndex + 1u],
+              rayIndices[triangleFirstIndex + 2u]) + geometry.y;
+    vec3 weights = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
+    bool useUv1 = (material.textureState.w & BASE_COLOR_TEXTURE_BIT) != 0u;
+    vec2 candidateUv = rayVertexUv(triangle.x, useUv1) * weights.x +
+                       rayVertexUv(triangle.y, useUv1) * weights.y +
+                       rayVertexUv(triangle.z, useUv1) * weights.z;
+
+    // Candidate rays have no useful screen-space texture derivatives. Base-level
+    // alpha is deterministic; ray-cone LOD selection belongs in a later quality pass.
+    alpha *= textureLod(materialTextures[nonuniformEXT(material.textureIndices.x)],
+                        candidateUv, 0.0).a;
+    return alpha >= material.emissiveAlphaCutoff.a;
+}
+#endif
 
 float directionalShadowVisibility(vec3 position, vec3 normal, vec3 lightDirection)
 {
@@ -80,6 +163,40 @@ float directionalShadowVisibility(vec3 position, vec3 normal, vec3 lightDirectio
         return 1.0;
     }
 
+#ifdef RENDERER_RAY_QUERY_SHADOWS
+    float sceneScale = max(frameData.shadowCascadeDepthRadii.w, 1.0);
+    float normalDotLight = clamp(dot(normal, lightDirection), 0.0, 1.0);
+    float originBias = sceneScale * mix(1.0e-3, 5.0e-4, normalDotLight);
+    vec3 geometricNormal = cross(dFdx(position), dFdy(position));
+    float geometricLengthSquared = dot(geometricNormal, geometricNormal);
+    geometricNormal = geometricLengthSquared > 1.0e-12
+                          ? geometricNormal * inversesqrt(geometricLengthSquared)
+                          : normal;
+    geometricNormal = dot(geometricNormal, normal) < 0.0 ? -geometricNormal : geometricNormal;
+    vec3 origin = position + geometricNormal * originBias + lightDirection * originBias;
+    rayQueryEXT query;
+    // Rays travel from the receiver toward the light, reversing the raster
+    // shadow-map traversal direction. Front-face culling therefore matches the
+    // raster pipeline's back-face culling convention.
+    rayQueryInitializeEXT(query, sceneTlas,
+                          gl_RayFlagsTerminateOnFirstHitEXT |
+                              gl_RayFlagsCullFrontFacingTrianglesEXT,
+                          0xff, origin, originBias, lightDirection, 1.0e27);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) ==
+                gl_RayQueryCandidateIntersectionTriangleEXT &&
+            rayCandidateBlocksLight(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(query, false),
+                rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
+                rayQueryGetIntersectionBarycentricsEXT(query, false))) {
+            rayQueryConfirmIntersectionEXT(query);
+        }
+    }
+    return rayQueryGetIntersectionTypeEXT(query, true) ==
+                   gl_RayQueryCommittedIntersectionNoneEXT
+               ? 1.0
+               : 0.0;
+#else
     float viewDistance =
         max((frameData.unjitteredViewProjection * vec4(position, 1.0)).w, 0.0);
     uint firstCascade = viewDistance <= frameData.shadowCascadeSplits.x
@@ -118,6 +235,7 @@ float directionalShadowVisibility(vec3 position, vec3 normal, vec3 lightDirectio
         }
     }
     return visibility / 9.0;
+#endif
 }
 
 void main()

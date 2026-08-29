@@ -1,5 +1,5 @@
-#ifndef BLOXEL_RENDERER_PBR_GLSL
-#define BLOXEL_RENDERER_PBR_GLSL
+#ifndef GENESIS_RENDER_PBR_GLSL
+#define GENESIS_RENDER_PBR_GLSL
 
 // Portions derived from pbrt-v4, Copyright (c) 1998-2020 Matt Pharr,
 // Wenzel Jakob, and Greg Humphreys; Apache-2.0.

@@ -16,6 +16,24 @@
 
 namespace renderer::gpu_scene {
 
+bool EmissiveTriangleDistribution::valid() const {
+    float previousCdf = 0.0F;
+    float probabilitySum = 0.0F;
+    for (const EmissiveTriangleRecord& triangle : triangles) {
+        if (!std::isfinite(triangle.sampling.x) || !std::isfinite(triangle.sampling.y) ||
+            !std::isfinite(triangle.sampling.z) || !std::isfinite(triangle.sampling.w) ||
+            triangle.sampling.x < previousCdf || triangle.sampling.x > 1.0F ||
+            triangle.sampling.y < 0.0F || triangle.sampling.z < 0.0F ||
+            triangle.sampling.w < 0.0F) {
+            return false;
+        }
+        previousCdf = triangle.sampling.x;
+        probabilitySum += triangle.sampling.y;
+    }
+    return triangles.empty() ||
+           (previousCdf == 1.0F && std::abs(probabilitySum - 1.0F) <= 1.0e-4F);
+}
+
 SceneRecords makePbrSphereGrid() {
     constexpr std::uint32_t columns = 7;
     constexpr std::uint32_t rows = 5;
@@ -290,6 +308,132 @@ PackedScene packScene(const scene::Scene& scene,
     packed.lods = std::move(hierarchy.lods);
     packed.meshlets = std::move(hierarchy.meshlets);
     return packed;
+}
+
+EmissiveTriangleDistribution buildEmissiveTriangleDistribution(
+    std::span<const VertexRecord> vertices, std::span<const std::uint32_t> indices,
+    std::span<const PrimitiveRecord> primitives,
+    std::span<const PrimitiveLodRange> primitiveLods,
+    std::span<const LodSourceRecord> lodSources, std::span<InstanceRecord> instances,
+    std::span<const MaterialRecord> materials, std::span<const TransformRecord> transforms,
+    RenderLayerMask viewMask) {
+    if (vertices.empty() || indices.empty() || primitives.empty() || primitiveLods.empty() ||
+        lodSources.empty() || instances.empty() || materials.empty() || transforms.empty()) {
+        throw std::invalid_argument(
+            "Emissive-triangle construction requires complete resident scene data");
+    }
+
+    EmissiveTriangleDistribution distribution;
+    double totalWeight = 0.0;
+    for (std::size_t instanceIndex = 0; instanceIndex < instances.size(); ++instanceIndex) {
+        InstanceRecord& instance = instances[instanceIndex];
+        instance.visibilityLayer.z = invalidEmissiveTriangleIndex;
+        instance.visibilityLayer.w = 0U;
+        if (!instanceVisible(instance, viewMask)) {
+            continue;
+        }
+        const std::uint32_t primitiveGroup = instance.meshMaterial.x;
+        const std::uint32_t materialIndex = instance.meshMaterial.y;
+        const std::uint32_t transformIndex = instance.meshMaterial.z;
+        if (primitiveGroup >= primitiveLods.size() || materialIndex >= materials.size() ||
+            transformIndex >= transforms.size()) {
+            throw std::runtime_error(
+                "Emissive-triangle instance references invalid scene residency");
+        }
+
+        const glm::vec3 emission = glm::max(
+            glm::vec3(materials[materialIndex].emissiveAlphaCutoff), glm::vec3(0.0F));
+        if (!std::isfinite(emission.x) || !std::isfinite(emission.y) ||
+            !std::isfinite(emission.z)) {
+            throw std::runtime_error("Emissive-triangle material has nonfinite radiance");
+        }
+        const float luminance = glm::dot(emission, glm::vec3(0.2126F, 0.7152F, 0.0722F));
+        if (luminance <= 0.0F) {
+            continue;
+        }
+
+        const PrimitiveLodRange lodRange = primitiveLods[primitiveGroup];
+        const std::uint64_t lodEnd =
+            static_cast<std::uint64_t>(lodRange.firstLod) + lodRange.lodCount;
+        if (lodRange.lodCount == 0U || lodEnd > lodSources.size()) {
+            throw std::runtime_error("Emissive-triangle instance has an invalid LOD range");
+        }
+        const std::uint32_t primitiveIndex = lodSources[lodRange.firstLod].primitiveIndex;
+        if (primitiveIndex >= primitives.size()) {
+            throw std::runtime_error("Emissive-triangle LOD references an invalid primitive");
+        }
+        const PrimitiveRecord& primitive = primitives[primitiveIndex];
+        const std::uint64_t indexEnd =
+            static_cast<std::uint64_t>(primitive.firstIndex) + primitive.indexCount;
+        if (primitive.indexCount == 0U || primitive.indexCount % 3U != 0U ||
+            indexEnd > indices.size() || primitive.vertexOffset < 0) {
+            throw std::runtime_error(
+                "Emissive-triangle source is not a valid indexed triangle list");
+        }
+
+        const std::uint32_t triangleCount = primitive.indexCount / 3U;
+        if (distribution.triangles.size() > std::numeric_limits<std::uint32_t>::max() ||
+            triangleCount > std::numeric_limits<std::uint32_t>::max() -
+                                distribution.triangles.size()) {
+            throw std::length_error("Emissive-triangle light index space is exhausted");
+        }
+        instance.visibilityLayer.z =
+            static_cast<std::uint32_t>(distribution.triangles.size());
+        instance.visibilityLayer.w = triangleCount;
+        const glm::mat4& world = transforms[transformIndex].world;
+        for (std::uint32_t triangleIndex = 0U; triangleIndex < triangleCount; ++triangleIndex) {
+            std::array<glm::vec3, 3> positions{};
+            for (std::uint32_t corner = 0U; corner < 3U; ++corner) {
+                const std::uint32_t localVertex =
+                    indices[static_cast<std::size_t>(primitive.firstIndex) +
+                            static_cast<std::size_t>(triangleIndex) * 3U + corner];
+                const std::uint64_t vertexIndex =
+                    static_cast<std::uint64_t>(primitive.vertexOffset) + localVertex;
+                if (vertexIndex >= vertices.size()) {
+                    throw std::runtime_error(
+                        "Emissive triangle references a vertex outside residency");
+                }
+                positions[corner] = glm::vec3(
+                    world * glm::vec4(vertices[static_cast<std::size_t>(vertexIndex)].position,
+                                      1.0F));
+            }
+            const float area = 0.5F * glm::length(
+                glm::cross(positions[1] - positions[0], positions[2] - positions[0]));
+            if (!std::isfinite(area)) {
+                throw std::runtime_error("Emissive triangle has nonfinite world area");
+            }
+            const float weight = area * luminance;
+            totalWeight += static_cast<double>(weight);
+            distribution.triangles.push_back({
+                .identity = {static_cast<std::uint32_t>(instanceIndex), triangleIndex,
+                             materialIndex, 0U},
+                .sampling = {0.0F, 0.0F, area, weight},
+            });
+        }
+    }
+
+    if (!(totalWeight > 0.0) || !std::isfinite(totalWeight)) {
+        distribution.triangles.clear();
+        for (InstanceRecord& instance : instances) {
+            instance.visibilityLayer.z = invalidEmissiveTriangleIndex;
+            instance.visibilityLayer.w = 0U;
+        }
+        return distribution;
+    }
+
+    double cdf = 0.0;
+    for (EmissiveTriangleRecord& triangle : distribution.triangles) {
+        const float probability =
+            static_cast<float>(static_cast<double>(triangle.sampling.w) / totalWeight);
+        cdf += static_cast<double>(probability);
+        triangle.sampling.x = static_cast<float>(std::min(cdf, 1.0));
+        triangle.sampling.y = probability;
+    }
+    distribution.triangles.back().sampling.x = 1.0F;
+    if (!distribution.valid()) {
+        throw std::runtime_error("Emissive-triangle sampling distribution is invalid");
+    }
+    return distribution;
 }
 
 MeshletHierarchy buildMeshletHierarchy(std::span<const VertexRecord> vertices,

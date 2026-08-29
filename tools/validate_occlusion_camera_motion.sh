@@ -3,7 +3,7 @@ set -euo pipefail
 
 build_dir="${1:-build/debug}"
 output_dir="${2:-captures/current/occlusion_camera_motion}"
-renderer_demo="${build_dir}/bin/renderer_demo"
+genesis_render="${build_dir}/bin/genesis_render"
 
 mkdir -p "${output_dir}"
 
@@ -12,7 +12,7 @@ capture() {
     local camera_script="$2"
     local frame="$3"
     local occlusion="$4"
-    env SDL_VIDEODRIVER=wayland "${renderer_demo}" \
+    env SDL_VIDEODRIVER=wayland "${genesis_render}" \
         --validation required \
         --demo directional-shadow \
         --taa off \

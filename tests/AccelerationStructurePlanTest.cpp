@@ -1,5 +1,6 @@
 #include "renderer/ray_tracing/AccelerationStructurePlan.hpp"
 
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/mat4x4.hpp>
 
 #include <array>
@@ -39,7 +40,19 @@ void testFinestLodAndSharedInstances() {
         LodSourceRecord{.primitiveIndex = 0U, .minimumProjectedDiameter = 100.0F},
         LodSourceRecord{.primitiveIndex = 1U, .minimumProjectedDiameter = 0.0F},
     };
-    const std::array<MaterialRecord, 1> materials{MaterialRecord{}};
+    MaterialRecord texturedOpaqueMaterial{};
+    texturedOpaqueMaterial.textureIndices = {1U, 2U, 3U, 4U};
+    texturedOpaqueMaterial.textureState = {
+        5U,
+        renderer::gpu_scene::baseColorTextureBit |
+            renderer::gpu_scene::metallicRoughnessTextureBit |
+            renderer::gpu_scene::normalTextureBit |
+            renderer::gpu_scene::occlusionTextureBit |
+            renderer::gpu_scene::emissiveTextureBit,
+        0U,
+        renderer::gpu_scene::normalTextureBit,
+    };
+    const std::array<MaterialRecord, 1> materials{texturedOpaqueMaterial};
     const std::array<InstanceRecord, 2> instances{
         InstanceRecord{.meshMaterial = {0U, 0U, 0U, 0U}},
         InstanceRecord{.meshMaterial = {0U, 0U, 1U, 0U}},
@@ -54,6 +67,8 @@ void testFinestLodAndSharedInstances() {
     require(plan.bottomLevels[0].maximumVertex == 3U, "BLAS maximum vertex is incorrect");
     require(plan.uniqueTriangleCount == 2U, "unique triangle count is incorrect");
     require(plan.instancedTriangleCount == 4U, "instanced triangle count is incorrect");
+    require(renderer::ray_tracing::supportsOpaquePathTracing(plan),
+            "opaque textured scene should be accepted by the path tracer");
 }
 
 void testVulkanInstanceTransformLayout() {
@@ -76,6 +91,34 @@ void testVulkanInstanceTransformLayout() {
         rejected = true;
     }
     require(rejected, "non-finite RT transform must be rejected");
+}
+
+void testChangingTransformResolution() {
+    std::array<renderer::gpu_scene::TransformRecord, 2> transforms{};
+    transforms[0].world = glm::mat4(1.0F);
+    transforms[1].world = glm::translate(glm::mat4(1.0F), glm::vec3(2.0F, 3.0F, 4.0F));
+    renderer::ray_tracing::TlasInstancePlan instance{.transformIndex = 1U};
+
+    const std::array<float, 12> initial =
+        renderer::ray_tracing::resolveInstanceTransform3x4(instance, transforms);
+    require(initial[3] == 2.0F && initial[7] == 3.0F && initial[11] == 4.0F,
+            "TLAS instance did not resolve its selected transform");
+
+    transforms[1].world = glm::translate(glm::mat4(1.0F), glm::vec3(-5.0F, 6.0F, 7.0F));
+    const std::array<float, 12> changed =
+        renderer::ray_tracing::resolveInstanceTransform3x4(instance, transforms);
+    require(changed[3] == -5.0F && changed[7] == 6.0F && changed[11] == 7.0F,
+            "TLAS instance did not propagate a changed world transform");
+    require(changed != initial, "changed TLAS transform produced stale packed data");
+
+    instance.transformIndex = 2U;
+    bool rejected = false;
+    try {
+        static_cast<void>(renderer::ray_tracing::resolveInstanceTransform3x4(instance, transforms));
+    } catch (const std::out_of_range&) {
+        rejected = true;
+    }
+    require(rejected, "out-of-range TLAS transform mapping must be rejected");
 }
 
 void testVertexOffsetUsesLocalMaximumIndex() {
@@ -116,18 +159,64 @@ void testMaterialAndTransformFlags() {
     const std::array<MaterialRecord, 1> materials{material};
     const std::array<InstanceRecord, 1> instances{
         InstanceRecord{
-            .meshMaterial = {0U, 0U, 0U, renderer::gpu_scene::mirroredTransformInstance}},
+            .meshMaterial = {0U, 0U, 0U, renderer::gpu_scene::mirroredTransformInstance},
+            .visibilityLayer = {0U, 1U << 15U, 0U, 0U},
+        },
     };
 
     const renderer::ray_tracing::SceneBuildPlan plan = renderer::ray_tracing::makeSceneBuildPlan(
         3U, indices, primitives, primitiveLods, lodSources, instances, materials, 1U);
 
     require(!plan.bottomLevels[0].opaque, "alpha-tested geometry must not be marked opaque");
+    require(plan.topLevelInstances[0].rayShadowMaterialMode ==
+                renderer::ray_tracing::RayShadowMaterialMode::alphaMasked,
+            "alpha-tested material was not classified for ray candidate evaluation");
+    require(renderer::ray_tracing::supportsRayQueryShadows(plan),
+            "alpha-tested material should be supported by ray-query shadows");
+    require(!renderer::ray_tracing::supportsOpaquePathTracing(plan),
+            "alpha-tested material must be rejected by the initial path tracer");
     require(plan.topLevelInstances[0].doubleSided, "double-sided state was not propagated");
     require(plan.topLevelInstances[0].mirrored, "mirrored transform state was not propagated");
-    require(plan.topLevelInstances[0].visibilityMask ==
+    require(plan.topLevelInstances[0].renderLayerMask == (1ULL << 47U),
+            "full-width renderer layer mask was not propagated");
+    require(renderer::ray_tracing::resolveInstanceVisibilityMask(plan.topLevelInstances[0],
+                                                                 1ULL << 47U) ==
                 renderer::ray_tracing::defaultRayVisibilityMask,
-            "default ray visibility mask is incorrect");
+            "visible high renderer layer did not enable the Vulkan ray mask");
+    require(renderer::ray_tracing::resolveInstanceVisibilityMask(plan.topLevelInstances[0],
+                                                                 1ULL << 15U) == 0U,
+            "hidden renderer layer remained visible to ray traversal");
+}
+
+void testUnsupportedMaterialRequiresRasterFallback() {
+    const std::array<std::uint32_t, 3> indices{0U, 1U, 2U};
+    const std::array<PrimitiveRecord, 1> primitives{
+        PrimitiveRecord{.indexCount = 3U, .firstIndex = 0U, .vertexOffset = 0},
+    };
+    const std::array<PrimitiveLodRange, 1> primitiveLods{
+        PrimitiveLodRange{.firstLod = 0U, .lodCount = 1U},
+    };
+    const std::array<LodSourceRecord, 1> lodSources{
+        LodSourceRecord{.primitiveIndex = 0U, .minimumProjectedDiameter = 0.0F},
+    };
+    const std::array<InstanceRecord, 1> instances{InstanceRecord{}};
+    constexpr std::array unsupportedFlags{renderer::gpu_scene::alphaBlendMaterial,
+                                          renderer::gpu_scene::additiveMaterial};
+    for (const std::uint32_t flag : unsupportedFlags) {
+        MaterialRecord material{};
+        material.textureState.z = flag;
+        const std::array<MaterialRecord, 1> materials{material};
+        const renderer::ray_tracing::SceneBuildPlan plan =
+            renderer::ray_tracing::makeSceneBuildPlan(
+                3U, indices, primitives, primitiveLods, lodSources, instances, materials, 1U);
+        require(plan.topLevelInstances[0].rayShadowMaterialMode ==
+                    renderer::ray_tracing::RayShadowMaterialMode::unsupported,
+                "blended/additive material was not classified as unsupported");
+        require(!renderer::ray_tracing::supportsRayQueryShadows(plan),
+                "blended/additive material must retain the raster shadow fallback");
+        require(!renderer::ray_tracing::supportsOpaquePathTracing(plan),
+                "blended/additive material must be rejected by the initial path tracer");
+    }
 }
 
 void testInvalidGeometryIsRejected() {
@@ -184,8 +273,10 @@ int main() {
     try {
         testFinestLodAndSharedInstances();
         testVulkanInstanceTransformLayout();
+        testChangingTransformResolution();
         testVertexOffsetUsesLocalMaximumIndex();
         testMaterialAndTransformFlags();
+        testUnsupportedMaterialRequiresRasterFallback();
         testInvalidGeometryIsRejected();
         testInvalidLodRangeIsRejected();
         std::cout << "acceleration structure plan tests passed\n";

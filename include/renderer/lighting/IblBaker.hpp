@@ -38,9 +38,28 @@ struct IblAssets {
     FloatImage brdfLut;
 };
 
+struct alignas(16) EnvironmentAliasEntry {
+    float threshold = 1.0F;
+    std::uint32_t aliasIndex = 0;
+    float probabilityMass = 0.0F;
+    float reserved = 0.0F;
+};
+
+struct EnvironmentSamplingDistribution {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::vector<EnvironmentAliasEntry> entries;
+
+    [[nodiscard]] bool valid() const;
+};
+
+static_assert(sizeof(EnvironmentAliasEntry) == 4 * sizeof(std::uint32_t));
+
 [[nodiscard]] FloatImage toLinearFloatImage(const assets::DecodedImage& image);
 [[nodiscard]] FloatImage makeProceduralStudioEnvironment(std::uint32_t width = 256,
                                                          std::uint32_t height = 128);
+[[nodiscard]] EnvironmentSamplingDistribution
+buildEnvironmentSamplingDistribution(const FloatImage& environment);
 [[nodiscard]] IblAssets bakeImageBasedLighting(FloatImage environment,
                                                const IblBakeSettings& settings = {});
 

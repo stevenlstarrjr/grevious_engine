@@ -1,4 +1,4 @@
-# Renderer Architecture
+# Genesis Render Architecture
 
 ## Scope and direction
 
@@ -93,6 +93,273 @@ later multi-queue executor must add submission batching, paired release/acquire
 ownership barriers, and timeline edges. Transient resources are owned correctly
 but do not alias memory yet; lifetime-based aliasing is an optimization after
 the first measured transient-heavy pipeline.
+
+## Host physics and simulation boundary — PLANNED
+
+### Current-state assessment
+
+Genesis Render has no physics runtime, physics abstraction, Jolt dependency, PhysX
+dependency, Blast integration, or Flow integration. The only physics-related
+build switch is fastgltf's draft `KHR_physics_rigid_bodies` support, which is
+explicitly disabled. That extension must remain disabled in the renderer
+importer; a future host asset compiler may parse physics authoring data into its
+own schema without adding physics objects to Scene IR.
+
+The current separation is conceptually correct but not yet a sufficient runtime
+integration API. Scene IR is immutable source-stage data, and `Renderer`
+currently owns scene-path loading, GPU-scene construction, transform storage,
+and acceleration-structure resources. Its changing-transform path remains a
+private validation script, not a host-facing animation or simulation channel.
+Raster mode changes only the frame-local TLAS input. Path mode additionally
+updates matching frame-local GPU Scene transform records with current and
+previous matrices so rigid object motion and history rejection can be tested.
+Before physics, destruction, or animation can drive rendering, Genesis Render needs
+generation-checked runtime render-instance handles plus batched create, destroy,
+transform, bounds, and geometry-residency updates. Those are renderer features,
+not physics features.
+
+There is no implemented or documented Jolt-specific contract to migrate.
+Selecting PhysX changes a future host dependency decision, not current Genesis Render
+code. Accidental coupling would begin if `PxRigidDynamic`, `PxShape`, PhysX
+callbacks, Blast actor objects, CUDA resources, or Flow SDK objects appeared in
+renderer public headers, Scene IR, GPU Scene records, render-graph declarations,
+or renderer CMake targets. Those placements are prohibited.
+
+### Proposed ownership architecture
+
+Physics and simulation belong to the host/game-engine layer:
+
+```text
+Host Engine
+├── gameplay / ECS / animation / world streaming
+├── renderer-neutral physics API
+│   ├── IPhysicsWorld
+│   ├── PhysicsBodyHandle / CollisionShapeHandle / PhysicsSceneHandle
+│   ├── body, joint, query, controller, and vehicle descriptors
+│   └── PhysX backend (preferred) OR another backend
+├── destruction coordinator
+│   ├── DestructionAssetHandle / DestructionEvent
+│   └── Blast implementation (optional)
+├── volume-simulation coordinator
+│   ├── VolumeFieldHandle / VolumeFieldSnapshot
+│   └── Flow implementation (optional, later)
+└── render-world bridge
+    ├── maps host entities and physics bodies to RenderInstanceHandle
+    ├── converts simulation results to renderer-owned update records
+    └── submits updates to Genesis Render
+        ├── GPU Scene transforms, bounds, instance create/destroy
+        ├── raster motion-vector history
+        └── BLAS/TLAS build, refit, update, and accumulation invalidation
+```
+
+`IPhysicsWorld` owns fixed-step simulation, rigid bodies, collision, queries,
+joints, controllers, and vehicles. PhysX types remain private to the PhysX
+backend translation unit. Backend-neutral handles are opaque, generation-
+checked values; public descriptors use engine math, scalar units, layer/filter
+data, and plain spans rather than vendor layouts. A handle identifies an engine
+resource, not a castable PhysX pointer.
+
+The render bridge must not pass `PhysicsBodyHandle` to Genesis Render. It maintains the
+mapping from host entities/bodies to renderer-owned `RenderInstanceHandle`
+values and produces render-domain records such as:
+
+```text
+TransformUpdate
+    RenderInstanceHandle instance
+    current world transform
+    previous world transform or teleport/history-reset flag
+    optional updated world bounds
+
+InstanceCreate / InstanceDestroy
+    renderer mesh/material handles and render-layer state
+
+GeometryReplacement
+    renderer geometry/meshlet asset handle and residency lifetime
+
+VolumeFieldSnapshot
+    renderer-neutral field semantics, transforms, extents, format, and lifetime
+    plus an explicitly negotiated CPU upload or GPU interop resource
+```
+
+This preserves a one-way dependency: the host understands both its physics
+handles and Genesis Render instance handles; Genesis Render understands neither PhysX nor Jolt.
+The host decides fixed-step timing, interpolation, origin rebasing, sleeping,
+teleports, and when a simulation discontinuity invalidates temporal/path-
+tracing history. Genesis Render owns GPU upload scheduling, previous-rendered transforms,
+visibility, residency, and acceleration-structure policy.
+
+### PhysX, Blast, Flow, terrain, and Gaussian data flow
+
+```text
+PhysX step
+    -> host TransformUpdate batch
+    -> Genesis Render runtime GPU Scene
+    -> raster motion vectors and dirty-instance TLAS updates
+
+Blast damage/fracture
+    -> host DestructionEvent and fragment ownership
+    -> host creates/updates PhysX fragment bodies
+    -> host creates/destroys Genesis Render mesh/meshlet instances
+    -> geometry residency plus BLAS/TLAS updates
+
+Flow simulation
+    -> host-owned density / temperature / velocity field snapshot
+    -> Genesis Render volume representation and Vulkan resource contract
+    -> raster or path-traced volume integration
+    -> temporal reconstruction and denoising
+
+CBT terrain
+    -> renderer-owned render topology, height/surface data, and stable dataset handles
+    -> host terrain-physics adapter and asynchronous cooking
+    -> PhysX collision/query representation owned by the host
+
+Gaussian tiles
+    -> Genesis Render visual representation only by default
+    -> separate host-authored coarse collision proxy when gameplay requires one
+```
+
+Blast does not itself supply collision or graphics representations; its split
+events are inputs to host-owned physics and render adapters. The PhysX-specific
+Blast extension may be studied inside the PhysX backend, but its objects must
+not become the host abstraction. Flow likewise supplies simulation data and
+optional Vulkan interop, while Genesis Render owns volume rendering and reconstruction.
+CBT must expose stable, versioned surface/height data to the host, but Genesis Render
+does not cook PhysX terrain or answer gameplay collision queries. Gaussian
+splats never become collision geometry implicitly.
+
+### PhysX versus Jolt implications
+
+| Concern | PhysX direction | Jolt implication |
+|---|---|---|
+| Current migration cost | No current backend exists, so selection has zero renderer migration cost. | Nothing must be removed; Jolt remains a possible future backend. |
+| Core game physics | Mature rigid bodies, collision, scene queries, joints, character controllers, and vehicles fit the desired host scope. | Covers the main game-oriented rigid-body/query/controller/vehicle scope with a smaller dependency. |
+| Extended simulation | PhysX supplies a broader unified family for GPU rigid bodies, FEM soft bodies, PBD particles/cloth, Blast, and Flow. | Comparable features would require separate evaluation or additional libraries. |
+| GPU acceleration | Optional CUDA paths can benefit NVIDIA hardware, including the current RTX 2060 Super, but are not portable. | Primarily CPU-oriented core avoids a CUDA deployment branch. |
+| Build integration | Current official Linux flow is a separately generated/built SDK with more toolchain and packaging work. | Official CMake FetchContent example, C++17, and standard-library-only core are materially simpler to consume. |
+| Platform breadth | The current Genesis Render target is Linux, which PhysX supports; future non-Linux targets require a fresh support audit. | Officially supports a substantially broader desktop/mobile/console/architecture matrix. |
+| Determinism and threading | Must be measured against the host's replay, fixed-step, and async-query requirements. | Determinism and concurrent game access are explicit design goals, so it remains a credible fallback. |
+| Destruction/volumes | Direct ecosystem relationship with Blast and Flow is the strongest reason to prefer PhysX. | Would need custom Blast adaptation and an independently selected volume simulator. |
+
+The choice must not force a lowest-common-denominator physics API. The common
+interface covers stable engine needs; backend-specific optional capabilities
+are queried explicitly. Unsupported features return a capability result or use
+a host-selected fallback rather than leaking a vendor object through the API.
+
+### Dependency and Linux/Vulkan implications
+
+PhysX, Blast, and Flow are host-engine dependencies and must not be added to
+`GenesisRender` targets. A future host build should use separately named
+targets such as `engine_physics_api` and `engine_physics_physx`, with all PhysX
+include directories, compile definitions, libraries, allocators, callbacks, and
+SDK initialization private to the latter. Recommended options are conceptually:
+
+```text
+ENGINE_PHYSICS_BACKEND=physx
+ENGINE_ENABLE_PHYSX_GPU=OFF       # portable default
+ENGINE_ENABLE_BLAST=OFF           # enable per product after prerequisites
+ENGINE_ENABLE_FLOW=OFF            # later volume feature
+```
+
+At the 2026-08-28 review point, the official PhysX Linux instructions require a
+generated external build, CMake 3.21+, Python, curl, supported Clang/GCC and
+glibc combinations, and CUDA Toolkit 12.8 only for GPU-enabled builds. CPU-only
+builds do not require CUDA. GPU PhysX requires a compatible driver and Volta-or-
+newer NVIDIA GPU. The official build may retrieve binary content through
+Packman/CloudFront, which conflicts with this repository's current pinned,
+offline-friendly submodule policy. The host integration must therefore pin a
+tested PhysX release, build it outside the renderer target graph, cache or
+mirror audited artifacts, and make network access an explicit dependency-
+preparation step rather than a configure-time surprise.
+
+Blast has its own Linux setup/build output and transitive authoring/
+serialization dependencies. Integrate only the runtime layers actually needed;
+keep fracture authoring and cooking in offline tools where possible. Flow's
+current SDK supports Linux and provides a Vulkan implementation with shared-
+buffer/semaphore interop, but adopting that path requires explicit Vulkan
+external-resource ownership, queue synchronization, lifetime, and failure-
+fallback contracts. It must not bypass Genesis Render's render graph or make CUDA,
+Flow, or an NVIDIA driver mandatory for normal rendering.
+
+The CPU PhysX configuration is the first portability baseline and must run with
+Genesis Render on NVIDIA, AMD, Intel, and software/CI Vulkan configurations. GPU physics
+is a separately detected host capability with CPU fallback. Vulkan rendering
+and CUDA simulation also compete for frame time, VRAM, upload bandwidth, and
+driver scheduling on NVIDIA systems; measure the combined workload rather than
+budgeting either system in isolation.
+
+Reviewed upstream references:
+
+- [PhysX SDK repository and component layout](https://github.com/NVIDIA-Omniverse/PhysX)
+- [PhysX Linux build requirements](https://github.com/NVIDIA-Omniverse/PhysX/blob/main/physx/documentation/platformreadme/linux/README_LINUX.md)
+- [Blast architecture and physics/graphics boundary](https://nvidia-omniverse.github.io/PhysX/blast/index.html)
+- [Flow Vulkan context and sparse-volume model](https://nvidia-omniverse.github.io/PhysX/flow/index.html)
+- [Jolt design, platforms, and CMake consumption](https://github.com/jrouwe/JoltPhysics)
+
+### Incremental integration milestones
+
+| Milestone | Location | Acceptance criteria | Status |
+|---|---|---|---|
+| P0: boundary decision | Genesis Render docs plus future host design | No physics SDK type or link dependency in Genesis Render; ownership and data flows reviewed. | Complete in architecture only |
+| P1: renderer runtime-update contract | Genesis Render | Generation-checked render-instance handles; deterministic batched create/destroy/transform updates; raster current/previous transforms and RT dirty-instance updates agree; no physics names in API. | Deferred until current path-lighting prerequisites permit |
+| P2: backend-neutral physics API | Host engine | Fake/test backend exercises lifecycle, fixed-step, queries, events, serialization IDs, and transform extraction without PhysX headers. | Host work, can proceed in parallel |
+| P3: CPU PhysX Linux spike | Host engine | Pinned SDK builds reproducibly; rigid bodies, collision, ray/sweep/overlap queries, one joint, and controller smoke tests pass with CUDA absent; clean shutdown and leak checks. | Integrate first |
+| P4: host-to-render bridge | Host plus Genesis Render API | Thousands of stable transform updates drive GPU Scene and TLAS without per-object draw submission; teleports/reset rules and add/remove churn are deterministic and measured. | After P1 and P3 |
+| P5: product physics features | Host engine | Controllers, vehicles, joints, cooking, streaming, soft-body/cloth/particles are added only with feature tests and CPU fallbacks or explicit unsupported capability. | Incremental, demand-driven |
+| P6: Blast | Host plus asset tools | Offline fracture assets are versioned; split events create/destroy host bodies and render instances; fragment residency and BLAS/TLAS costs stay within measured budgets. | Deferred until P4 and explicit residency |
+| P7: CBT physics adapter | Host plus terrain data API | Stable terrain data versions feed asynchronous collision cooking; render and collision LOD changes do not invalidate live handles or block the render thread. | Deferred until CBT representation is stable |
+| P8: Flow and volume rendering | Host plus later Genesis Render volume subsystem | Sparse fields have a renderer-neutral snapshot contract; Vulkan interop/fallback is validated; raster/path volume output has motion/history data and a denoising budget. | Deferred until volume rendering prerequisites |
+| P9: optional GPU PhysX | Host engine | Runtime capability selection, CPU fallback, cross-vendor launch coverage, and combined CUDA/Vulkan frame/VRAM measurements pass. | Optional, after CPU production path |
+
+### Scheduling and recommendation
+
+Physics work may proceed in the host layer in parallel, but it does not reorder
+the renderer roadmap. Genesis Render priorities remain:
+
+1. Real-time progressive path-tracing improvements.
+2. Bounded multi-bounce transport and Russian roulette.
+3. Better light sampling and MIS.
+4. Path-reconstruction outputs.
+5. Temporal reconstruction and denoising.
+6. Upscaling abstraction.
+7. Explicit GPU residency.
+8. Concurrent Binary Tree terrain.
+9. Terrain streaming and large-world support.
+10. 3D Gaussian splat rendering.
+11. Hierarchical Gaussian tiles and LOD.
+12. Representation-level LOD.
+13. Advanced reconstruction, ReSTIR, and vendor integrations.
+
+Flow volumetrics remain after the opaque/path reconstruction prerequisites; an
+SDK selection is not a reason to pull them forward.
+
+The recommendation is to adopt PhysX as the **preferred first host backend now**
+without making it an irreversible engine ABI or a Genesis Render dependency. Keep the
+backend decision technically open until P3 proves reproducible CPU-only Linux
+builds, required game features, deployment/licensing, and host tests. If that
+spike fails its build, determinism, footprint, or portability gates, the
+renderer-neutral API makes Jolt a viable substitute. Even after PhysX passes,
+CPU PhysX remains the portable baseline, GPU PhysX is opt-in, and Jolt or
+another backend remains possible by contract.
+
+## Dual game/VFX rendering profiles
+
+Genesis Render is one hybrid renderer intended to serve interactive games and converged
+VFX/animation work, not two engines with drifting scene, material, and lighting
+implementations. The interactive profile constrains samples, bounce depth,
+history cost, denoising, reconstruction, and upscaling to a measured frame
+budget while retaining raster/hybrid fallback. A later converged profile may
+raise sample and bounce budgets, render deterministic frame sequences, export
+linear HDR AOVs, and add production features such as motion blur, depth of
+field, offline denoising, color-management/output policy, and render-job
+scheduling. Both profiles must share Scene IR, GPU Scene, materials, lighting,
+visibility, acceleration structures, path transport, and reconstruction-output
+semantics.
+
+The current path mode is the real-time-first foundation for both profiles, not
+yet a Cycles-equivalent production renderer. Film-oriented scheduling, EXR/AOV
+export, animated deformation, motion blur, depth of field, volumes, hair,
+spectral transport, and production color management remain later work. Those
+features must extend the shared renderer rather than fork an offline-only path.
 
 ## Scene IR boundary
 
@@ -234,18 +501,21 @@ Acceleration structures are enabled only with deferred host operations and the
 required feature bit. Ray-query and ray-pipeline features/extensions are each
 enabled only on top of that complete acceleration-structure set. The device
 records AS geometry/primitive/instance limits, scratch alignment, ray recursion
-depth, and shader-group alignment for later allocation validation. Mesh-shader
+depth, shader-group handle/base alignment, and maximum SBT stride for allocation
+validation. Mesh-shader
 support is still detection-only because no mesh-shader owner/backend is live.
 
 No vendor ray-tracing or upscaling extension is foundational. Optional features
 retain raster fallbacks on AMD, Intel, NVIDIA, and conforming software Vulkan
-devices.
+devices. `GPU_VENDOR_LIBRARIES.md` is the evaluation record for optional
+upscaling, denoising, profiling, and latency SDKs; those integrations remain
+behind renderer-owned interfaces and do not replace this architecture.
 
-## Milestone 8 ray-tracing foundation — in progress
+## Milestone 8 hybrid ray-query shadows — complete baseline
 
 The public `--ray-tracing off|auto|required` policy is independent from
-`--shadows on|off` and from the internal Vulkan mechanism. The current planned
-first shadow backend is ray query, but the policy can later select a ray
+`--shadows on|off` and from the internal Vulkan mechanism. The current first
+shadow backend is ray query, but the policy can later select a ray
 pipeline without changing the public control. Selection requires both enabled
 acceleration structures and enabled ray queries plus a renderer-owned backend:
 
@@ -254,10 +524,11 @@ Request + enabled device capabilities + implemented backend
     -> raster fallback OR ray-query shadows OR explicit required-mode failure
 ```
 
-`auto` falls back to raster when hardware support is incomplete or the backend
-is not implemented. `off` forces raster. `required` rejects either condition
-instead of silently rendering a different path. This prevents capability
-detection from being confused with a working ray-traced effect.
+`auto` falls back to raster when hardware support is incomplete or when the
+scene contains blended/additive geometry that the first backend cannot evaluate.
+`off` forces raster. `required` rejects either limitation instead of silently
+rendering a different path. This prevents capability detection from being
+confused with a working ray-traced effect.
 
 The scene residency boundary now retains whole primitive/LOD source ranges in
 addition to raster meshlets. A deterministic CPU planner selects the finest
@@ -269,15 +540,43 @@ checks Vulkan's 24-bit instance-index limit, and converts GLM transforms to the
 row-major Vulkan 3x4 layout under unit test. The public/runtime LOD policy is
 not permanently coupled to this initial finest-LOD choice.
 
-The capability-gated Vulkan build path is implemented and compiles in Debug and
-Release. It queries exact BLAS/TLAS sizes, owns each acceleration structure and
-its backing buffer, supplies whole-mesh vertex/index device addresses, allocates
-separate aligned scratch ranges for concurrent BLAS commands, inserts the
-required BLAS-write to TLAS-read barrier, and waits for the exact startup build
-fence rather than idling the device. TLAS storage is created update-capable and
-the packed instance buffer remains persistent, but per-frame TLAS updates are
-not implemented yet. Scratch is temporary; BLAS, TLAS, and instance input are
-persistent and report their requested resource bytes on capable hardware.
+The capability-gated Vulkan build path is implemented and validated in Debug
+and Release. It queries exact BLAS/TLAS sizes, owns each acceleration structure
+and its backing buffer, supplies whole-mesh vertex/index device addresses,
+allocates separate aligned scratch ranges for concurrent BLAS commands, inserts
+the required BLAS-write to TLAS-read barrier, and waits for the exact startup
+build fence rather than idling the device. TLAS storage is created
+update-capable. Two frame-local host instance inputs are rewritten only after
+their frame timeline wait, and two frame-local scratch buffers keep update work
+from racing an earlier slot. Each submitted frame records explicit host-write
+and prior-AS dependencies before an in-place TLAS `UPDATE`. Startup scratch is
+temporary; update scratch, BLAS, TLAS, and instance inputs are persistent and
+report their requested resource bytes on capable hardware.
+
+The first visible backend compiles the shared PBR fragment source a second time
+with `GL_EXT_ray_query`. Its reflected set 0 binding 11 is a TLAS descriptor;
+bindings 12-14 expose resident vertex/index data and one compact range per BLAS.
+The raster variant retains its three shadow-map samplers at binding 10. Vulkan-
+opaque BLAS geometry keeps the hardware fast path. Non-opaque triangle
+candidates use the TLAS custom instance index and primitive index to reconstruct
+UVs from barycentrics, sample bindless base-color alpha at deterministic mip 0,
+and confirm only alpha-cutoff hits. Terminate-on-first-hit then uses committed-
+hit presence as hard visibility.
+
+Shadow rays travel from receiver to light, reversing raster shadow-map
+traversal, so ray front-face culling matches raster back-face culling. A
+geometric-normal, scene-scaled offset clears faceted smooth-shading
+self-intersection. An AS-build-write to fragment-AS-read barrier follows each
+per-frame TLAS update, and uploaded vertex/index states include fragment storage
+reads. When this backend is selected, raster shadow culling/drawing is skipped
+and the three transient maps shrink to inactive 1x1 fallbacks. Blended or
+additive materials select raster because their partial coverage is not modeled.
+
+Renderer visibility layers remain 64-bit. Each TLAS plan retains the complete
+instance layer mask, intersects it with the current view mask on the CPU, and
+then writes Vulkan's 8-bit instance mask only as a binary `0xff`/`0` traversal
+gate. This preserves the renderer policy without inventing a lossy eight-layer
+mapping and updates with the frame-local TLAS input.
 
 The Intel Iris Xe host exposes none of the three RT feature sets, so no RT
 buffer usage, acceleration structure, scratch buffer, or RT memory is created.
@@ -288,14 +587,254 @@ triangles after instancing. Automatic and explicitly-off captures match exactly
 validation. Policy and build-planner tests simulate complete, partial, missing,
 shared-mesh, alpha, transform, and invalid-geometry cases.
 
-The Vulkan BLAS/TLAS command path has not executed on RT hardware yet and is
-therefore implemented but **not certified** pending the RTX 2060 Super run.
-Ray descriptors, per-frame TLAS updates, shader execution, ray-traced shadows,
-RT GPU timing, and measured RTX memory cost remain unfinished. They must not be
-described as working based only on compilation, CPU planning, and Intel fallback
-tests. The current Vulkan 8-bit instance mask is deliberately left fully open;
-the existing 64-bit raster render-layer policy must be preserved by the later
-ray-query integration rather than silently truncated.
+The static Vulkan BLAS/TLAS command path has executed in Debug and Release on an
+NVIDIA RTX 2060 Super 8 GB with driver 595.84. The directional-shadow demo built
+two BLAS and one TLAS for 2,306 unique triangles and 36 instances. The
+update-capable configuration uses 188,446 persistent RT resource bytes,
+0.0545645 MiB of temporary startup scratch, and 2,432 update scratch bytes per
+frame slot. Debug and Release gates each recorded eight static and eight
+scripted-changing in-place TLAS updates; disabled-shadow captures matched
+RT-off exactly (`RMSE 0`). An alpha-enabled 240-frame Release resize stress run
+recorded 240 updates through repeated frame-slot reuse.
+
+Debug and Release ray-query gates now select the live backend for the opaque
+directional-shadow scene. Repeat and automatic/required captures match exactly
+(`RMSE 0`); ray shadows differ from shadows-off by `RMSE 0.0467753439165` and
+from the raster reference by `RMSE 0.00547396798572`. The alpha-shadow scene
+also selects ray query in automatic and required modes with repeat and mode
+`RMSE 0`, shadows-on/off `RMSE 0.0175814992413`, and ray/raster reference
+`RMSE 0.00562910967074`. Opaque checker probes darken while hole probes remain
+within 0.01 luminance of shadows-off. These runs shut down cleanly with core,
+synchronization, and best-practices validation.
+
+GPU profiling now assigns stage-specific timestamp pairs to the in-place TLAS
+build and the indexed PBR geometry draw. On the same RTX 2060 Super, two matched
+240-frame Release runs at 1280x720 measured TLAS updates at 0.0206669 ms with
+shadow traversal disabled and 0.0186416 ms with it enabled. PBR geometry took
+0.0690935 ms with traversal disabled and 0.172482 ms with traversal enabled, so
+the embedded ray-query shadow path adds an estimated 0.1033885 ms (149.636%) in
+this scene. This is deliberately a matched fragment-draw delta because Vulkan
+cannot timestamp only the ray-query instructions embedded within that shader.
+`tools/validate_ray_query_timings.sh` checks positive finite samples, backend
+and traversal state, all 240 TLAS updates, and clean Vulkan validation logs.
+
+Production animation input, ray-aware alpha texture LOD, startup AS build
+timing, soft-shadow sampling/denoising, and practical RTX scaling limits remain
+unfinished. The deterministic raster test remains TLAS-only; path mode has one
+validated rigid-transform/history script but no host-facing update API. The
+first bounded progressive path-tracing slice described below is now live.
+
+## Progressive path-tracing baseline
+
+`--render-mode path-traced` selects a separate, capability-gated renderer path;
+`rasterized` remains the default. The mode requires acceleration structures, a
+ray-tracing pipeline, loaded trace/pipeline/group-handle entry points, and ray
+recursion depth equal to the configured bounce count plus two. The public
+`--path-max-bounces 1|2|3|4` control defaults to two. It rejects
+`--ray-tracing off` and alpha/blended/additive geometry. Opaque materials may
+use the resident bindless texture table. TAA, bloom, and Hi-Z culling are
+disabled because the path tracer owns its own progressive history.
+
+`RayTracingPipeline` owns the Vulkan pipeline/layout and one host-visible SBT.
+Shader groups are ordered raygen, two miss records (radiance and shadow), and
+two triangle-hit records (radiance closest-hit and shaderless shadow). Records
+respect handle alignment, region starts respect base alignment, and stride is
+checked against the device maximum before dispatch.
+
+The dedicated graph is:
+
+```text
+in-place TLAS update -> ray dispatch into persistent radiance + first-hit AOVs
+    -> path history validation -> temporal radiance reconstruction
+    -> AOV-guided spatial denoising
+    -> optional path AOV image-to-host readback
+    -> existing exposure/ACES-fit tone mapping -> optional capture -> present
+```
+
+Raygen emits deterministic subpixel camera rays and incrementally averages one
+sample per pixel per submitted frame. Closest-hit reconstructs smooth normals
+from resident vertex/index/instance/transform/geometry-range buffers, evaluates
+emission and the existing metallic/roughness direct-light BRDF, traces a hard
+directional-light visibility ray, and emits one sampled diffuse/visible-GGX
+metallic-roughness continuation at each nonterminal hit. Lobe selection uses a
+bounded material/Fresnel energy heuristic; the full BRDF and combined
+solid-angle PDF produce explicit `f * absDot / PDF` throughput. Cumulative path
+throughput drives Russian roulette after the second continuation, with survival
+compensation preserving expectation. Every hit performs direct-light sampling.
+A path-only 256x128 alias table weights each HDR lat-long texel by
+nonnegative luminance times its exact spherical solid angle. Sampling is uniform
+within the selected texel's solid angle. Environment next-event samples trace
+visibility at every hit. Nonterminal light samples and environment misses use
+complementary power-heuristic MIS weights against the existing full-BRDF PDF;
+the configured terminal hit uses an unweighted light sample because it launches
+no complementary BSDF ray. This is an opaque, bounded one-to-four-bounce
+baseline. A second path-only distribution enumerates every triangle in each
+visible emissive instance's finest resident RT LOD. Triangle selection is
+weighted by world-space area times nonnegative emissive-factor luminance, uses a
+binary-searched normalized CDF, and samples uniform barycentric area. The sampled
+material's emissive texture is evaluated at the selected point. The shader
+converts selection/area density to solid angle with
+`p_select * distance^2 / (area * absCosLight)`, traces a bounded visibility ray,
+and applies complementary power-heuristic weights to explicit light samples and
+BSDF paths that hit emitters. Reserved instance-record words store the first
+light index and triangle count, making emissive-hit PDF lookup O(1). This initial
+distribution is static: animated emitter transforms, changing materials, and RT
+LOD/residency changes require a rebuild rather than an incremental GPU update.
+
+The same dispatch now writes a renderer-owned reconstruction contract. Beauty
+and direct radiance are independently accumulated in `RGBA32F`; nonnegative
+indirect radiance is derived as `beauty - direct`, avoiding a redundant
+full-resolution read/write image. First-hit base color plus perceptual roughness
+occupy one `RGBA16F` image. Geometric and shading normals are octahedrally
+encoded into a second `RGBA16F` image. An `RGBA32F` image stores unjittered
+current-minus-previous UV motion, expected previous Vulkan device depth, and
+world-space hit distance. Current device depth has a dedicated `R32F` image so
+the reconstruction consumer never has to infer which frame a depth channel
+describes. Motion includes both previous camera projection and each instance's
+`previousWorld` transform, matching the raster convention. Primary misses write
+explicit sky defaults and infinite-direction camera motion, so no stale surface
+data survives and rotating-camera sky history can reproject. Surface attributes
+describe the current jittered primary sample; beauty and direct radiance retain
+progressive accumulation. `--path-debug` exposes final, direct, indirect,
+   albedo, roughness, geometric/shading normal, motion, depth, hit-distance, a
+   high-gain lighting-decomposition residual, history validity, raw progressive
+   radiance, temporal-only radiance, the applied temporal reconstruction weight,
+   and temporal luminance variance.
+
+When the deterministic rigid-instance script is enabled, two frame-local
+host-visible transform buffers keep closest-hit shading synchronized with the
+frame-local TLAS update. Before each write, the current transform becomes
+`previousWorld`; the scripted translation becomes `world`; and `normalToWorld`
+is regenerated. A host-write-to-ray-shader render-graph dependency makes the
+mapped update visible before tracing. Because moving geometry invalidates the
+stationary progressive average, beauty/direct accumulation resets to one fresh
+sample every moving frame. Geometry and radiance histories remain eligible and
+are accepted only through the same motion, depth, normal, and surface-class
+tests. This is the renderer-side rigid-motion boundary, not animation
+ingestion, skinning, deforming BLAS updates, or a general runtime instance API.
+
+After the ray dispatch, a renderer-owned compute pass writes current depth and
+geometric-normal/surface class into ping-ponged `R32F` and `RGBA16F` history.
+It reprojects the prior metadata with `previousUv = currentUv - motion` and emits
+an `R32F` binary confidence image. Eligibility requires an initialized semantic
+history, a finite valid projection, in-bounds UVs, and a matching surface/sky
+class. Surface samples additionally require expected-previous versus historical
+device depth within a local depth-gradient threshold and geometric-normal dot
+product of at least 0.85. Sky samples do not invent surface depth or normal
+requirements. Smooth camera motion preserves geometry history even though it
+resets progressive radiance accumulation; large camera discontinuities,
+teleports, environment/view changes, explicit resets, and resize invalidate it.
+The pass always writes current metadata, so a rejected frame seeds the next one.
+
+A second compute pass consumes accumulated beauty, current motion, the validated
+confidence mask, and ping-ponged `RGBA16F` reconstructed radiance. It reprojects
+with the same current-minus-previous motion convention, clamps accepted history
+to the current 3x3 radiance neighborhood, and blends with the smaller of a
+motion-adaptive weight and a convergence weight. Accepted history represents at
+most four equivalent fresh samples: its maximum contribution is 0.8 at sample
+index zero and decays as progressive stationary samples accumulate. Rejected or
+first-frame pixels copy current raw radiance. Output alpha records the applied
+weight for diagnostics. The pass also ping-pongs `RG16F` first and second
+luminance moments with the same validated history weight; luminance is bounded
+to the representable half-float moment range and variance is clamped
+nonnegative.
+
+A third compute pass applies one bounded 3x3 spatial filter to temporal
+radiance. It rejects surface/sky transitions and weights accepted neighbors by
+temporal luminance variance, geometric normal, device depth, albedo, roughness,
+and world hit distance. Sky uses the kernel plus radiance/variance guidance.
+Filter strength is `4 / (sampleIndex + 4)`, so it is strongest for the live
+one-sample image and fades as stationary progressive accumulation converges.
+The default final view consumes this output; raw and temporal-only radiance
+remain independently inspectable, and output alpha exposes variance. This is a
+minimal native spatial reconstruction baseline, not a production multistage
+denoiser: direct/indirect-specific filtering, reactive masks, larger adaptive
+kernels, and vendor backends remain later work.
+
+Closest-hit reconstructs UV0/UV1 and the transformed tangent frame from the
+same 14-float vertex record used by rasterization. Set 1 is the shared runtime
+bindless array, visible to both fragment and closest-hit stages. Base-color,
+metallic/roughness, normal, occlusion, and emissive maps follow the existing
+glTF factors, indices, UV selectors, color-space formats, and sampler state.
+Primary-ray angular spread comes from adjacent camera rays. At each hit, the
+accumulated world-space cone width is scaled by the triangle's maximum UV/world
+edge ratio and texture extent to choose an explicit mip; diffuse and visible-GGX
+bounces widen the cone before a secondary hit. This is a bounded ray-cone LOD
+adaptation, not a full anisotropic ray-differential implementation.
+
+At 1280x720, beauty and direct `RGBA32F` accumulation use 28.125 MiB. Current
+first-hit AOVs use 31.6406 MiB; ping-ponged depth/geometric-normal history and
+the confidence image use 24.6094 MiB; ping-ponged `RGBA16F` temporal radiance
+uses 14.0625 MiB; ping-ponged `RG16F` moments use 7.03125 MiB; and the
+`RGBA16F` spatial output uses 7.03125 MiB, for 112.5 MiB total persistent path
+targets. An AOV export request additionally allocates one 77.34375 MiB
+host-visible staging buffer at 1280x720; normal interactive path tracing does
+not allocate it. Nine packed GPU targets are copied once at the selected frame
+and expanded on the CPU into 15 semantic float32 planes. A full 1280x720 PFM v1
+frame is approximately 116.0156 MiB plus its JSON manifest. The 36-transform
+animation validation allocates two 6,912-byte frame-local transform buffers,
+raising its persistent RT resources from 188,446 to 202,270 bytes. Deriving
+indirect radiance instead of storing it removes another 14.0625 MiB
+and reduced the measured default dispatch from 5.99 ms during implementation to
+the certified result below. The path-only environment
+distribution is 524,288 bytes for the current 256x128 environment. A zero-energy
+map falls back to a normalized uniform-sphere distribution. The 2,304-triangle
+emissive validation sphere uses a 73,744-byte header/CDF buffer. Camera/view/
+environment changes and swapchain recreation discard prior samples deterministically; the graph
+binds the prior `GENERAL` fragment-sampled state only while history is valid.
+`tools/validate_path_tracing.sh` verifies finite convergence, bit-exact repeated
+32-sample output, two resize resets, all TLAS/sample counts, one opaque textured
+Damaged Helmet run, explicit depth-1/depth-4 captures, a fixed-budget
+uniform/importance comparison, a fixed-budget emissive sampled/BSDF-only
+comparison, temporal/spatial reconstruction comparisons, and clean Vulkan
+validation. At four samples and 640x360, uniform environment sampling has RMSE
+0.0391032915832 against the 64-sample importance reference; importance sampling
+has RMSE 0.0300797832782, a ratio of 0.769239. Depth-1 and depth-4 32-sample
+captures differ by RMSE 0.0163448365271, while repeated depth-4 captures match
+at RMSE 0. On the RTX 2060 Super, one versus 32 default-two-bounce samples
+differs by RMSE 0.0395091618743 and repeated 32-sample captures match at RMSE 0.
+The clean 1280x720 full-suite ray dispatch averages 4.06463 ms against a 5 ms
+gate.
+`tools/validate_aov_export.sh` separately validates the offline-facing boundary:
+it exports all 15 finite planes, checks extent/channel/manifest metadata, unit
+surface normals, zero sky normals, motion-channel convention, numeric ranges,
+and exact `indirect = max(raw - direct, 0)` decomposition. It also proves that a
+tone-mapped PNG capture can coexist at the same frame. Repeated RTX 2060 Super
+runs measured 1.73222 to 2.88858 ms for the one 640x360 image-to-host copy
+against a 4 ms regression ceiling; the deliberately loose ceiling accounts for
+single-frame timing variance. This explicit export copy is not part of normal
+real-time pass cost.
+`tools/validate_path_animation.sh` adds a static control, invalid first frame,
+animated third frame, and exact repeated animated export. At 320x180 the
+scripted rigid instance produces maximum motion 0.00283263 UV across 125
+pixels. Moving-pixel history confidence averages 0.952 while 17 surface pixels,
+including six moving pixels, are rejected at changed coverage/depth. The raw
+accumulator holds one sample after two deliberate resets at frame three, all 15
+AOV planes repeat exactly, and validation is clean. TLAS update and path-history
+validation average 0.0177707 ms and 0.0105173 ms on the RTX 2060 Super against
+0.25 ms and 0.10 ms gates at this diagnostic resolution. A separate 120-frame
+run records 120 synchronized scripted updates and 119 resets, covering repeated
+reuse of both frame-local transform, instance-input, and scratch-buffer slots.
+The AOV gate records exact repeated albedo, geometric/shading normal RMSE
+0.00323482300546, moving/static motion RMSE 0.0273575809056, direct/indirect
+display RMSE 0.560681778635, and zero high-gain beauty-decomposition residual.
+The stationary and translating-camera history-validity captures have luminance
+0.71266082292 and 0.711792616323. First-frame and scripted-teleport invalid
+captures match at RMSE 0; invalid versus stationary differs by RMSE
+0.814431464956. History validation averages 0.120671 ms and temporal
+reconstruction averages 0.18209 ms at 1280x720; each has a 0.25 ms gate.
+Spatial denoising averages 0.333075 ms against a 0.50 ms gate. First-frame raw
+and temporal display output differ by only 0.000558511296533 RMSE. Against a
+64-sample temporal reference, one-sample temporal and spatial output measure
+0.0591471802356 and 0.0436362789205 RMSE, a spatial/temporal ratio of 0.737758.
+Across adjacent translating-camera frames, raw, temporal, and spatial output
+change by 0.0603450265089, 0.0486407735702, and 0.0426373774477 RMSE. Temporal
+versus raw has ratio 0.806044; spatial versus temporal has ratio 0.876577.
+At four samples, emissive-triangle sampling reduces RMSE against its 64-sample
+reference from 0.0444489341774 for BSDF-only transport to 0.032161095846, a
+ratio of 0.723552; the 64-sample emissive dispatch mean is 0.371332 ms at
+640x360 and its repeat RMSE is 0. The five-texture Damaged Helmet dispatch mean
+is 2.11111 ms; both 1280x720 paths use a 5 ms gate.
 
 ## Frame and data flow
 
@@ -331,7 +870,7 @@ The target render-graph order is:
 
 ```text
 Visibility -> Shadow maps -> Depth -> Hi-Z -> GBuffer -> Lighting -> optional RT effects
-      -> Temporal/Denoise -> Post -> Upscale -> Present
+      -> Temporal/Denoise -> linear-HDR Post -> Upscale -> Tone map -> Present
 ```
 
 GPU-driven scene flow is `scene buffers -> flattened instance/LOD/meshlet
@@ -434,8 +973,8 @@ cascade-transition quality still require a representative outdoor scene.
 ## Temporal reconstruction
 
 Milestone 7 adds a reusable temporal boundary without coupling it to ray
-tracing or an upscaler. `TemporalState` owns committed current/previous camera
-matrices and an explicit history-valid bit. GPU transform records carry current
+tracing or a specific upscaler backend. `TemporalState` owns committed
+current/previous camera matrices and an explicit history-valid bit. GPU transform records carry current
 and previous world matrices, so the motion-vector ABI already covers rigid
 object motion even though the current imported demo scenes are static. Raster
 positions use an eight-sample, zero-mean base-2/base-3 camera-jitter cycle;
@@ -466,8 +1005,38 @@ The current temporal certification covers opaque/alpha-masked rigid geometry,
 camera motion, thin-edge disocclusion, the infinite environment, teleport, and
 resize recovery. Transparent/additive scheduling, live animation/skinning and
 morph transform updates, reactive masks, variance clipping, and temporal
-upscaling remain later milestones; their data must feed this same motion and
-history contract rather than create parallel temporal systems.
+upscaling backends remain later milestones; their data must feed this same
+motion and history contract rather than create parallel temporal systems.
+
+## Upscaling boundary — native baseline
+
+`renderer::upscaling::IUpscaler` is the renderer-owned backend boundary. Its
+Vulkan-independent frame input declares render and output extents; color,
+depth, motion-vector, jitter, exposure, and reset availability; current and
+previous jitter in render pixels; and the exposure scale. Reactive-mask
+availability is explicit but false for the current renderer. Backends return a
+validated per-frame plan rather than leaking FSR, XeSS, DLSS, or Vulkan objects
+into renderer-facing configuration.
+
+The first `native` backend is intentionally strict: its render extent equals
+the swapchain/output extent, all canonical inputs must be valid, and it requests
+no dispatch. Raster and path render graphs nevertheless schedule the same
+timestamped native boundary after their linear-HDR reconstruction and bloom
+source is selected and before tone mapping. This makes the convergence point
+and dependency surface live without inserting a redundant image copy. Raster,
+temporal, path, bloom, and AOV allocations now derive from `renderExtent()`;
+presentation and capture remain output-extent operations. Swapchain recreation
+recomputes both extents and invalidates reconstruction history.
+
+`tools/validate_upscaling.sh` compares implicit and explicit native raster
+captures exactly (`RMSE 0`), exercises a 1279x719 resize followed by 640x360
+recovery, and carries eight animated path frames through TLAS/accumulation
+resets under Vulkan core, synchronization, and best-practices validation. On the
+RTX 2060 Super, the timestamp-only boundary measures `0.000016 ms` in raster and
+`0.000116 ms` in the animated path run at 320x180. This is an interface and
+scheduling baseline, not an upscaling algorithm: no reduced internal
+resolution, output-resolution HDR target, reactive mask, FSR, XeSS, or DLSS
+backend exists yet.
 
 ## Certified post-processing contract
 
@@ -479,6 +1048,7 @@ Linear HDR PBR
     -> bloom extraction + downsample when enabled
     -> horizontal blur
     -> vertical blur
+    -> native/upscaler boundary
     -> bloom composite
     -> exposure compensation
     -> ACES-fit tone mapping
@@ -779,10 +1349,10 @@ Cross-module tests import the local `CompareMetallic`, `CompareRoughness`,
 evaluated through the reference BRDF. `MetalRoughSpheresNoTextures` is also
 packed through the full CPU residency gate, including unified geometry,
 primitive draw ranges, instances, material records, and transform history.
-PNG/JPEG/HDR decoding and IBL texture residency are implemented and tested, but
-general Scene IR material-texture image residency is not; textured glTF assets
-therefore still verify source semantics, bindings, geometry, and hierarchy
-rather than image-space golden results.
+PNG/JPEG/HDR decoding, IBL residency, and general Scene IR material-texture
+residency are implemented and tested. Raster validation covers extended
+textured glTF runs; the path gate additionally captures Damaged Helmet through
+bindless closest-hit texture reads and explicit ray-cone mip selection.
 `NormalTangentTest` intentionally omits tangent data; tangent reconstruction is
 a required precondition for enabling normal maps in the live shader.
 4. Each model's README/license is checked before use or redistribution. Tests
@@ -864,13 +1434,54 @@ dependency belongs in the renderer library itself.
   Large-landscape coverage, smoother transitions, local-light shadows,
   blended/transmission shadows, and configurable quality remain production-raster work.
   This raster prerequisite completed before Milestone 8 began.
-- Milestone 8 is in progress at the capability/device-policy foundation. A
+- Milestone 8 is complete at the first visible hybrid effect. A
   complete supported AS/ray-query/ray-pipeline dependency set is enabled on
-  capable devices, unsupported or unfinished automatic paths fall back to
-  raster, and required mode fails explicitly. Fifteen Debug/Release tests pass;
-  Intel automatic/off raster captures are exact under Vulkan validation. No
-  BLAS, TLAS, ray shader, or ray-traced image exists yet, and the capable path
-  remains unverified until it runs on the RTX 2060 Super.
+  capable devices, unsupported or blended/additive automatic paths fall back to
+  raster, and required mode fails explicitly when its contract cannot be met.
+  Sixteen Debug/Release tests pass;
+  Intel automatic/off raster captures are exact under Vulkan validation. On the
+  RTX 2060 Super, Debug and Release each build two BLAS and one TLAS, execute
+  static and changing per-frame TLAS updates cleanly, and render deterministic
+  visible ray-query sun shadows with measurable shadows-on/off deltas. Opaque
+  and alpha-masked required paths succeed with deterministic candidate alpha
+  evaluation, while raster output remains independently certified. Dedicated
+  Release GPU timing measures the 36-instance TLAS update directly and estimates
+  the shader-integrated ray-query cost from matched PBR geometry draws.
+- The first progressive path-tracing baseline is complete: a separate mode owns
+  an aligned SBT, ray pipeline, persistent RGBA32F accumulation, deterministic
+  reset rules, one-to-four sampled diffuse/visible-GGX metallic-roughness
+  bounces with throughput-based Russian roulette, explicit throughput/PDF
+  accounting, direct-light visibility, solid-angle luminance environment
+  sampling, world-area/luminance emissive-triangle selection, complementary
+  power-heuristic MIS, opaque bindless material textures with ray-cone mip
+  selection, renderer-owned reconstruction outputs, tone mapping, and
+  capture/present integration. Reconstruction supplies accumulated beauty and
+  direct radiance (with derived indirect), albedo/roughness, packed geometric
+  and shading normals, motion, current/expected-previous device depth, world hit
+  distance, and a compute-validated geometry-history confidence mask. A second
+  compute pass reprojects and neighborhood-clips ping-ponged temporal radiance,
+  tracks ping-ponged luminance moments, and applies bounded motion/convergence
+  weighting. A third pass performs variance- and AOV-guided 3x3 spatial
+  filtering whose strength fades with progressive convergence. Raw, temporal,
+  final, weight, and variance views remain independently inspectable.
+  Debug/Release tests pass; validation-clean RTX captures verify finite
+  convergence, RMSE-0 default and depth-4 repeatability, two swapchain resets, a
+  0.769239 fixed-budget environment importance/uniform RMSE ratio, a 0.723552
+  emissive sampled/BSDF-only RMSE ratio, deterministic AOV output and lighting
+  decomposition, stationary/moving/teleport history rejection, a 0.806044
+  temporal/raw adjacent moving-frame RMSE ratio, a 0.876577 spatial/temporal
+  ratio, a 0.737758 one-sample reference-error ratio, 0.18209 ms temporal and
+  0.333075 ms spatial averages, a 4.06463 ms default-two-bounce path dispatch,
+  a 0.371332 ms emissive dispatch at 640x360, and a 2.11111 ms five-texture
+  Damaged Helmet dispatch at 1280x720.
+- The renderer-owned upscaling baseline is complete: `IUpscaler` and the
+  default `native` backend validate canonical reconstruction inputs, keep
+  render/output extents distinct in ownership, and converge raster and path
+  graphs at one timed pre-tone-mapping boundary. Implicit/explicit native output
+  is exact at RMSE 0, odd-size resize/recovery and animated path operation are
+  validation-clean, and the no-dispatch boundary measures at or below
+  0.000116 ms at 320x180. Native remains 1:1; the first scaled backend and
+  output-resolution HDR resource are the next gate.
 
 Each milestone gets a measurable scene, automated smoke path, and validation
 evidence before the next begins.

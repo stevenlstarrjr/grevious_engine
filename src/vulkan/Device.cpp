@@ -197,6 +197,7 @@ void queryOptionalProperties(VkPhysicalDevice device, OptionalCapabilities& capa
         capabilities.shaderGroupHandleSize = rayPipeline.shaderGroupHandleSize;
         capabilities.shaderGroupHandleAlignment = rayPipeline.shaderGroupHandleAlignment;
         capabilities.shaderGroupBaseAlignment = rayPipeline.shaderGroupBaseAlignment;
+        capabilities.maxShaderGroupStride = rayPipeline.maxShaderGroupStride;
     }
 }
 
@@ -421,7 +422,8 @@ Device::Device(const Instance& instance) {
                   supportedOptionalCapabilities_.maxRayRecursionDepth, ", shader-group handle ",
                   supportedOptionalCapabilities_.shaderGroupHandleSize, " bytes, alignments ",
                   supportedOptionalCapabilities_.shaderGroupHandleAlignment, '/',
-                  supportedOptionalCapabilities_.shaderGroupBaseAlignment, " bytes");
+                  supportedOptionalCapabilities_.shaderGroupBaseAlignment, " bytes; maximum stride ",
+                  supportedOptionalCapabilities_.maxShaderGroupStride, " bytes");
     }
 }
 

@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include <glm/gtc/matrix_transform.hpp>
+
 namespace {
 
 void require(bool condition, std::string_view message) {
@@ -77,6 +79,55 @@ void testMeshletVertexCapacity() {
             "Meshlet construction exceeded its 64-vertex capacity");
 }
 
+void testEmissiveTriangleDistribution() {
+    using namespace renderer::gpu_scene;
+    const std::array vertices{
+        VertexRecord{.position = {0.0F, 0.0F, 0.0F}},
+        VertexRecord{.position = {1.0F, 0.0F, 0.0F}},
+        VertexRecord{.position = {0.0F, 1.0F, 0.0F}},
+    };
+    const std::array indices{0U, 1U, 2U};
+    const std::array primitives{
+        PrimitiveRecord{.indexCount = 3U, .materialIndex = 0U}};
+    const std::array ranges{PrimitiveLodRange{.firstLod = 0U, .lodCount = 1U}};
+    const std::array sources{
+        LodSourceRecord{.primitiveIndex = 0U, .minimumProjectedDiameter = 0.0F}};
+    const glm::mat4 scaled = glm::scale(glm::mat4(1.0F), glm::vec3(2.0F));
+    const std::array transforms{
+        TransformRecord{},
+        TransformRecord{.world = scaled,
+                        .normalToWorld = glm::transpose(glm::inverse(scaled)),
+                        .previousWorld = scaled},
+    };
+    const std::array materials{
+        MaterialRecord{.emissiveAlphaCutoff = {1.0F, 1.0F, 1.0F, 0.5F}},
+        MaterialRecord{},
+    };
+    std::array instances{
+        InstanceRecord{.meshMaterial = {0U, 0U, 0U, 0U}},
+        InstanceRecord{.meshMaterial = {0U, 0U, 1U, 0U}},
+        InstanceRecord{.meshMaterial = {0U, 1U, 0U, 0U}},
+        InstanceRecord{.meshMaterial = {0U, 0U, 0U, 0U},
+                       .visibilityLayer = {1U << 20U, 0U, 0U, 0U}},
+    };
+    const EmissiveTriangleDistribution distribution = buildEmissiveTriangleDistribution(
+        vertices, indices, primitives, ranges, sources, instances, materials, transforms);
+    require(distribution.valid() && distribution.triangles.size() == 2U,
+            "Emissive distribution did not retain both emitting instances");
+    require(std::abs(distribution.triangles[0].sampling.y - 0.2F) < 1.0e-6F &&
+                std::abs(distribution.triangles[1].sampling.y - 0.8F) < 1.0e-6F &&
+                distribution.triangles[0].sampling.x == distribution.triangles[0].sampling.y &&
+                distribution.triangles[1].sampling.x == 1.0F,
+            "Emissive distribution is not world-area/luminance weighted");
+    require(instances[0].visibilityLayer.z == 0U && instances[0].visibilityLayer.w == 1U &&
+                instances[1].visibilityLayer.z == 1U && instances[1].visibilityLayer.w == 1U &&
+                instances[2].visibilityLayer.z == invalidEmissiveTriangleIndex &&
+                instances[2].visibilityLayer.w == 0U &&
+                instances[3].visibilityLayer.z == invalidEmissiveTriangleIndex &&
+                instances[3].visibilityLayer.w == 0U,
+            "Emissive instance lookup metadata is incorrect");
+}
+
 } // namespace
 
 int main() {
@@ -109,6 +160,7 @@ int main() {
         }
         testMeshletLodWorkGeneration();
         testMeshletVertexCapacity();
+        testEmissiveTriangleDistribution();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

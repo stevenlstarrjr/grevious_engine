@@ -27,6 +27,18 @@ ShadowBackendSelection selectShadowBackend(Request request, const Capabilities& 
     };
 }
 
+ShadowBackendSelection requireSceneCompatibility(Request request,
+                                                  ShadowBackendSelection selection,
+                                                  bool sceneCompatible) {
+    if (selection.backend != ShadowBackend::rayQuery || sceneCompatible) {
+        return selection;
+    }
+    return {
+        .accepted = request != Request::required,
+        .reason = SelectionReason::sceneUnsupported,
+    };
+}
+
 std::string_view backendName(ShadowBackend backend) {
     switch (backend) {
     case ShadowBackend::raster:
@@ -45,6 +57,8 @@ std::string_view selectionReason(SelectionReason reason) {
         return "acceleration structures and ray queries are unavailable";
     case SelectionReason::backendUnavailable:
         return "the GPU is capable but the ray-query shadow backend is not implemented yet";
+    case SelectionReason::sceneUnsupported:
+        return "the ray-query shadow backend does not support blended or additive geometry";
     case SelectionReason::rayQuerySelected:
         return "the ray-query backend is available";
     }

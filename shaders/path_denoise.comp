@@ -1,0 +1,132 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D temporalRadiance;
+layout(set = 0, binding = 1) uniform sampler2D surfaceAov;
+layout(set = 0, binding = 2) uniform sampler2D normalAov;
+layout(set = 0, binding = 3) uniform sampler2D motionDepthAov;
+layout(set = 0, binding = 4) uniform sampler2D depthAov;
+layout(set = 0, binding = 5) uniform sampler2D temporalMoments;
+// Alpha stores temporal luminance variance for diagnostics.
+layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D outputRadiance;
+
+layout(push_constant) uniform PathDenoisingControls
+{
+    uint sampleIndex;
+} controls;
+
+bool finiteVector(vec4 value)
+{
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 decodeOctahedralNormal(vec2 encoded)
+{
+    vec2 value = encoded * 2.0 - 1.0;
+    vec3 normal = vec3(value, 1.0 - abs(value.x) - abs(value.y));
+    if (normal.z < 0.0) {
+        vec2 signs = vec2(normal.x >= 0.0 ? 1.0 : -1.0,
+                          normal.y >= 0.0 ? 1.0 : -1.0);
+        normal.xy = (vec2(1.0) - abs(normal.yx)) * signs;
+    }
+    return normalize(normal);
+}
+
+float luminance(vec3 color)
+{
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 sanitizedRadiance(ivec2 coordinate)
+{
+    vec4 radiance = texelFetch(temporalRadiance, coordinate, 0);
+    return finiteVector(radiance) ? max(radiance.rgb, vec3(0.0)) : vec3(0.0);
+}
+
+float temporalVariance(ivec2 coordinate)
+{
+    vec2 moments = texelFetch(temporalMoments, coordinate, 0).rg;
+    if (any(isnan(moments)) || any(isinf(moments))) {
+        return 0.0;
+    }
+    return clamp(moments.y - moments.x * moments.x, 0.0, 65504.0);
+}
+
+void main()
+{
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputRadiance);
+    if (any(greaterThanEqual(coordinate, size))) {
+        return;
+    }
+
+    vec3 centerColor = sanitizedRadiance(coordinate);
+    vec4 centerSurface = texelFetch(surfaceAov, coordinate, 0);
+    vec4 centerNormalPacked = texelFetch(normalAov, coordinate, 0);
+    vec4 centerMotionDepth = texelFetch(motionDepthAov, coordinate, 0);
+    float centerDepth = texelFetch(depthAov, coordinate, 0).r;
+    bool centerIsSurface = finiteVector(centerMotionDepth) && centerMotionDepth.w > 0.0;
+    float centerVariance = temporalVariance(coordinate);
+    float centerLuminance = luminance(centerColor);
+    vec3 centerNormal = centerIsSurface && finiteVector(centerNormalPacked)
+                            ? decodeOctahedralNormal(centerNormalPacked.xy)
+                            : vec3(0.0, 0.0, 1.0);
+
+    vec3 filtered = vec3(0.0);
+    float totalWeight = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 neighbor = clamp(coordinate + ivec2(x, y), ivec2(0), size - 1);
+            vec3 neighborColor = sanitizedRadiance(neighbor);
+            vec4 neighborSurface = texelFetch(surfaceAov, neighbor, 0);
+            vec4 neighborNormalPacked = texelFetch(normalAov, neighbor, 0);
+            vec4 neighborMotionDepth = texelFetch(motionDepthAov, neighbor, 0);
+            float neighborDepth = texelFetch(depthAov, neighbor, 0).r;
+            bool neighborIsSurface = finiteVector(neighborMotionDepth) &&
+                                     neighborMotionDepth.w > 0.0;
+            if (centerIsSurface != neighborIsSurface) {
+                continue;
+            }
+
+            float kernelWeight = (x == 0 && y == 0) ? 1.0
+                               : (x == 0 || y == 0) ? 0.5
+                                                    : 0.25;
+            float neighborVariance = temporalVariance(neighbor);
+            float neighborLuminance = luminance(neighborColor);
+            float luminanceScale = 0.10 +
+                0.35 * max(centerLuminance, neighborLuminance) +
+                4.0 * sqrt(max(centerVariance, neighborVariance) + 1.0e-5);
+            float weight = kernelWeight *
+                exp(-abs(neighborLuminance - centerLuminance) /
+                    max(luminanceScale, 1.0e-4));
+
+            if (centerIsSurface) {
+                if (!finiteVector(centerSurface) || !finiteVector(neighborSurface) ||
+                    !finiteVector(neighborNormalPacked) || isnan(centerDepth) ||
+                    isinf(centerDepth) || isnan(neighborDepth) || isinf(neighborDepth)) {
+                    continue;
+                }
+                vec3 neighborNormal = decodeOctahedralNormal(neighborNormalPacked.xy);
+                float normalWeight = exp(-max(1.0 - dot(centerNormal, neighborNormal), 0.0) * 64.0);
+                float albedoWeight = exp(-length(centerSurface.rgb - neighborSurface.rgb) * 6.0);
+                float roughnessWeight = exp(-abs(centerSurface.a - neighborSurface.a) * 4.0);
+                float depthWeight = exp(-abs(centerDepth - neighborDepth) / 0.0015);
+                float distanceScale = max(centerMotionDepth.w * 0.05, 1.0e-3);
+                float distanceWeight = exp(-abs(centerMotionDepth.w - neighborMotionDepth.w) /
+                                           distanceScale);
+                weight *= normalWeight * albedoWeight * roughnessWeight *
+                          depthWeight * distanceWeight;
+            }
+
+            filtered += neighborColor * weight;
+            totalWeight += weight;
+        }
+    }
+
+    filtered = totalWeight > 1.0e-6 ? filtered / totalWeight : centerColor;
+    float filterStrength = clamp(4.0 / (float(controls.sampleIndex) + 4.0), 0.0, 1.0);
+    vec3 result = mix(centerColor, filtered, filterStrength);
+    imageStore(outputRadiance, coordinate,
+               vec4(max(result, vec3(0.0)), centerVariance));
+}

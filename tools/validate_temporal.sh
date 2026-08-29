@@ -10,7 +10,7 @@ teleport_capture="${output_dir}/teleport_rejection.png"
 cmake --build "${build_dir}" -j4
 mkdir -p "${output_dir}"
 
-env SDL_VIDEODRIVER=wayland "${build_dir}/bin/renderer_demo" \
+env SDL_VIDEODRIVER=wayland "${build_dir}/bin/genesis_render" \
     --taa on \
     --debug-view history-validity \
     --frames 8 \
@@ -18,7 +18,7 @@ env SDL_VIDEODRIVER=wayland "${build_dir}/bin/renderer_demo" \
     --capture-frame 8 \
     --validation required
 
-env SDL_VIDEODRIVER=wayland "${build_dir}/bin/renderer_demo" \
+env SDL_VIDEODRIVER=wayland "${build_dir}/bin/genesis_render" \
     --taa on \
     --camera-script teleport \
     --debug-view history-validity \
@@ -27,7 +27,7 @@ env SDL_VIDEODRIVER=wayland "${build_dir}/bin/renderer_demo" \
     --capture-frame 3 \
     --validation required
 
-env SDL_VIDEODRIVER=wayland "${build_dir}/bin/renderer_demo" \
+env SDL_VIDEODRIVER=wayland "${build_dir}/bin/genesis_render" \
     --taa on \
     --resize-script \
     --frames 12 \

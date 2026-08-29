@@ -2,6 +2,7 @@
 
 #include <volk.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -46,6 +47,8 @@ int main() {
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "mesh.vert.spv"));
         const auto fragment =
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "mesh.frag.spv"));
+        const auto rayQueryFragment = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "mesh_ray_query.frag.spv"));
         const auto shadowVertex =
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "shadow.vert.spv"));
         const auto shadowFragment =
@@ -76,6 +79,20 @@ int main() {
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "tonemap.frag.spv"));
         const auto taaFragment =
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "taa.frag.spv"));
+        const auto pathRayGeneration = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "path_trace.rgen.spv"));
+        const auto pathRadianceMiss = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "path_trace.rmiss.spv"));
+        const auto pathShadowMiss = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "path_trace_shadow.rmiss.spv"));
+        const auto pathClosestHit = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "path_trace.rchit.spv"));
+        const auto pathHistory = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "path_history.comp.spv"));
+        const auto pathReconstruction = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "path_reconstruct.comp.spv"));
+        const auto pathDenoising = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "path_denoise.comp.spv"));
 
         require(vertex.stage == VK_SHADER_STAGE_VERTEX_BIT, "Vertex stage reflection failed");
         require(vertex.inputLocations == std::vector<std::uint32_t>{0, 1, 2, 3, 4},
@@ -117,6 +134,36 @@ int main() {
                         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     "PBR image descriptor reflection failed");
         }
+        require(rayQueryFragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT,
+                "Ray-query fragment stage reflection failed");
+        require(rayQueryFragment.descriptorBindings.size() == 11 &&
+                    rayQueryFragment.descriptorBindings[0].binding == 0 &&
+                    rayQueryFragment.descriptorBindings[0].type ==
+                        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                    rayQueryFragment.descriptorBindings[4].binding == 6 &&
+                    rayQueryFragment.descriptorBindings[4].type ==
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                    rayQueryFragment.descriptorBindings[5].binding == 8 &&
+                    rayQueryFragment.descriptorBindings[5].type ==
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                    rayQueryFragment.descriptorBindings[6].set == 0 &&
+                    rayQueryFragment.descriptorBindings[6].binding == 11 &&
+                    rayQueryFragment.descriptorBindings[6].type ==
+                        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
+                    rayQueryFragment.descriptorBindings[6].count == 1 &&
+                    rayQueryFragment.descriptorBindings[7].binding == 12 &&
+                    rayQueryFragment.descriptorBindings[7].type ==
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                    rayQueryFragment.descriptorBindings[8].binding == 13 &&
+                    rayQueryFragment.descriptorBindings[8].type ==
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                    rayQueryFragment.descriptorBindings[9].binding == 14 &&
+                    rayQueryFragment.descriptorBindings[9].type ==
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                    rayQueryFragment.descriptorBindings[10].set == 1 &&
+                    rayQueryFragment.descriptorBindings[10].binding == 0 &&
+                    rayQueryFragment.descriptorBindings[10].count == 0,
+                "Ray-query PBR descriptor reflection failed");
         require(shadowVertex.stage == VK_SHADER_STAGE_VERTEX_BIT &&
                     shadowVertex.inputLocations == std::vector<std::uint32_t>{0, 2, 4} &&
                     shadowVertex.descriptorBindings.size() == 4 &&
@@ -243,6 +290,87 @@ int main() {
                     toneMappingFragment.descriptorBindings[3].type ==
                         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 "Tone-mapping fragment reflection failed");
+        require(pathRayGeneration.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR &&
+                    pathRadianceMiss.stage == VK_SHADER_STAGE_MISS_BIT_KHR &&
+                    pathShadowMiss.stage == VK_SHADER_STAGE_MISS_BIT_KHR &&
+                    pathClosestHit.stage == VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+                "Path-tracing shader-stage reflection failed");
+        const std::array<const renderer::vulkan::ShaderReflection*, 4> pathReflections{
+            &pathRayGeneration, &pathRadianceMiss, &pathShadowMiss, &pathClosestHit};
+        const auto pathBindings = renderer::vulkan::mergeDescriptorBindings(pathReflections);
+        constexpr std::array pathTypes{
+            VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        };
+        require(pathBindings.size() == pathTypes.size() + 1U,
+                "Path-tracing descriptor count is incorrect");
+        for (std::size_t index = 0; index < pathTypes.size(); ++index) {
+            require(pathBindings[index].set == 0U && pathBindings[index].binding == index &&
+                        pathBindings[index].type == pathTypes[index] &&
+                        pathBindings[index].count == 1U,
+                    "Path-tracing descriptor interface is incorrect");
+        }
+        require(pathBindings.back().set == 1U && pathBindings.back().binding == 0U &&
+                    pathBindings.back().type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                    pathBindings.back().count == 0U &&
+                    (pathBindings.back().stages & VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) != 0U,
+                "Path-tracing bindless material interface is incorrect");
+        require(pathHistory.stage == VK_SHADER_STAGE_COMPUTE_BIT &&
+                    pathHistory.descriptorBindings.size() == 8U,
+                "Path-history shader reflection failed");
+        for (std::size_t index = 0U; index < pathHistory.descriptorBindings.size(); ++index) {
+            const VkDescriptorType expectedType =
+                index < 5U ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            require(pathHistory.descriptorBindings[index].set == 0U &&
+                        pathHistory.descriptorBindings[index].binding == index &&
+                        pathHistory.descriptorBindings[index].type == expectedType &&
+                        pathHistory.descriptorBindings[index].count == 1U,
+                    "Path-history descriptor interface is incorrect");
+        }
+        require(pathReconstruction.stage == VK_SHADER_STAGE_COMPUTE_BIT &&
+                    pathReconstruction.descriptorBindings.size() == 7U,
+                "Path-reconstruction shader reflection failed");
+        for (std::size_t index = 0U;
+             index < pathReconstruction.descriptorBindings.size(); ++index) {
+            const VkDescriptorType expectedType =
+                index < 5U ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            require(pathReconstruction.descriptorBindings[index].set == 0U &&
+                        pathReconstruction.descriptorBindings[index].binding == index &&
+                        pathReconstruction.descriptorBindings[index].type == expectedType &&
+                        pathReconstruction.descriptorBindings[index].count == 1U,
+                    "Path-reconstruction descriptor interface is incorrect");
+        }
+        require(pathDenoising.stage == VK_SHADER_STAGE_COMPUTE_BIT &&
+                    pathDenoising.descriptorBindings.size() == 7U,
+                "Path-denoising shader reflection failed");
+        for (std::size_t index = 0U;
+             index < pathDenoising.descriptorBindings.size(); ++index) {
+            const VkDescriptorType expectedType =
+                index < 6U ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                           : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            require(pathDenoising.descriptorBindings[index].set == 0U &&
+                        pathDenoising.descriptorBindings[index].binding == index &&
+                        pathDenoising.descriptorBindings[index].type == expectedType &&
+                        pathDenoising.descriptorBindings[index].count == 1U,
+                    "Path-denoising descriptor interface is incorrect");
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

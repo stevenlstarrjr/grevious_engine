@@ -1,5 +1,5 @@
-#ifndef BLOXEL_SHADOWS_GLSL
-#define BLOXEL_SHADOWS_GLSL
+#ifndef GENESIS_RENDER_SHADOWS_GLSL
+#define GENESIS_RENDER_SHADOWS_GLSL
 
 vec3 directionalShadowCoordinate(vec3 worldPosition, vec3 lightTravelDirection,
                                  vec4 sceneCenterRadius, float depthRadius)

@@ -25,8 +25,9 @@ namespace renderer::gpu_scene {
 struct alignas(16) InstanceRecord {
     glm::vec4 centerRadius{0.0F};
     glm::uvec4 meshMaterial{0U};
-    // Low/high 32-bit words of RenderLayerMask; zw are reserved. Splitting the
-    // mask avoids making optional shaderInt64 a renderer requirement.
+    // Low/high 32-bit words of RenderLayerMask. z/w identify the first
+    // emissive-triangle light and triangle count when this instance emits.
+    // Splitting the mask avoids making optional shaderInt64 a requirement.
     glm::uvec4 visibilityLayer{static_cast<std::uint32_t>(defaultInstanceRenderLayerMask), 0U, 0U,
                                0U};
 };
@@ -120,6 +121,20 @@ struct alignas(16) MaterialRecord {
     glm::uvec4 textureState{0U};
 };
 
+// One record per triangle in an emissive instance's finest resident RT LOD.
+// identity is instance index, local triangle index, material index, reserved.
+// sampling is normalized CDF, selection probability, world area, power proxy.
+struct alignas(16) EmissiveTriangleRecord {
+    glm::uvec4 identity{0U};
+    glm::vec4 sampling{0.0F};
+};
+
+struct EmissiveTriangleDistribution {
+    std::vector<EmissiveTriangleRecord> triangles;
+
+    [[nodiscard]] bool valid() const;
+};
+
 enum MaterialTextureBit : std::uint32_t {
     baseColorTextureBit = 1U << 0U,
     metallicRoughnessTextureBit = 1U << 1U,
@@ -136,6 +151,7 @@ enum MaterialFlag : std::uint32_t {
 };
 
 inline constexpr std::uint32_t invalidTextureDescriptor = ~std::uint32_t{0};
+inline constexpr std::uint32_t invalidEmissiveTriangleIndex = ~std::uint32_t{0};
 
 struct DrawIndexedIndirectRecord {
     std::uint32_t indexCount = 0;
@@ -195,6 +211,11 @@ static_assert(offsetof(InstanceRecord, meshMaterial) == 16);
 static_assert(offsetof(InstanceRecord, visibilityLayer) == 32);
 static_assert(sizeof(InstanceRecord) == 12 * sizeof(float));
 static_assert(alignof(InstanceRecord) == 16);
+static_assert(offsetof(VertexRecord, position) == 0);
+static_assert(offsetof(VertexRecord, normal) == 3 * sizeof(float));
+static_assert(offsetof(VertexRecord, uv0) == 6 * sizeof(float));
+static_assert(offsetof(VertexRecord, tangent) == 8 * sizeof(float));
+static_assert(offsetof(VertexRecord, uv1) == 12 * sizeof(float));
 static_assert(sizeof(VertexRecord) == 14 * sizeof(float));
 static_assert(sizeof(TransformRecord) == 48 * sizeof(float));
 static_assert(alignof(TransformRecord) == 16);
@@ -210,6 +231,8 @@ static_assert(sizeof(MeshletWorkRecord) == 8 * sizeof(std::uint32_t));
 static_assert(alignof(MeshletWorkRecord) == 16);
 static_assert(sizeof(MaterialRecord) == 20 * sizeof(float));
 static_assert(alignof(MaterialRecord) == 16);
+static_assert(sizeof(EmissiveTriangleRecord) == 8 * sizeof(std::uint32_t));
+static_assert(alignof(EmissiveTriangleRecord) == 16);
 static_assert(sizeof(DrawIndexedIndirectRecord) == 5 * sizeof(std::uint32_t));
 
 [[nodiscard]] SceneRecords makePbrSphereGrid();
@@ -221,6 +244,13 @@ packMaterials(const scene::Scene& scene,
               std::span<const std::uint32_t> textureDescriptorIndices = {});
 [[nodiscard]] PackedScene packScene(const scene::Scene& scene,
                                     std::span<const std::uint32_t> textureDescriptorIndices = {});
+[[nodiscard]] EmissiveTriangleDistribution buildEmissiveTriangleDistribution(
+    std::span<const VertexRecord> vertices, std::span<const std::uint32_t> indices,
+    std::span<const PrimitiveRecord> primitives,
+    std::span<const PrimitiveLodRange> primitiveLods,
+    std::span<const LodSourceRecord> lodSources, std::span<InstanceRecord> instances,
+    std::span<const MaterialRecord> materials, std::span<const TransformRecord> transforms,
+    RenderLayerMask viewMask = defaultViewVisibilityMask);
 [[nodiscard]] MeshletHierarchy buildMeshletHierarchy(
     std::span<const VertexRecord> vertices, std::span<const std::uint32_t> indices,
     std::span<const PrimitiveRecord> primitives, std::span<const PrimitiveLodRange> primitiveLods,

@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <limits>
 #include <numbers>
 #include <stdexcept>
 #include <string>
@@ -35,6 +37,11 @@ bool close(const glm::vec3& lhs, const glm::vec3& rhs, float tolerance = 1.0e-5F
            close(lhs.z, rhs.z, tolerance);
 }
 
+bool closeRelative(const glm::vec3& lhs, const glm::vec3& rhs, float tolerance = 1.0e-5F) {
+    return closeRelative(lhs.x, rhs.x, tolerance) && closeRelative(lhs.y, rhs.y, tolerance) &&
+           closeRelative(lhs.z, rhs.z, tolerance);
+}
+
 bool finiteNonNegative(const glm::vec3& value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z) &&
            value.x >= 0.0F && value.y >= 0.0F && value.z >= 0.0F;
@@ -59,6 +66,24 @@ float pbrtIsotropicSmithLambda(float normalDotDirection, float alpha) {
     const float cosineSquared = normalDotDirection * normalDotDirection;
     const float tangentSquared = (1.0F - cosineSquared) / cosineSquared;
     return (std::sqrt(1.0F + alpha * alpha * tangentSquared) - 1.0F) * 0.5F;
+}
+
+std::uint32_t sampleHash(std::uint32_t value) {
+    value ^= value >> 16U;
+    value *= 0x7feb352dU;
+    value ^= value >> 15U;
+    value *= 0x846ca68bU;
+    value ^= value >> 16U;
+    return value;
+}
+
+float unitSample(std::uint32_t value) {
+    return static_cast<float>(sampleHash(value) >> 8U) * (1.0F / 16777216.0F);
+}
+
+glm::vec3 bsdfRandomSample(std::uint32_t index) {
+    return {unitSample(index ^ 0x68bc21ebU), unitSample(index ^ 0x02e5be93U),
+            unitSample(index ^ 0x967a889bU)};
 }
 
 void testTrowbridgeReitzAndSmithReferenceValues() {
@@ -178,6 +203,139 @@ void testWhiteFurnaceEnergyBound() {
     }
 }
 
+void testSampledBsdfPdfAccounting() {
+    constexpr std::array materials{
+        rm::MetallicRoughnessSample{
+            .baseColor = {0.9F, 0.8F, 0.7F}, .metallic = 0.0F, .perceptualRoughness = 0.65F},
+        rm::MetallicRoughnessSample{
+            .baseColor = {0.9F, 0.6F, 0.2F}, .metallic = 1.0F, .perceptualRoughness = 0.35F},
+        rm::MetallicRoughnessSample{
+            .baseColor = {0.7F, 0.2F, 0.1F}, .metallic = 0.55F, .perceptualRoughness = 0.8F},
+    };
+    const glm::vec3 normal(0.0F, 0.0F, 1.0F);
+    constexpr std::uint32_t sampleCount = 16'384U;
+    for (std::size_t materialIndex = 0; materialIndex < materials.size(); ++materialIndex) {
+        const glm::vec3 view = materialIndex == 2
+                                   ? glm::normalize(glm::vec3(0.75F, -0.2F, 0.63F))
+                                   : normal;
+        const float specularProbability =
+            rm::metallicRoughnessSpecularSampleProbability(materials[materialIndex], normal, view);
+        require(std::isfinite(specularProbability) && specularProbability >= 0.05F &&
+                    specularProbability <= 0.95F,
+                "BSDF lobe-selection probability is invalid");
+
+        std::uint32_t validSamples = 0U;
+        for (std::uint32_t index = 0; index < sampleCount; ++index) {
+            const auto sample = rm::sampleMetallicRoughnessBsdf(
+                materials[materialIndex], normal, view,
+                bsdfRandomSample(index + static_cast<std::uint32_t>(materialIndex) * sampleCount));
+            if (sample.pdf == 0.0F) {
+                continue;
+            }
+            ++validSamples;
+            require(std::isfinite(sample.pdf) && sample.pdf > 0.0F &&
+                        finiteNonNegative(sample.throughput) &&
+                        close(glm::dot(sample.direction, sample.direction), 1.0F, 2.0e-5F) &&
+                        glm::dot(normal, sample.direction) > 0.0F,
+                    "Sampled BSDF produced an invalid direction, PDF, or throughput");
+            const float evaluatedPdf = rm::metallicRoughnessSamplePdf(
+                materials[materialIndex], normal, view, sample.direction);
+            require(closeRelative(sample.pdf, evaluatedPdf, 2.0e-5F),
+                    "Stored BSDF PDF differs from mixture PDF evaluation");
+            const glm::vec3 expected = rm::evaluateMetallicRoughnessBrdf(
+                                           materials[materialIndex], normal, view, sample.direction) *
+                                       glm::dot(normal, sample.direction);
+            require(closeRelative(sample.throughput * sample.pdf, expected, 2.0e-4F),
+                    "BSDF throughput does not equal f * absDot / PDF");
+        }
+        require(validSamples > sampleCount / 3U,
+                "Visible-GGX rejection discarded an unreasonable number of samples");
+    }
+
+    const rm::MetallicRoughnessSample whiteDiffuse{
+        .baseColor = {1.0F, 1.0F, 1.0F}, .metallic = 0.0F, .perceptualRoughness = 0.5F};
+    const rm::MetallicRoughnessSample polishedMetal{
+        .baseColor = {0.9F, 0.7F, 0.3F}, .metallic = 1.0F, .perceptualRoughness = 0.2F};
+    const float diffuseProbability =
+        rm::metallicRoughnessSpecularSampleProbability(whiteDiffuse, normal, normal);
+    const float metalProbability =
+        rm::metallicRoughnessSpecularSampleProbability(polishedMetal, normal, normal);
+    const float grazingProbability = rm::metallicRoughnessSpecularSampleProbability(
+        whiteDiffuse, normal, glm::normalize(glm::vec3(1.0F, 0.0F, 0.08F)));
+    require(metalProbability > diffuseProbability && grazingProbability > diffuseProbability,
+            "Lobe selection does not favor metallic and grazing specular transport");
+}
+
+void testSampledBsdfMatchesReferenceIntegration() {
+    constexpr std::array materials{
+        rm::MetallicRoughnessSample{
+            .baseColor = {0.8F, 0.6F, 0.3F}, .metallic = 0.0F, .perceptualRoughness = 0.65F},
+        rm::MetallicRoughnessSample{
+            .baseColor = {0.75F, 0.5F, 0.2F}, .metallic = 1.0F, .perceptualRoughness = 0.55F},
+    };
+    constexpr std::uint32_t sampleCount = 131'072U;
+    const glm::vec3 normal(0.0F, 0.0F, 1.0F);
+    for (std::size_t materialIndex = 0; materialIndex < materials.size(); ++materialIndex) {
+        glm::vec3 estimate(0.0F);
+        for (std::uint32_t index = 0; index < sampleCount; ++index) {
+            const auto sample = rm::sampleMetallicRoughnessBsdf(
+                materials[materialIndex], normal, normal,
+                bsdfRandomSample(index + static_cast<std::uint32_t>(materialIndex) * sampleCount));
+            estimate += sample.throughput;
+        }
+        estimate /= static_cast<float>(sampleCount);
+        const glm::vec3 reference = integrateDirectionalHemisphericalReflectance(
+            materials[materialIndex]);
+        require(close(estimate, reference, 0.012F),
+                "Sampled BSDF estimator disagrees with reference hemispherical integration");
+    }
+}
+
+void testPathRussianRouletteSurvivalProbability() {
+    require(close(rm::pathRussianRouletteSurvivalProbability(glm::vec3(0.0F)), 0.0F) &&
+                close(rm::pathRussianRouletteSurvivalProbability(
+                          glm::vec3(-0.5F, -0.1F, 0.0F)),
+                      0.0F),
+            "Russian roulette did not reject nonpositive throughput");
+    require(close(rm::pathRussianRouletteSurvivalProbability(
+                      glm::vec3(0.01F, 0.02F, 0.03F)),
+                  0.05F) &&
+                close(rm::pathRussianRouletteSurvivalProbability(
+                          glm::vec3(0.1F, 0.4F, 0.2F)),
+                      0.4F) &&
+                close(rm::pathRussianRouletteSurvivalProbability(
+                          glm::vec3(0.99F, 0.2F, 0.1F)),
+                      0.95F) &&
+                close(rm::pathRussianRouletteSurvivalProbability(
+                          glm::vec3(1.0F, 0.2F, 0.1F)),
+                      1.0F),
+            "Russian roulette survival probability violated its bounds");
+    require(close(rm::pathRussianRouletteSurvivalProbability(
+                      glm::vec3(std::numeric_limits<float>::infinity())),
+                  0.0F) &&
+                close(rm::pathRussianRouletteSurvivalProbability(
+                          glm::vec3(std::numeric_limits<float>::quiet_NaN())),
+                      0.0F),
+            "Russian roulette accepted nonfinite throughput");
+
+    const glm::vec3 throughput(0.2F, 0.4F, 0.1F);
+    const float survival = rm::pathRussianRouletteSurvivalProbability(throughput);
+    require(close(throughput / survival * survival, throughput),
+            "Russian roulette survival compensation is biased");
+}
+
+void testAreaLightSolidAnglePdf() {
+    require(close(rm::areaLightSolidAnglePdf(0.25F, 2.0F, 16.0F, 0.5F), 4.0F),
+            "Area-light density did not convert to solid angle");
+    require(close(rm::areaLightSolidAnglePdf(0.0F, 2.0F, 16.0F, 0.5F), 0.0F) &&
+                close(rm::areaLightSolidAnglePdf(0.25F, 0.0F, 16.0F, 0.5F), 0.0F) &&
+                close(rm::areaLightSolidAnglePdf(0.25F, 2.0F, 16.0F, 0.0F), 0.0F) &&
+                close(rm::areaLightSolidAnglePdf(
+                          std::numeric_limits<float>::quiet_NaN(), 2.0F, 16.0F, 0.5F),
+                      0.0F),
+            "Area-light density accepted a singular or nonfinite input");
+}
+
 void testLightUnitsAndHdrPreservation() {
     require(close(rm::inverseSquareAttenuation(2.0F), 0.25F) &&
                 close(rm::inverseSquareAttenuation(4.0F), 0.0625F),
@@ -205,6 +363,10 @@ int main() {
         testFresnelEndpointsAndExactReference();
         testReciprocityAndFiniteEdgeCases();
         testWhiteFurnaceEnergyBound();
+        testSampledBsdfPdfAccounting();
+        testSampledBsdfMatchesReferenceIntegration();
+        testPathRussianRouletteSurvivalProbability();
+        testAreaLightSolidAnglePdf();
         testLightUnitsAndHdrPreservation();
         return 0;
     } catch (const std::exception& error) {

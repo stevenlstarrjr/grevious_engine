@@ -20,6 +20,7 @@ enum class SelectionReason {
     explicitlyDisabled,
     hardwareUnavailable,
     backendUnavailable,
+    sceneUnsupported,
     rayQuerySelected,
 };
 
@@ -38,6 +39,8 @@ struct ShadowBackendSelection {
 [[nodiscard]] ShadowBackendSelection selectShadowBackend(Request request,
                                                          const Capabilities& capabilities,
                                                          bool rayQueryBackendImplemented);
+[[nodiscard]] ShadowBackendSelection requireSceneCompatibility(
+    Request request, ShadowBackendSelection selection, bool sceneCompatible);
 [[nodiscard]] std::string_view backendName(ShadowBackend backend);
 [[nodiscard]] std::string_view selectionReason(SelectionReason reason);
 

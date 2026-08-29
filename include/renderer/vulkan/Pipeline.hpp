@@ -3,11 +3,14 @@
 #include <volk.h>
 
 #include <filesystem>
+#include <memory>
 #include <span>
 
 namespace renderer::vulkan {
 
 class Device;
+class Buffer;
+class MemoryAllocator;
 class ShaderModule;
 
 class PipelineCache final {
@@ -90,6 +93,53 @@ class ComputePipeline final {
     const Device& device_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+};
+
+struct RayTracingPipelineCreateInfo {
+    const ShaderModule* rayGenerationShader = nullptr;
+    std::span<const ShaderModule* const> missShaders{};
+    // Null entries create shaderless hit groups, which are useful for shadow rays
+    // traced with VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR.
+    std::span<const ShaderModule* const> closestHitShaders{};
+    std::uint32_t maxRecursionDepth = 1;
+    VkPipelineCache cache = VK_NULL_HANDLE;
+    std::span<const VkDescriptorSetLayout> descriptorSetLayouts{};
+    std::span<const VkPushConstantRange> pushConstantRanges{};
+};
+
+class RayTracingPipeline final {
+  public:
+    RayTracingPipeline(const Device& device, MemoryAllocator& allocator,
+                       const RayTracingPipelineCreateInfo& createInfo);
+    ~RayTracingPipeline();
+
+    RayTracingPipeline(const RayTracingPipeline&) = delete;
+    RayTracingPipeline& operator=(const RayTracingPipeline&) = delete;
+
+    [[nodiscard]] VkPipeline handle() const { return pipeline_; }
+    [[nodiscard]] VkPipelineLayout layout() const { return layout_; }
+    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& rayGenerationRegion() const {
+        return rayGenerationRegion_;
+    }
+    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& missRegion() const {
+        return missRegion_;
+    }
+    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& hitRegion() const {
+        return hitRegion_;
+    }
+    [[nodiscard]] const VkStridedDeviceAddressRegionKHR& callableRegion() const {
+        return callableRegion_;
+    }
+
+  private:
+    const Device& device_;
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+    VkPipeline pipeline_ = VK_NULL_HANDLE;
+    std::unique_ptr<Buffer> shaderBindingTable_;
+    VkStridedDeviceAddressRegionKHR rayGenerationRegion_{};
+    VkStridedDeviceAddressRegionKHR missRegion_{};
+    VkStridedDeviceAddressRegionKHR hitRegion_{};
+    VkStridedDeviceAddressRegionKHR callableRegion_{};
 };
 
 } // namespace renderer::vulkan

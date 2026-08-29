@@ -187,10 +187,74 @@ void testTemporalRejectionAndClipping() {
     require(close(renderer::temporal::temporalHistoryWeight({}, 1920, 1080), 0.92F) &&
                 close(renderer::temporal::temporalHistoryWeight({1.0F, 0.0F}, 1920, 1080), 0.10F),
             "Motion-adaptive history weights differ from the shader convention");
+    require(close(renderer::temporal::pathReconstructionHistoryWeight({}, 1920, 1080, 0U),
+                  0.80F) &&
+                close(renderer::temporal::pathReconstructionHistoryWeight({}, 1920, 1080, 15U),
+                      0.20F) &&
+                close(renderer::temporal::pathReconstructionHistoryWeight(
+                          {1.0F, 0.0F}, 1920, 1080, 0U),
+                      0.10F),
+            "Path reconstruction weights differ from the shader convention");
+    require(glm::length(renderer::temporal::pathTemporalMoments(4.0F, {2.0F, 5.0F}, 0.0F) -
+                        glm::vec2(4.0F, 16.0F)) < 1.0e-6F &&
+                glm::length(renderer::temporal::pathTemporalMoments(
+                                4.0F, {2.0F, 5.0F}, 0.5F) -
+                            glm::vec2(3.0F, 10.5F)) < 1.0e-6F &&
+                close(renderer::temporal::pathTemporalVariance({3.0F, 10.5F}), 1.5F),
+            "Path temporal moment tracking differs from the shader convention");
+    require(close(renderer::temporal::pathSpatialFilterStrength(0U), 1.0F) &&
+                close(renderer::temporal::pathSpatialFilterStrength(12U), 0.25F) &&
+                renderer::temporal::pathSpatialFilterStrength(1024U) < 0.004F,
+            "Path spatial filter strength does not fade with progressive convergence");
     const glm::vec3 clipped = renderer::temporal::clipHistoryColor(
         {4.0F, -1.0F, 0.5F}, {0.1F, 0.2F, 0.3F}, {1.0F, 1.5F, 0.8F});
     require(glm::length(clipped - glm::vec3(1.0F, 0.2F, 0.5F)) < 1.0e-6F,
             "Neighborhood color clipping is incorrect");
+}
+
+void testPathHistoryRejection() {
+    renderer::temporal::PathHistoryRejectionInput sample{
+        .historyValid = true,
+        .motionValid = true,
+        .previousUv = {0.5F, 0.5F},
+        .expectedPreviousDepth = 0.65F,
+        .historyDepth = 0.6505F,
+        .depthThreshold = 0.001F,
+        .currentGeometricNormal = {0.0F, 0.0F, 1.0F},
+        .historyGeometricNormal = {0.0F, 0.1F, 0.995F},
+        .currentSurface = true,
+        .historySurface = true,
+    };
+    require(renderer::temporal::acceptsPathHistory(sample),
+            "Stable path surface history was rejected");
+
+    sample.historyDepth = 0.66F;
+    require(!renderer::temporal::acceptsPathHistory(sample),
+            "Path history accepted a depth disocclusion");
+    sample.historyDepth = 0.6505F;
+    sample.historyGeometricNormal = {1.0F, 0.0F, 0.0F};
+    require(!renderer::temporal::acceptsPathHistory(sample),
+            "Path history accepted a geometric-normal discontinuity");
+    sample.historyGeometricNormal = {0.0F, 0.0F, 1.0F};
+    sample.historySurface = false;
+    require(!renderer::temporal::acceptsPathHistory(sample),
+            "Path history accepted a surface-to-sky transition");
+
+    sample.currentSurface = false;
+    sample.historySurface = false;
+    sample.expectedPreviousDepth = std::numeric_limits<float>::quiet_NaN();
+    sample.historyDepth = std::numeric_limits<float>::quiet_NaN();
+    sample.currentGeometricNormal = {};
+    sample.historyGeometricNormal = {};
+    require(renderer::temporal::acceptsPathHistory(sample),
+            "Valid reprojected sky history required surface metadata");
+    sample.previousUv.x = -0.01F;
+    require(!renderer::temporal::acceptsPathHistory(sample),
+            "Path history accepted out-of-bounds sky reprojection");
+    sample.previousUv.x = 0.5F;
+    sample.motionValid = false;
+    require(!renderer::temporal::acceptsPathHistory(sample),
+            "Path history accepted an invalid projection");
 }
 
 } // namespace
@@ -203,6 +267,7 @@ int main() {
         testRigidMotionConventions();
         testJitterCorrectedHistoryReprojection();
         testTemporalRejectionAndClipping();
+        testPathHistoryRejection();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

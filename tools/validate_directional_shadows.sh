@@ -4,7 +4,7 @@ set -euo pipefail
 renderer_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="${1:-${renderer_root}/build/debug}"
 output_dir="${2:-${renderer_root}/captures/current/directional_shadow}"
-renderer_demo="${build_dir}/bin/renderer_demo"
+genesis_render="${build_dir}/bin/genesis_render"
 metrics="${build_dir}/post_image_metrics"
 
 cmake --build "${build_dir}" -j4
@@ -15,8 +15,9 @@ run_capture() {
     local output="$2"
     local frames="$3"
     shift 3
-    env SDL_VIDEODRIVER=wayland "${renderer_demo}" \
+    env SDL_VIDEODRIVER=wayland "${genesis_render}" \
         --demo directional-shadow \
+        --ray-tracing off \
         --shadows "${shadow_mode}" \
         --taa off \
         --bloom off \

@@ -28,6 +28,7 @@ struct OptionalCapabilities {
     std::uint32_t shaderGroupHandleSize = 0;
     std::uint32_t shaderGroupHandleAlignment = 0;
     std::uint32_t shaderGroupBaseAlignment = 0;
+    std::uint32_t maxShaderGroupStride = 0;
 };
 
 class Device final {

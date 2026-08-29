@@ -149,9 +149,9 @@ Instance::Instance(const platform::Window& window, ValidationMode validationMode
 
     const VkApplicationInfo appInfo{
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pApplicationName = "Bloxel Renderer Demo",
+        .pApplicationName = "Genesis Render",
         .applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
-        .pEngineName = "Bloxel Renderer",
+        .pEngineName = "Genesis Render",
         .engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
         .apiVersion = VK_API_VERSION_1_3,
     };

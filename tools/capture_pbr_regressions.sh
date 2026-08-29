@@ -18,7 +18,7 @@ fi
 
 cmake --build "${build_dir}" -j4
 mkdir -p "${output_dir}"
-env SDL_VIDEODRIVER=wayland "${build_dir}/bin/renderer_demo" \
+env SDL_VIDEODRIVER=wayland "${build_dir}/bin/genesis_render" \
     --scene "${reference_root}/glTF-Sample-Assets/Models/DamagedHelmet/glTF/DamagedHelmet.gltf" \
     --environment "${environment}" \
     --environment-rotation 0 \

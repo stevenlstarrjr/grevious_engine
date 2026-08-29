@@ -284,6 +284,103 @@ bool FloatImage::valid() const {
            texels.size() == static_cast<std::size_t>(width) * height * channels;
 }
 
+bool EnvironmentSamplingDistribution::valid() const {
+    return width != 0 && height != 0 &&
+           entries.size() == static_cast<std::size_t>(width) * height;
+}
+
+EnvironmentSamplingDistribution
+buildEnvironmentSamplingDistribution(const FloatImage& environment) {
+    if (!environment.valid() || environment.channels < 3U) {
+        throw std::runtime_error(
+            "Environment importance sampling requires a valid RGB environment");
+    }
+
+    const std::size_t entryCount =
+        static_cast<std::size_t>(environment.width) * environment.height;
+    std::vector<double> weights(entryCount);
+    double totalWeight = 0.0;
+    const double deltaPhi = 2.0 * std::numbers::pi_v<double> /
+                            static_cast<double>(environment.width);
+    for (std::uint32_t y = 0; y < environment.height; ++y) {
+        const double theta0 = std::numbers::pi_v<double> * static_cast<double>(y) /
+                              static_cast<double>(environment.height);
+        const double theta1 = std::numbers::pi_v<double> * static_cast<double>(y + 1U) /
+                              static_cast<double>(environment.height);
+        const double texelSolidAngle = deltaPhi * (std::cos(theta0) - std::cos(theta1));
+        for (std::uint32_t x = 0; x < environment.width; ++x) {
+            const glm::vec3 rgb = texelRgb(environment, x, y);
+            if (!std::isfinite(rgb.x) || !std::isfinite(rgb.y) || !std::isfinite(rgb.z)) {
+                throw std::runtime_error(
+                    "Environment importance sampling requires finite RGB radiance");
+            }
+            const double luminance = std::max(
+                0.0, 0.2126 * static_cast<double>(rgb.x) +
+                         0.7152 * static_cast<double>(rgb.y) +
+                         0.0722 * static_cast<double>(rgb.z));
+            const std::size_t index = static_cast<std::size_t>(y) * environment.width + x;
+            weights[index] = luminance * texelSolidAngle;
+            totalWeight += weights[index];
+        }
+    }
+
+    if (!(totalWeight > std::numeric_limits<double>::epsilon())) {
+        totalWeight = 0.0;
+        for (std::uint32_t y = 0; y < environment.height; ++y) {
+            const double theta0 = std::numbers::pi_v<double> * static_cast<double>(y) /
+                                  static_cast<double>(environment.height);
+            const double theta1 = std::numbers::pi_v<double> * static_cast<double>(y + 1U) /
+                                  static_cast<double>(environment.height);
+            const double texelSolidAngle = deltaPhi * (std::cos(theta0) - std::cos(theta1));
+            for (std::uint32_t x = 0; x < environment.width; ++x) {
+                const std::size_t index =
+                    static_cast<std::size_t>(y) * environment.width + x;
+                weights[index] = texelSolidAngle;
+                totalWeight += texelSolidAngle;
+            }
+        }
+    }
+
+    EnvironmentSamplingDistribution result{
+        .width = environment.width,
+        .height = environment.height,
+        .entries = std::vector<EnvironmentAliasEntry>(entryCount),
+    };
+    std::vector<double> scaled(entryCount);
+    std::vector<std::uint32_t> small;
+    std::vector<std::uint32_t> large;
+    small.reserve(entryCount);
+    large.reserve(entryCount);
+    for (std::size_t index = 0; index < entryCount; ++index) {
+        const double mass = weights[index] / totalWeight;
+        result.entries[index].probabilityMass = static_cast<float>(mass);
+        result.entries[index].aliasIndex = static_cast<std::uint32_t>(index);
+        scaled[index] = mass * static_cast<double>(entryCount);
+        (scaled[index] < 1.0 ? small : large).push_back(static_cast<std::uint32_t>(index));
+    }
+
+    while (!small.empty() && !large.empty()) {
+        const std::uint32_t smallIndex = small.back();
+        small.pop_back();
+        const std::uint32_t largeIndex = large.back();
+        large.pop_back();
+        result.entries[smallIndex].threshold =
+            static_cast<float>(std::clamp(scaled[smallIndex], 0.0, 1.0));
+        result.entries[smallIndex].aliasIndex = largeIndex;
+        scaled[largeIndex] = scaled[largeIndex] + scaled[smallIndex] - 1.0;
+        (scaled[largeIndex] < 1.0 ? small : large).push_back(largeIndex);
+    }
+    for (const std::uint32_t index : small) {
+        result.entries[index].threshold = 1.0F;
+        result.entries[index].aliasIndex = index;
+    }
+    for (const std::uint32_t index : large) {
+        result.entries[index].threshold = 1.0F;
+        result.entries[index].aliasIndex = index;
+    }
+    return result;
+}
+
 FloatImage toLinearFloatImage(const assets::DecodedImage& image) {
     if (!image.valid()) {
         throw std::runtime_error("Cannot convert an invalid decoded image");

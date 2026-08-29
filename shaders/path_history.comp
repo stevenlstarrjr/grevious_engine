@@ -1,0 +1,99 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Current motion is current UV minus previous UV. Z is expected previous
+// device depth, with a negative value marking an invalid projection. W is
+// first-hit world distance; zero identifies the infinite environment.
+layout(set = 0, binding = 0) uniform sampler2D currentNormal;
+layout(set = 0, binding = 1) uniform sampler2D currentMotionDepth;
+layout(set = 0, binding = 2) uniform sampler2D currentDepth;
+// History normal XY is octahedral geometric normal; alpha is the surface class.
+layout(set = 0, binding = 3) uniform sampler2D previousNormal;
+layout(set = 0, binding = 4) uniform sampler2D previousDepth;
+layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D outputNormal;
+layout(r32f, set = 0, binding = 6) uniform writeonly image2D outputDepth;
+layout(r32f, set = 0, binding = 7) uniform writeonly image2D outputConfidence;
+
+layout(push_constant) uniform PathHistoryControls
+{
+    uint historyValid;
+} controls;
+
+bool finiteVector(vec4 value)
+{
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 decodeOctahedralNormal(vec2 encoded)
+{
+    vec2 value = encoded * 2.0 - 1.0;
+    vec3 normal = vec3(value, 1.0 - abs(value.x) - abs(value.y));
+    if (normal.z < 0.0) {
+        vec2 signs = vec2(normal.x >= 0.0 ? 1.0 : -1.0,
+                          normal.y >= 0.0 ? 1.0 : -1.0);
+        normal.xy = (vec2(1.0) - abs(normal.yx)) * signs;
+    }
+    return normalize(normal);
+}
+
+float localDepthThreshold(ivec2 coordinate, ivec2 size, float depth)
+{
+    float gradient = 0.0;
+    const ivec2 offsets[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0),
+                                      ivec2(0, -1), ivec2(0, 1));
+    for (int index = 0; index < 4; ++index) {
+        ivec2 neighbor = clamp(coordinate + offsets[index], ivec2(0), size - 1);
+        float neighborDepth = texelFetch(currentDepth, neighbor, 0).r;
+        if (!isnan(neighborDepth) && !isinf(neighborDepth)) {
+            gradient = max(gradient, abs(neighborDepth - depth));
+        }
+    }
+    return max(0.00075, gradient * 2.0);
+}
+
+void main()
+{
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputConfidence);
+    if (any(greaterThanEqual(coordinate, size))) {
+        return;
+    }
+
+    vec4 normal = texelFetch(currentNormal, coordinate, 0);
+    vec4 motionDepth = texelFetch(currentMotionDepth, coordinate, 0);
+    float depth = texelFetch(currentDepth, coordinate, 0).r;
+    bool currentSurface = finiteVector(motionDepth) && motionDepth.w > 0.0;
+    if (!finiteVector(normal)) {
+        normal = vec4(0.0);
+    }
+    if (isnan(depth) || isinf(depth)) {
+        depth = 1.0;
+    }
+
+    imageStore(outputNormal, coordinate,
+               vec4(normal.xy, 0.0, currentSurface ? 1.0 : 0.0));
+    imageStore(outputDepth, coordinate, vec4(depth));
+
+    vec2 uv = (vec2(coordinate) + 0.5) / vec2(size);
+    vec2 historyUv = uv - motionDepth.xy;
+    bool motionValid = finiteVector(motionDepth) && motionDepth.z >= 0.0;
+    bool insideHistory = all(greaterThanEqual(historyUv, vec2(0.0))) &&
+                         all(lessThan(historyUv, vec2(1.0)));
+    bool accepted = controls.historyValid != 0u && motionValid && insideHistory;
+
+    if (accepted) {
+        vec4 historyNormal = texture(previousNormal, historyUv);
+        float historyDepth = texture(previousDepth, historyUv).r;
+        bool historySurface = finiteVector(historyNormal) && historyNormal.a > 0.5;
+        accepted = currentSurface == historySurface;
+        if (accepted && currentSurface) {
+            float threshold = localDepthThreshold(coordinate, size, depth);
+            accepted = !isnan(historyDepth) && !isinf(historyDepth) &&
+                       abs(historyDepth - motionDepth.z) <= threshold &&
+                       dot(decodeOctahedralNormal(normal.xy),
+                           decodeOctahedralNormal(historyNormal.xy)) >= 0.85;
+        }
+    }
+    imageStore(outputConfidence, coordinate, vec4(accepted ? 1.0 : 0.0));
+}

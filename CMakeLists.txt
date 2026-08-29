@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(BloxelRenderer VERSION 0.1.0 LANGUAGES C CXX)
+project(GenesisRender VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "BloxelRenderer supports Linux only")
+    message(FATAL_ERROR "Genesis Render supports Linux only")
 endif()
 
 option(RENDERER_VALIDATION_DEFAULT "Request Vulkan validation by default" ON)
@@ -173,6 +173,36 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     )
 endif()
 
+add_library(renderer_output STATIC src/output/AovExport.cpp)
+target_compile_features(renderer_output PUBLIC cxx_std_20)
+target_include_directories(renderer_output PUBLIC include)
+set_target_properties(renderer_output PROPERTIES CXX_EXTENSIONS OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(renderer_output PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
+        -Wnon-virtual-dtor
+    )
+endif()
+
+add_library(renderer_upscaling STATIC src/upscaling/Upscaler.cpp)
+target_compile_features(renderer_upscaling PUBLIC cxx_std_20)
+target_include_directories(renderer_upscaling PUBLIC include)
+set_target_properties(renderer_upscaling PROPERTIES CXX_EXTENSIONS OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(renderer_upscaling PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
+        -Wnon-virtual-dtor
+    )
+endif()
+
 add_library(renderer_ibl STATIC src/lighting/IblBaker.cpp)
 target_compile_features(renderer_ibl PUBLIC cxx_std_20)
 target_include_directories(renderer_ibl PUBLIC include)
@@ -291,12 +321,22 @@ set(RENDERER_SHADER_SOURCES
     shaders/taa.frag
     shaders/tonemap.vert
     shaders/tonemap.frag
+    shaders/path_trace.rgen
+    shaders/path_trace.rmiss
+    shaders/path_trace_shadow.rmiss
+    shaders/path_trace.rchit
+    shaders/path_history.comp
+    shaders/path_reconstruct.comp
+    shaders/path_denoise.comp
 )
 set(RENDERER_SHADER_HEADERS
     shaders/include/pbr.glsl
     shaders/include/ibl.glsl
     shaders/include/post.glsl
     shaders/include/shadows.glsl
+    shaders/include/path_trace.glsl
+    shaders/include/path_trace_bsdf.glsl
+    shaders/include/path_trace_environment.glsl
 )
 set(RENDERER_SHADER_OUTPUTS)
 foreach(shader_source IN LISTS RENDERER_SHADER_SOURCES)
@@ -320,9 +360,29 @@ foreach(shader_source IN LISTS RENDERER_SHADER_SOURCES)
     )
     list(APPEND RENDERER_SHADER_OUTPUTS "${shader_output}")
 endforeach()
+
+set(RENDERER_RAY_QUERY_SHADER_OUTPUT "${RENDERER_SHADER_OUTPUT_DIR}/mesh_ray_query.frag.spv")
+add_custom_command(
+    OUTPUT "${RENDERER_RAY_QUERY_SHADER_OUTPUT}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RENDERER_SHADER_OUTPUT_DIR}"
+    COMMAND "${GLSLC_EXECUTABLE}"
+        --target-env=vulkan1.3
+        -Werror
+        -O
+        -DRENDERER_RAY_QUERY_SHADOWS=1
+        -I "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.frag"
+        -o "${RENDERER_RAY_QUERY_SHADER_OUTPUT}"
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh.frag"
+        ${RENDERER_SHADER_HEADERS}
+    VERBATIM
+    COMMENT "Compiling ray-query PBR fragment shader"
+)
+list(APPEND RENDERER_SHADER_OUTPUTS "${RENDERER_RAY_QUERY_SHADER_OUTPUT}")
 add_custom_target(renderer_shaders DEPENDS ${RENDERER_SHADER_OUTPUTS})
 
-add_executable(renderer_demo
+add_executable(genesis_render
     src/main.cpp
     src/core/Log.cpp
     src/platform/Window.cpp
@@ -340,36 +400,38 @@ add_executable(renderer_demo
     src/render_graph/RenderGraph.cpp
     src/renderer/Renderer.cpp
 )
-add_dependencies(renderer_demo renderer_shaders)
+add_dependencies(genesis_render renderer_shaders)
 
-target_compile_features(renderer_demo PRIVATE cxx_std_20)
-target_include_directories(renderer_demo PRIVATE include)
-target_link_libraries(renderer_demo PRIVATE
+target_compile_features(genesis_render PRIVATE cxx_std_20)
+target_include_directories(genesis_render PRIVATE include)
+target_link_libraries(genesis_render PRIVATE
     SDL3::SDL3-static
     renderer_gltf
     renderer_ibl
+    renderer_output
     renderer_gpu_scene
     renderer_post
     renderer_ray_tracing
     renderer_temporal
+    renderer_upscaling
     renderer_vma
     volk::volk
     glm::glm
 )
-target_compile_definitions(renderer_demo PRIVATE
+target_compile_definitions(genesis_render PRIVATE
     RENDERER_SHADER_DIR="${RENDERER_SHADER_OUTPUT_DIR}"
     RENDERER_PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/cache/pipeline.bin"
     RENDERER_BUILD_CONFIGURATION="${CMAKE_BUILD_TYPE}"
 )
 
 if(RENDERER_VALIDATION_DEFAULT)
-    target_compile_definitions(renderer_demo PRIVATE RENDERER_VALIDATION_DEFAULT=1)
+    target_compile_definitions(genesis_render PRIVATE RENDERER_VALIDATION_DEFAULT=1)
 else()
-    target_compile_definitions(renderer_demo PRIVATE RENDERER_VALIDATION_DEFAULT=0)
+    target_compile_definitions(genesis_render PRIVATE RENDERER_VALIDATION_DEFAULT=0)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(renderer_demo PRIVATE
+    target_compile_options(genesis_render PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -382,14 +444,44 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     )
 endif()
 
-set_target_properties(renderer_demo PROPERTIES
+set_target_properties(genesis_render PROPERTIES
     CXX_EXTENSIONS OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
 include(CTest)
 if(BUILD_TESTING)
-    add_test(NAME renderer_cli_help COMMAND renderer_demo --help)
+    add_test(NAME genesis_render_cli_help COMMAND genesis_render --help)
+
+    add_executable(aov_export_test tests/AovExportTest.cpp)
+    target_compile_features(aov_export_test PRIVATE cxx_std_20)
+    target_link_libraries(aov_export_test PRIVATE renderer_output)
+    set_target_properties(aov_export_test PROPERTIES CXX_EXTENSIONS OFF)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(aov_export_test PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Wnon-virtual-dtor
+        )
+    endif()
+    add_test(NAME aov_export COMMAND aov_export_test)
+
+    add_executable(aov_export_metrics tests/AovExportMetrics.cpp)
+    target_compile_features(aov_export_metrics PRIVATE cxx_std_20)
+    set_target_properties(aov_export_metrics PROPERTIES CXX_EXTENSIONS OFF)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(aov_export_metrics PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Wnon-virtual-dtor
+        )
+    endif()
 
     add_executable(shader_reflection_test
         tests/ShaderReflectionTest.cpp
@@ -611,6 +703,22 @@ if(BUILD_TESTING)
         )
     endif()
     add_test(NAME temporal_sampling COMMAND temporal_sampling_test)
+
+    add_executable(upscaling_test tests/UpscalingTest.cpp)
+    target_compile_features(upscaling_test PRIVATE cxx_std_20)
+    target_link_libraries(upscaling_test PRIVATE renderer_upscaling)
+    set_target_properties(upscaling_test PROPERTIES CXX_EXTENSIONS OFF)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(upscaling_test PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Wnon-virtual-dtor
+        )
+    endif()
+    add_test(NAME upscaling COMMAND upscaling_test)
 
     add_executable(post_processing_test tests/PostProcessingTest.cpp)
     target_compile_features(post_processing_test PRIVATE cxx_std_20)

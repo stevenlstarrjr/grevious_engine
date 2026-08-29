@@ -1,10 +1,12 @@
 #pragma once
 
+#include "renderer/output/AovExport.hpp"
 #include "renderer/post/PostProcessing.hpp"
 #include "renderer/ray_tracing/AccelerationStructurePlan.hpp"
 #include "renderer/ray_tracing/RayTracingPolicy.hpp"
 #include "renderer/render_graph/RenderGraph.hpp"
 #include "renderer/temporal/TemporalState.hpp"
+#include "renderer/upscaling/Upscaler.hpp"
 #include "renderer/visibility/Visibility.hpp"
 #include "renderer/vulkan/Buffer.hpp"
 #include "renderer/vulkan/Descriptors.hpp"
@@ -58,6 +60,36 @@ enum class TemporalCameraScript : std::uint32_t {
     rotate = 3,
     approach = 4,
 };
+enum class RayTracingTransformScript : std::uint32_t {
+    none = 0,
+    oscillate = 1,
+};
+enum class RenderMode : std::uint32_t {
+    rasterized = 0,
+    pathTraced = 1,
+};
+enum class PathDebugView : std::uint32_t {
+    final = 0,
+    direct = 1,
+    indirect = 2,
+    albedo = 3,
+    roughness = 4,
+    geometricNormal = 5,
+    shadingNormal = 6,
+    motion = 7,
+    depth = 8,
+    hitDistance = 9,
+    lightingResidual = 10,
+    historyValidity = 11,
+    rawRadiance = 12,
+    reconstructionWeight = 13,
+    temporalRadiance = 14,
+    variance = 15,
+};
+
+inline constexpr std::uint32_t defaultPathBounceCount = 2U;
+inline constexpr std::uint32_t maximumPathBounceCount = 4U;
+inline constexpr std::uint32_t pathRussianRouletteStartDepth = 2U;
 
 struct RendererConfig {
     std::filesystem::path scenePath;
@@ -67,6 +99,8 @@ struct RendererConfig {
     std::filesystem::path capturePath;
     std::filesystem::path timingOutputPath;
     std::uint64_t captureFrame = 8;
+    std::shared_ptr<output::AovFrameSink> aovFrameSink;
+    std::uint64_t aovExportFrame = 8;
     RenderView view;
     bool taaEnabled = true;
     bool bloomEnabled = true;
@@ -79,12 +113,20 @@ struct RendererConfig {
     bool alphaShadowDemo = false;
     bool shadowsEnabled = true;
     ray_tracing::Request rayTracingRequest = ray_tracing::Request::automatic;
+    RayTracingTransformScript rayTracingTransformScript = RayTracingTransformScript::none;
+    RenderMode renderMode = RenderMode::rasterized;
+    upscaling::Backend upscalingBackend = upscaling::Backend::native;
+    bool pathEnvironmentImportanceSampling = true;
+    bool pathEmissiveTriangleSampling = true;
+    std::uint32_t pathMaxBounces = defaultPathBounceCount;
+    PathDebugView pathDebugView = PathDebugView::final;
     bool occlusionCullingEnabled = true;
     post::TestPattern postTestPattern = post::TestPattern::none;
     float postTestSourceValue = 4.0F;
     glm::vec2 postTestPosition{0.5F};
     TemporalDebugView temporalDebugView = TemporalDebugView::none;
     TemporalCameraScript temporalCameraScript = TemporalCameraScript::none;
+    bool interactiveCameraInput = true;
 };
 
 class Renderer final {
@@ -102,11 +144,13 @@ class Renderer final {
         mainView_.visibilityMask = mask;
         temporalState_.invalidateHistory();
         hiZReady_ = false;
+        pathTracingResetPending_ = true;
     }
     [[nodiscard]] RenderLayerMask viewVisibilityMask() const { return mainView_.visibilityMask; }
     void resetTemporalHistory() {
         temporalState_.reset();
         hiZReady_ = false;
+        pathTracingResetPending_ = true;
     }
 
   private:
@@ -116,6 +160,19 @@ class Renderer final {
         VkSemaphore imageAvailable = VK_NULL_HANDLE;
         std::uint64_t completionValue = 0;
         bool timingPending = false;
+    };
+
+    enum class PathAovReadbackTarget : std::size_t {
+        rawBeauty,
+        directLighting,
+        surface,
+        normals,
+        motionDepth,
+        depth,
+        historyValidity,
+        temporalBeauty,
+        beauty,
+        count,
     };
 
     struct FrameUniform {
@@ -168,17 +225,26 @@ class Renderer final {
         std::size_t historyReadIndex = 0;
         std::size_t historyWriteIndex = 0;
         bool capture = false;
+        bool exportAovs = false;
     };
 
     void createFrameResources();
     void createCaptureBuffer();
     void createTemporalResources();
+    void createPathTracingResources();
     void destroyFrameResources();
     void createSceneResources();
     void createRayTracingResources(std::span<const gpu_scene::TransformRecord> transforms);
+    void updateRayTracingInstanceBuffer(std::size_t frameIndex);
+    void recordRayTracingTlasUpdate(VkCommandBuffer commandBuffer, std::size_t frameIndex);
     void createGraphicsPipelines();
     void createRenderGraph();
+    void createPathTracingRenderGraph();
     void updateToneMappingDescriptor();
+    void updatePathTracingDescriptors();
+    void updatePathHistoryDescriptors();
+    void updatePathReconstructionDescriptors();
+    void updatePathDenoisingDescriptors();
     void updateShadowDescriptor();
     void updateHiZDescriptors();
     void resetCamera();
@@ -186,9 +252,21 @@ class Renderer final {
     void updateFrameUniform(std::size_t frameIndex);
     void recreateSwapchain();
     void recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageIndex,
-                     std::size_t frameIndex, bool capture);
+                     std::size_t frameIndex, bool capture, bool exportAovs);
     void recordPbrPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
                        const GraphFrameContext& context);
+    void recordPathTracingPass(VkCommandBuffer commandBuffer,
+                               const GraphFrameContext& context);
+    void recordPathHistoryPass(VkCommandBuffer commandBuffer,
+                               const GraphFrameContext& context);
+    void recordPathReconstructionPass(VkCommandBuffer commandBuffer,
+                                      const GraphFrameContext& context);
+    void recordPathDenoisingPass(VkCommandBuffer commandBuffer,
+                                 const GraphFrameContext& context);
+    void recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
+                                   const GraphFrameContext& context);
+    void recordUpscalingPass(VkCommandBuffer commandBuffer,
+                             const GraphFrameContext& context);
     void recordCullingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context);
     void recordShadowCullingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context,
                                  std::size_t cascadeIndex);
@@ -204,13 +282,23 @@ class Renderer final {
                                const GraphFrameContext& context);
     void recordCapturePass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph);
     void writeCapture() const;
+    void writePathAovExport() const;
     enum class GpuTimingPass : std::uint32_t {
+        tlasUpdate,
         shadowCulling,
         shadowMap,
+        pbrGeometry,
+        pathTracing,
+        pathHistory,
+        pathReconstruction,
+        pathDenoising,
+        pathAovReadback,
         bloomDownsample,
         bloomHorizontal,
         bloomVertical,
+        upscaling,
         toneMapping,
+        count,
     };
     void recordBloomPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
                          render_graph::ImageHandle target, const vulkan::GraphicsPipeline& pipeline,
@@ -220,18 +308,30 @@ class Renderer final {
                            GpuTimingPass pass, bool end) const;
     void collectGpuTimings(std::size_t frameIndex);
     void writeGpuTimingReport();
+    [[nodiscard]] bool rasterShadowMapsEnabled() const {
+        return config_.renderMode != RenderMode::pathTraced && config_.shadowsEnabled &&
+               rayTracingShadowBackend_ == ray_tracing::ShadowBackend::raster;
+    }
+    [[nodiscard]] bool pathTracingEnabled() const {
+        return config_.renderMode == RenderMode::pathTraced;
+    }
+    [[nodiscard]] VkExtent2D renderExtent() const;
 
     static constexpr std::size_t framesInFlight = 2;
     static constexpr std::uint32_t maxBindlessTextures = 64;
     static constexpr std::uint32_t maxHiZLevels = 16;
     static constexpr std::uint32_t directionalShadowResolution = 2048;
     static constexpr std::size_t directionalShadowCascadeCount = 3;
-    static constexpr std::size_t gpuTimingPassCount = 6;
+    static constexpr std::size_t gpuTimingPassCount =
+        static_cast<std::size_t>(GpuTimingPass::count);
     platform::Window& window_;
     const vulkan::Instance& instance_;
     const vulkan::Device& device_;
     RendererConfig config_;
+    std::unique_ptr<upscaling::IUpscaler> upscaler_;
     ray_tracing::ShadowBackend rayTracingShadowBackend_ = ray_tracing::ShadowBackend::raster;
+    ray_tracing::SelectionReason rayTracingSelectionReason_ =
+        ray_tracing::SelectionReason::hardwareUnavailable;
     bool rayTracingFoundationEnabled_ = false;
     ray_tracing::SceneBuildPlan rayTracingBuildPlan_;
     RenderView mainView_;
@@ -240,10 +340,23 @@ class Renderer final {
     vulkan::PipelineCache pipelineCache_;
     std::unique_ptr<vulkan::Buffer> vertexBuffer_;
     std::unique_ptr<vulkan::Buffer> indexBuffer_;
+    std::unique_ptr<vulkan::Buffer> rayTracingGeometryBuffer_;
     std::vector<std::unique_ptr<vulkan::AccelerationStructure>> bottomLevelStructures_;
     std::unique_ptr<vulkan::AccelerationStructure> topLevelStructure_;
-    std::unique_ptr<vulkan::Buffer> rayTracingInstanceBuffer_;
+    std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight> rayTracingInstanceBuffers_{};
+    std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight>
+        rayTracingUpdateScratchBuffers_{};
+    std::vector<VkAccelerationStructureInstanceKHR> rayTracingPackedInstances_;
+    std::vector<gpu_scene::TransformRecord> rayTracingBaseTransforms_;
+    std::vector<gpu_scene::TransformRecord> rayTracingTransforms_;
+    std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight>
+        pathAnimatedTransformBuffers_{};
+    VkDeviceSize rayTracingUpdateScratchSize_ = 0;
+    VkDeviceSize rayTracingScratchAlignment_ = 1;
     VkDeviceSize rayTracingPersistentBytes_ = 0;
+    std::uint64_t rayTracingTlasUpdateCount_ = 0;
+    std::uint64_t rayTracingScriptedUpdateCount_ = 0;
+    bool rayTracingUpdateReportWritten_ = false;
     std::unique_ptr<vulkan::Buffer> instanceBuffer_;
     std::unique_ptr<vulkan::Buffer> materialBuffer_;
     std::unique_ptr<vulkan::Buffer> transformBuffer_;
@@ -263,6 +376,12 @@ class Renderer final {
     std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight> uniformBuffers_{};
     std::unique_ptr<vulkan::Buffer> bloomControlsBuffer_;
     std::unique_ptr<vulkan::Buffer> captureReadbackBuffer_;
+    std::unique_ptr<vulkan::Buffer> pathAovReadbackBuffer_;
+    static constexpr std::size_t pathAovReadbackTargetCount =
+        static_cast<std::size_t>(PathAovReadbackTarget::count);
+    std::array<VkDeviceSize, pathAovReadbackTargetCount> pathAovReadbackOffsets_{};
+    std::unique_ptr<vulkan::Buffer> environmentSamplingBuffer_;
+    std::unique_ptr<vulkan::Buffer> emissiveTriangleBuffer_;
     std::vector<std::unique_ptr<vulkan::Image>> textureImages_;
     std::vector<std::unique_ptr<vulkan::ImageView>> textureViews_;
     std::vector<std::unique_ptr<vulkan::Sampler>> textureSamplers_;
@@ -274,6 +393,30 @@ class Renderer final {
     std::unique_ptr<vulkan::ImageView> prefilteredSpecularView_;
     std::unique_ptr<vulkan::Image> brdfLutImage_;
     std::unique_ptr<vulkan::ImageView> brdfLutView_;
+    std::unique_ptr<vulkan::Image> pathTracingAccumulationImage_;
+    std::unique_ptr<vulkan::ImageView> pathTracingAccumulationView_;
+    std::unique_ptr<vulkan::Image> pathTracingDirectImage_;
+    std::unique_ptr<vulkan::ImageView> pathTracingDirectView_;
+    std::unique_ptr<vulkan::Image> pathTracingSurfaceImage_;
+    std::unique_ptr<vulkan::ImageView> pathTracingSurfaceView_;
+    std::unique_ptr<vulkan::Image> pathTracingNormalImage_;
+    std::unique_ptr<vulkan::ImageView> pathTracingNormalView_;
+    std::unique_ptr<vulkan::Image> pathTracingMotionDepthImage_;
+    std::unique_ptr<vulkan::ImageView> pathTracingMotionDepthView_;
+    std::unique_ptr<vulkan::Image> pathTracingDepthImage_;
+    std::unique_ptr<vulkan::ImageView> pathTracingDepthView_;
+    std::array<std::unique_ptr<vulkan::Image>, 2> pathHistoryNormalImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, 2> pathHistoryNormalViews_{};
+    std::array<std::unique_ptr<vulkan::Image>, 2> pathHistoryDepthImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, 2> pathHistoryDepthViews_{};
+    std::unique_ptr<vulkan::Image> pathHistoryValidityImage_;
+    std::unique_ptr<vulkan::ImageView> pathHistoryValidityView_;
+    std::array<std::unique_ptr<vulkan::Image>, 2> pathReconstructionImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, 2> pathReconstructionViews_{};
+    std::array<std::unique_ptr<vulkan::Image>, 2> pathMomentImages_{};
+    std::array<std::unique_ptr<vulkan::ImageView>, 2> pathMomentViews_{};
+    std::unique_ptr<vulkan::Image> pathDenoisedImage_;
+    std::unique_ptr<vulkan::ImageView> pathDenoisedView_;
     std::array<std::unique_ptr<vulkan::Image>, 2> historyColorImages_{};
     std::array<std::unique_ptr<vulkan::ImageView>, 2> historyColorViews_{};
     std::array<std::unique_ptr<vulkan::Image>, 2> historyDepthImages_{};
@@ -302,6 +445,21 @@ class Renderer final {
     std::unique_ptr<vulkan::ShaderModule> toneMappingVertexShader_;
     std::unique_ptr<vulkan::ShaderModule> toneMappingFragmentShader_;
     std::unique_ptr<vulkan::ShaderModule> taaFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> pathTracingRayGenerationShader_;
+    std::unique_ptr<vulkan::ShaderModule> pathTracingRadianceMissShader_;
+    std::unique_ptr<vulkan::ShaderModule> pathTracingShadowMissShader_;
+    std::unique_ptr<vulkan::ShaderModule> pathTracingClosestHitShader_;
+    std::unique_ptr<vulkan::ShaderModule> pathHistoryShader_;
+    std::unique_ptr<vulkan::ShaderModule> pathReconstructionShader_;
+    std::unique_ptr<vulkan::ShaderModule> pathDenoisingShader_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> pathTracingDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> pathTracingDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> pathHistoryDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> pathHistoryDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> pathReconstructionDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> pathReconstructionDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> pathDenoisingDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> pathDenoisingDescriptorPool_;
     std::unique_ptr<vulkan::DescriptorSetLayout> descriptorSetLayout_;
     std::unique_ptr<vulkan::DescriptorPool> descriptorPool_;
     std::unique_ptr<vulkan::DescriptorSetLayout> bindlessDescriptorSetLayout_;
@@ -334,6 +492,10 @@ class Renderer final {
     std::unique_ptr<vulkan::GraphicsPipeline> bloomBlurVerticalPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> taaPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> toneMappingPipeline_;
+    std::unique_ptr<vulkan::RayTracingPipeline> pathTracingPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> pathHistoryPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> pathReconstructionPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> pathDenoisingPipeline_;
     std::unique_ptr<render_graph::RenderGraph> renderGraph_;
     render_graph::ImageHandle graphSwapchainImage_;
     std::vector<render_graph::ImageHandle> graphTextureImages_;
@@ -341,6 +503,22 @@ class Renderer final {
     render_graph::ImageHandle graphDiffuseIrradianceImage_;
     render_graph::ImageHandle graphPrefilteredSpecularImage_;
     render_graph::ImageHandle graphBrdfLutImage_;
+    render_graph::ImageHandle graphPathTracingAccumulationImage_;
+    render_graph::ImageHandle graphPathTracingDirectImage_;
+    render_graph::ImageHandle graphPathTracingSurfaceImage_;
+    render_graph::ImageHandle graphPathTracingNormalImage_;
+    render_graph::ImageHandle graphPathTracingMotionDepthImage_;
+    render_graph::ImageHandle graphPathTracingDepthImage_;
+    render_graph::ImageHandle graphPathHistoryNormalReadImage_;
+    render_graph::ImageHandle graphPathHistoryNormalWriteImage_;
+    render_graph::ImageHandle graphPathHistoryDepthReadImage_;
+    render_graph::ImageHandle graphPathHistoryDepthWriteImage_;
+    render_graph::ImageHandle graphPathHistoryValidityImage_;
+    render_graph::ImageHandle graphPathReconstructionReadImage_;
+    render_graph::ImageHandle graphPathReconstructionWriteImage_;
+    render_graph::ImageHandle graphPathMomentReadImage_;
+    render_graph::ImageHandle graphPathMomentWriteImage_;
+    render_graph::ImageHandle graphPathDenoisedImage_;
     std::array<render_graph::ImageHandle, directionalShadowCascadeCount>
         graphDirectionalShadowImages_{};
     render_graph::ImageHandle graphHdrImage_;
@@ -354,6 +532,7 @@ class Renderer final {
     render_graph::ImageHandle graphHistoryNormalWriteImage_;
     std::vector<BloomLevelGraphResources> graphBloomLevels_;
     render_graph::ImageHandle graphDepthImage_;
+    render_graph::ImageHandle graphUpscaledImage_;
     std::vector<render_graph::ImageHandle> graphHiZImages_;
     std::vector<VkExtent2D> hiZExtents_;
     render_graph::BufferHandle graphVertexBuffer_;
@@ -361,6 +540,9 @@ class Renderer final {
     render_graph::BufferHandle graphInstanceBuffer_;
     render_graph::BufferHandle graphMaterialBuffer_;
     render_graph::BufferHandle graphTransformBuffer_;
+    render_graph::BufferHandle graphRayTracingGeometryBuffer_;
+    render_graph::BufferHandle graphEnvironmentSamplingBuffer_;
+    render_graph::BufferHandle graphEmissiveTriangleBuffer_;
     render_graph::BufferHandle graphMeshletWorkBuffer_;
     render_graph::BufferHandle graphFrustumVisibleInstanceBuffer_;
     render_graph::BufferHandle graphFrustumIndirectDrawBuffer_;
@@ -376,6 +558,7 @@ class Renderer final {
         graphShadowDrawCountBuffers_{};
     render_graph::BufferHandle graphUniformBuffer_;
     render_graph::BufferHandle graphCaptureBuffer_;
+    render_graph::BufferHandle graphPathAovReadbackBuffer_;
     std::array<Frame, framesInFlight> frames_{};
     VkSemaphore frameTimeline_ = VK_NULL_HANDLE;
     VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
@@ -404,14 +587,25 @@ class Renderer final {
     VkFormat motionFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkFormat normalFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
     VkFormat temporalDepthFormat_ = VK_FORMAT_R32_SFLOAT;
+    VkFormat pathTracingFormat_ = VK_FORMAT_R32G32B32A32_SFLOAT;
+    VkFormat pathTracingAovFormat_ = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat pathMomentFormat_ = VK_FORMAT_R16G16_SFLOAT;
     VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
     temporal::TemporalState temporalState_;
+    upscaling::FramePlan upscalingFramePlan_;
     vulkan::UploadTicket sceneUpload_{};
     bool sceneUploadPending_ = false;
     bool hiZReady_ = false;
     bool cameraMovedThisFrame_ = true;
     bool temporalImageLayoutsInitialized_ = false;
     bool captureComplete_ = false;
+    bool pathAovExportComplete_ = false;
+    std::uint32_t pathTracingSampleIndex_ = 0;
+    std::uint64_t pathTracingResetCount_ = 0;
+    bool pathTracingImageInitialized_ = false;
+    bool pathHistoryLayoutsInitialized_ = false;
+    bool pathTracingResetPending_ = false;
+    bool pathTracingReportWritten_ = false;
 };
 
 } // namespace renderer

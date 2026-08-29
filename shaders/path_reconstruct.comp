@@ -1,0 +1,87 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D currentRadiance;
+// Current motion is current UV minus previous UV.
+layout(set = 0, binding = 1) uniform sampler2D currentMotionDepth;
+layout(set = 0, binding = 2) uniform sampler2D historyConfidence;
+layout(set = 0, binding = 3) uniform sampler2D previousRadiance;
+layout(set = 0, binding = 4) uniform sampler2D previousMoments;
+// Alpha stores the history weight applied to this pixel for diagnostics.
+layout(rgba16f, set = 0, binding = 5) uniform writeonly image2D outputRadiance;
+layout(rg16f, set = 0, binding = 6) uniform writeonly image2D outputMoments;
+
+layout(push_constant) uniform PathReconstructionControls
+{
+    uint sampleIndex;
+} controls;
+
+bool finiteVector(vec4 value)
+{
+    return !any(isnan(value)) && !any(isinf(value));
+}
+
+vec3 sanitizedRadiance(ivec2 coordinate)
+{
+    vec4 radiance = texelFetch(currentRadiance, coordinate, 0);
+    return finiteVector(radiance) ? max(radiance.rgb, vec3(0.0)) : vec3(0.0);
+}
+
+float luminance(vec3 color)
+{
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main()
+{
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputRadiance);
+    if (any(greaterThanEqual(coordinate, size))) {
+        return;
+    }
+
+    vec3 current = sanitizedRadiance(coordinate);
+    vec3 neighborhoodMinimum = current;
+    vec3 neighborhoodMaximum = current;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 neighbor = clamp(coordinate + ivec2(x, y), ivec2(0), size - 1);
+            vec3 radiance = sanitizedRadiance(neighbor);
+            neighborhoodMinimum = min(neighborhoodMinimum, radiance);
+            neighborhoodMaximum = max(neighborhoodMaximum, radiance);
+        }
+    }
+
+    vec4 motionDepth = texelFetch(currentMotionDepth, coordinate, 0);
+    float confidence = texelFetch(historyConfidence, coordinate, 0).r;
+    vec2 uv = (vec2(coordinate) + 0.5) / vec2(size);
+    vec2 historyUv = uv - motionDepth.xy;
+    vec4 historySample = texture(previousRadiance, historyUv);
+    bool historyFinite = finiteVector(historySample) && finiteVector(motionDepth);
+    confidence = historyFinite ? clamp(confidence, 0.0, 1.0) : 0.0;
+
+    vec3 history = clamp(max(historySample.rgb, vec3(0.0)),
+                         neighborhoodMinimum, neighborhoodMaximum);
+    float motionPixels = length(motionDepth.xy * vec2(size));
+    float motionWeight = clamp(0.92 - motionPixels * 0.08, 0.10, 0.92);
+    // Treat accepted temporal history as at most four equivalent fresh samples.
+    float convergenceWeight = 4.0 / (float(controls.sampleIndex) + 5.0);
+    float historyWeight = confidence * min(motionWeight, convergenceWeight);
+    vec3 reconstructed = mix(current, history, historyWeight);
+
+    // RG16F bounds the stored first/second moments while retaining enough
+    // range for the real-time reconstruction signal.
+    float currentLuminance = min(luminance(current), 255.0);
+    vec2 currentMoments = vec2(currentLuminance, currentLuminance * currentLuminance);
+    vec2 historyMoments = texture(previousMoments, historyUv).rg;
+    bool momentsFinite = !any(isnan(historyMoments)) && !any(isinf(historyMoments));
+    if (!momentsFinite || confidence <= 0.0) {
+        historyMoments = currentMoments;
+    } else {
+        historyMoments = clamp(historyMoments, vec2(0.0), vec2(255.0, 65504.0));
+    }
+    vec2 reconstructedMoments = mix(currentMoments, historyMoments, historyWeight);
+    imageStore(outputRadiance, coordinate, vec4(reconstructed, historyWeight));
+    imageStore(outputMoments, coordinate, vec4(reconstructedMoments, 0.0, 0.0));
+}

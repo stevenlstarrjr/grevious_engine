@@ -69,6 +69,29 @@ void testRayQuerySelection() {
             "Ray-tracing policy descriptions are incomplete");
 }
 
+void testSceneCompatibility() {
+    using namespace renderer::ray_tracing;
+    const ShadowBackendSelection selected{
+        .backend = ShadowBackend::rayQuery,
+        .reason = SelectionReason::rayQuerySelected,
+    };
+    const ShadowBackendSelection compatible =
+        requireSceneCompatibility(Request::automatic, selected, true);
+    require(compatible.backend == ShadowBackend::rayQuery && compatible.accepted,
+            "An opaque scene lost the selected ray-query backend");
+
+    const ShadowBackendSelection automatic =
+        requireSceneCompatibility(Request::automatic, selected, false);
+    require(automatic.accepted && automatic.backend == ShadowBackend::raster &&
+                automatic.reason == SelectionReason::sceneUnsupported,
+            "Automatic mode did not fall back for unsupported scene geometry");
+
+    const ShadowBackendSelection required =
+        requireSceneCompatibility(Request::required, selected, false);
+    require(!required.accepted && required.reason == SelectionReason::sceneUnsupported,
+            "Required mode accepted unsupported scene geometry");
+}
+
 } // namespace
 
 int main() {
@@ -77,6 +100,7 @@ int main() {
         testAutomaticFallbacks();
         testRequiredModeFailures();
         testRayQuerySelection();
+        testSceneCompatibility();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

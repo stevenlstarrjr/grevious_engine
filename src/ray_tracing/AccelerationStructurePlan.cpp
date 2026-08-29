@@ -8,10 +8,14 @@
 namespace renderer::ray_tracing {
 namespace {
 
-bool materialIsOpaque(const gpu_scene::MaterialRecord& material) {
-    constexpr std::uint32_t nonOpaqueFlags =
-        gpu_scene::alphaMaskMaterial | gpu_scene::alphaBlendMaterial | gpu_scene::additiveMaterial;
-    return (material.textureState.z & nonOpaqueFlags) == 0U;
+RayShadowMaterialMode classifyRayShadowMaterial(const gpu_scene::MaterialRecord& material) {
+    const std::uint32_t flags = material.textureState.z;
+    if ((flags & (gpu_scene::alphaBlendMaterial | gpu_scene::additiveMaterial)) != 0U) {
+        return RayShadowMaterialMode::unsupported;
+    }
+    return (flags & gpu_scene::alphaMaskMaterial) != 0U
+               ? RayShadowMaterialMode::alphaMasked
+               : RayShadowMaterialMode::opaque;
 }
 
 } // namespace
@@ -28,6 +32,29 @@ std::array<float, 12> makeInstanceTransform3x4(const glm::mat4& world) {
         }
     }
     return transform;
+}
+
+std::array<float, 12>
+resolveInstanceTransform3x4(const TlasInstancePlan& instance,
+                            std::span<const gpu_scene::TransformRecord> transforms) {
+    if (instance.transformIndex >= transforms.size()) {
+        throw std::out_of_range("RT instance transform mapping is outside scene residency");
+    }
+    return makeInstanceTransform3x4(transforms[instance.transformIndex].world);
+}
+
+bool supportsRayQueryShadows(const SceneBuildPlan& plan) {
+    return std::ranges::all_of(
+        plan.topLevelInstances, [](const TlasInstancePlan& instance) {
+            return instance.rayShadowMaterialMode != RayShadowMaterialMode::unsupported;
+        });
+}
+
+bool supportsOpaquePathTracing(const SceneBuildPlan& plan) {
+    return std::ranges::all_of(
+        plan.topLevelInstances, [](const TlasInstancePlan& instance) {
+            return instance.rayShadowMaterialMode == RayShadowMaterialMode::opaque;
+        });
 }
 
 SceneBuildPlan makeSceneBuildPlan(std::size_t vertexCount, std::span<const std::uint32_t> indices,
@@ -83,9 +110,10 @@ SceneBuildPlan makeSceneBuildPlan(std::size_t vertexCount, std::span<const std::
             maximumVertex = std::max(maximumVertex, localVertex);
         }
 
-        const bool primitiveOpaque = primitive.materialIndex < materials.size()
-                                         ? materialIsOpaque(materials[primitive.materialIndex])
-                                         : true;
+        const bool primitiveOpaque =
+            primitive.materialIndex >= materials.size() ||
+            classifyRayShadowMaterial(materials[primitive.materialIndex]) ==
+                RayShadowMaterialMode::opaque;
         plan.bottomLevels.push_back({
             .primitiveGroup = static_cast<std::uint32_t>(groupIndex),
             .primitiveIndex = finest.primitiveIndex,
@@ -110,9 +138,10 @@ SceneBuildPlan makeSceneBuildPlan(std::size_t vertexCount, std::span<const std::
                 "RT instance references invalid geometry, material, or transform");
         }
         const gpu_scene::MaterialRecord& material = materials[materialIndex];
-        if (!materialIsOpaque(material)) {
-            // BLAS geometry flags cannot vary per TLAS instance. One cutout use
-            // makes every shared use conservative/non-opaque for future alpha tests.
+        const RayShadowMaterialMode rayShadowMaterialMode = classifyRayShadowMaterial(material);
+        if (rayShadowMaterialMode != RayShadowMaterialMode::opaque) {
+            // BLAS geometry flags cannot vary per TLAS instance. One non-opaque
+            // use makes every shared use conservative so the shader can decide.
             plan.bottomLevels[primitiveGroup].opaque = false;
         }
         const std::uint32_t flags = instance.meshMaterial.w;
@@ -121,6 +150,8 @@ SceneBuildPlan makeSceneBuildPlan(std::size_t vertexCount, std::span<const std::
             .blasIndex = primitiveGroup,
             .transformIndex = transformIndex,
             .materialIndex = materialIndex,
+            .renderLayerMask = gpu_scene::unpackRenderLayerMask(instance.visibilityLayer),
+            .rayShadowMaterialMode = rayShadowMaterialMode,
             .doubleSided = (material.textureState.z & gpu_scene::doubleSidedMaterial) != 0U,
             .mirrored = (flags & gpu_scene::mirroredTransformInstance) != 0U,
         });

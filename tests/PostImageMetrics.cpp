@@ -1,6 +1,7 @@
 #include "renderer/assets/ImageDecoder.hpp"
 
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -85,6 +86,24 @@ void compare(const DecodedImage& first, const DecodedImage& second) {
               << " max_abs=" << maximumError << '\n';
 }
 
+std::uint32_t parseCoordinate(std::string_view text) {
+    std::uint32_t value = 0U;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size()) {
+        throw std::runtime_error("Image sample coordinate is not an unsigned integer");
+    }
+    return value;
+}
+
+void sample(const DecodedImage& image, std::uint32_t x, std::uint32_t y) {
+    if (x >= image.width || y >= image.height) {
+        throw std::runtime_error("Image sample coordinate is out of bounds");
+    }
+    const auto color = rgb(image, x, y);
+    std::cout << "r=" << color[0] << " g=" << color[1] << " b=" << color[2]
+              << " luminance=" << luminance(color) << '\n';
+}
+
 void symmetry(const DecodedImage& image) {
     double horizontal = 0.0;
     double vertical = 0.0;
@@ -131,11 +150,16 @@ int main(int argc, char** argv) {
             compare(load(argv[2]), load(argv[3]));
             return EXIT_SUCCESS;
         }
+        if (argc == 5 && std::string_view(argv[1]) == "sample") {
+            sample(load(argv[2]), parseCoordinate(argv[3]), parseCoordinate(argv[4]));
+            return EXIT_SUCCESS;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "symmetry") {
             symmetry(load(argv[2]));
             return EXIT_SUCCESS;
         }
-        std::cerr << "Usage: post_image_metrics stats IMAGE | compare A B | symmetry IMAGE\n";
+        std::cerr << "Usage: post_image_metrics stats IMAGE | compare A B | "
+                     "sample IMAGE X Y | symmetry IMAGE\n";
         return EXIT_FAILURE;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
