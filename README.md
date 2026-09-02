@@ -33,9 +33,9 @@ goals are simple:
 - **Lighting with presence.** Sunlight, shadow, emissive surfaces, reflections,
   and eventually global illumination should help shape mood and gameplay—not
   exist merely as checkboxes.
-- **A graceful path across hardware.** Rasterization remains the dependable
-  foundation. Ray tracing will enhance supported machines without making older
-  or integrated GPUs second-class citizens.
+- **Built for RTX hardware.** Genesis targets NVIDIA RTX-capable graphics cards
+  exclusively, allowing ray tracing, DLSS/Ray Reconstruction, and CUDA-backed
+  techniques to be treated as first-class platform capabilities.
 
 ## What you can see today
 
@@ -48,8 +48,21 @@ real rendering pipeline rather than a collection of mockups. It includes:
   history weighting, and presentation-only sharpening, so the image remains
   stable without unnecessarily softening stationary detail;
 - a shadow-casting sun with live ray-query shadows for opaque and alpha-masked
-  scenes on capable hardware, plus three filtered raster ranges as the portable
-  and blended-material path;
+  scenes, plus three filtered raster ranges for blended materials and reference
+  comparison;
+- Eric Bruneton's precomputed Earth atmosphere with interactive Sun placement,
+  astronomical time-of-day playback, a real-time procedural spherical cloud
+  layer, cloud-aware sunlight attenuation, and an automatic nighttime star and
+  Milky Way field. Clouds share one 512x256 dynamic HDR cache between raster
+  and path modes instead of ray marching every camera pixel;
+- a depth-aware camera-local rain field composited after temporal reconstruction,
+  with physical fall speed, six irregular distance layers, stable analytic edge
+  filtering, depth/normal-aware surface impacts, and rain-receiver materials
+  that darken and reduce roughness for damp ground and shallow puddles. Shared
+  directional wind advects clouds and controls rain slant, while the rain field
+  retains a monotonic downward phase through gust and direction changes. A
+  Sun-elevation response keeps rain and splash reflections faint at night
+  instead of rendering them as self-lit white streaks;
 - glTF/GLB scene loading for static meshes, materials, textures, cameras,
   lights, and scene hierarchies;
 - GPU-selected detail levels, frustum and occlusion culling, meshlets, and
@@ -89,16 +102,18 @@ real rendering pipeline rather than a collection of mockups. It includes:
 Opaque and alpha-masked scenes now select ray-query sun shadows automatically
 when acceleration structures and ray queries are available. Scale-stable ray
 origins and near-source candidate rejection prevent receiver self-shadowing.
-Unsupported devices and scenes with blended or additive geometry retain the
-proven raster path; explicit required mode reports either limitation instead of
-silently changing backends.
+Scenes with blended or additive geometry retain the proven raster shadow path;
+explicit required mode reports that material limitation instead of silently
+changing backends. GPUs without the required NVIDIA RTX feature set are outside
+the supported hardware target.
 
 ## What Genesis Render is becoming
 
-The destination is a hybrid renderer that can scale from a strong raster image
-to richer ray-assisted lighting. The planned journey moves from the current PBR
-and first progressive path-tracing baselines to denoised ray-traced effects and
-real-time global illumination.
+The destination is an RTX-focused hybrid renderer that combines rasterization
+where it remains the best representation with ray-traced lighting and
+reconstruction. The planned journey moves from the current PBR and first
+progressive path-tracing baselines to denoised ray-traced effects and real-time
+global illumination.
 
 Future work also aims at large-scale and planetary terrain, more expressive
 lighting and shadow types, better material coverage, denoising, temporal
@@ -106,17 +121,32 @@ upscaling, and the asset pipeline needed to turn detailed source art into
 streamable game worlds.
 
 The promise is not “maximum settings at any cost.” It is a renderer where each
-new effect earns its frame time, where optional hardware features have solid
-fallbacks, and where a beautiful still frame does not come at the expense of a
-game that feels good to play.
+new effect earns its frame time and fully uses the defined RTX platform without
+letting a beautiful still frame come at the expense of a game that feels good
+to play.
 
 ## Try the current demo
 
-The demo supports native Windows and Linux. Both platforms require Vulkan 1.3,
-a C++20 compiler, CMake 3.25+, and `glslc`.
+The demo supports native Windows and Linux. Both platforms require an NVIDIA
+RTX-capable graphics card with Vulkan 1.3 acceleration-structure and ray-tracing
+pipeline support, a compatible NVIDIA driver, a C++20 compiler, CMake 3.25+,
+and `glslc`.
 
 - Windows requires Visual Studio with the Desktop development with C++ workload
-  and the Vulkan SDK. The Win32 window and Vulkan surface are provided by SDL.
+  and the Vulkan SDK. The standalone executable uses SDL, while embedders can
+  link `Genesis::Renderer` and provide a native `RenderSurface` such as the
+  supplied Win32 HWND surface without linking SDL.
+
+### Editor embedding
+
+`Genesis::Renderer` is the SDL-independent rendering library used by Genisis
+Studio's Qt viewport. A host supplies an in-memory `scene::Scene`, camera, native
+surface, and optional `EditorOverlayFrame`. Raster editor hosts can enable
+`dynamicSceneUpdates` and call `updateSceneSnapshot` to stream geometry into
+reserved GPU buffers without recreating the swapchain, pipelines, or IBL bake.
+Clean rendered views leave editor overlays disabled. Empty editor documents are
+supported through an internal zero-visibility residency anchor and do not need
+host-authored placeholder geometry.
 - Linux requires Ninja, a Wayland session, and the Wayland/libdecor development
   libraries.
 
@@ -182,6 +212,57 @@ Some useful ways to explore it:
   --render-mode path-traced --ray-tracing required \
   --scene reference/glTF-Sample-Assets/Models/DamagedHelmet/glTF/DamagedHelmet.gltf
 
+# Render Khronos Sponza under the interactive Bruneton atmosphere
+./build/release/bin/genesis_render \
+  --render-mode path-traced --ray-tracing required \
+  --demo atmosphere \
+  --clouds on --cloud-coverage 0.42 --cloud-density 1.0 \
+  --time-of-day on --time-hour 16 --day-cycle-seconds 120 \
+  --scene reference/glTF-Sample-Assets/Models/Sponza/glTF/Sponza.gltf
+
+# Atmosphere controls: Ctrl+left-drag moves the Sun, +/- changes exposure, and
+# 1-9 selects the original Bruneton demo presets. Right-drag and WASD retain the normal camera controls
+# for free-fly navigation through imported scenes such as Sponza.
+# Time-of-day controls: T pauses/resumes, [ and ] slow down/speed up the cycle,
+# and , and . scrub backward/forward by 15 minutes. Manual Sun dragging pauses
+# playback; resuming continues smoothly from the manually placed Sun.
+# Stars fade in automatically after sunset. Clouds use a 1.5-7.0 km planetary
+# shell and move at 18 m/s by default; --clouds off retains the exact clear-sky
+# atmosphere path.
+
+# Add camera-local rain after temporal reconstruction. Intensity is normalized;
+# tagged receiving materials become wet and upward-facing visible surfaces show
+# short-lived contact ripples. Wind direction uses world-space horizontal
+# degrees: 0 is +X and 90 is +Z. The same 18 m/s wind moves the clouds.
+# Scene materials can opt into `rainReceiver` for capped puddles plus spreading
+# dampness, or `wetCoat` for a patch-to-continuous glossy water film.
+./build/release/bin/genesis_render \
+  --demo atmosphere --rain on --rain-intensity 0.65 \
+  --wind-speed 18 --wind-direction 14
+
+# A zero speed provides a calm reference without changing the chosen direction.
+./build/release/bin/genesis_render \
+  --demo atmosphere --rain on --wind-speed 0
+
+# Cycle through drizzle, downpour, storm, and a dry clearing interval. Over the
+# default 90 seconds, intensity moves from 0 to 1 and back to 0, wind moves from
+# 3 to 32 m/s, wetness accumulates and then evaporates, and low steam rises
+# during the post-rain interval. Use --weather-cycle-seconds 12 for a fast cycle.
+./build/release/bin/genesis_render \
+  --demo weather --weather-cycle-seconds 90 \
+  --render-mode path-traced --ray-tracing required \
+  --path-denoiser ray-reconstruction --upscaler dlss \
+  --upscaler-quality quality --taa off
+
+# Capture a deterministic camera/altitude/Sun matrix and a labeled contact sheet.
+# Add -CloudDebug transmittance to inspect cloud opacity, or shafts to inspect
+# normalized additive shaft illumination without the beauty composite.
+./tools/capture_atmosphere_debug_sweep.ps1
+
+# Capture a Sun-facing cloud-edge shot as native beauty, production RR beauty,
+# cloud opacity, and normalized shaft illumination in one labeled comparison sheet.
+./tools/capture_light_shaft_debug.ps1
+
 # Reproduce convergence, environment/emissive variance, reset, and RTX timing gates
 ./tools/validate_path_tracing.sh build/release
 
@@ -233,7 +314,7 @@ Some useful ways to explore it:
 # Feed one fresh path sample per frame into NVIDIA DLSS Ray Reconstruction
 .\build\windows\bin\Release\genesis_render.exe --render-mode path-traced --ray-tracing required --demo directional-shadow --upscaler dlss --upscaler-quality quality --path-denoiser ray-reconstruction
 
-# Adjust the subtle post-tone-map film grain (default 0.015; zero disables it)
+# Add optional post-tone-map film grain (disabled by default; zero disables it)
 ./build/release/bin/genesis_render \
   --render-mode path-traced --ray-tracing required \
   --demo directional-shadow --film-grain 0.015
@@ -246,6 +327,13 @@ Some useful ways to explore it:
 # Explicit render scale remains available as a custom diagnostic mode
 ./build/release/bin/genesis_render \
   --demo pbr-grid --upscaler spatial --render-scale 0.75
+
+# Keep a 1280x720 SDL window while path tracing internally at 1920x1080
+./build/release/bin/genesis_render \
+  --resolution 1280 720 --upscaler spatial --render-scale 1.5 \
+  --render-mode path-traced --ray-tracing required \
+  --demo atmosphere \
+  --scene reference/glTF-Sample-Assets/Models/Sponza/glTF/Sponza.gltf
 
 # Inspect renderer-owned path outputs used by game reconstruction and VFX AOVs
 ./build/release/bin/genesis_render \
@@ -338,10 +426,10 @@ signed-runtime NVIDIA Streamline DLSS Super Resolution and DLSS Ray
 Reconstruction adapters; FSR/XeSS and backend-provided sharpening remain future
 work.
 
-Production animation ingestion, alpha/transmission path
-materials, more complete transport, RT scene scaling, skinning, morph targets,
-transparent rendering, terrain, and a game-ready asset streaming pipeline are
-still ahead.
+Production animation ingestion, alpha/transmission path materials, more
+complete transport, RT scene scaling, skinning, morph targets, spatially simulated
+wetness deposition/drainage/drying, local fog/smoke volumes, imported NanoVDB fields, transparent rendering,
+terrain, and a game-ready asset streaming pipeline are still ahead.
 
 This repository deliberately focuses on rendering. Physics, audio, gameplay,
 networking, scripting, an entity system, and editor tools belong to the larger

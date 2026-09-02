@@ -85,6 +85,8 @@ int main() {
             readWords(shaderDirectory / "upscale_reactive.frag.spv"));
         const auto temporalUpscalingFragment = renderer::vulkan::reflectSpirv(
             readWords(shaderDirectory / "upscale_temporal.frag.spv"));
+        const auto atmosphereEnvironment = renderer::vulkan::reflectSpirv(
+            readWords(shaderDirectory / "atmosphere_environment.comp.spv"));
         const auto pathRayGeneration =
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "path_trace.rgen.spv"));
         const auto pathRadianceMiss =
@@ -103,7 +105,7 @@ int main() {
             renderer::vulkan::reflectSpirv(readWords(shaderDirectory / "path_denoise.comp.spv"));
 
         require(vertex.stage == VK_SHADER_STAGE_VERTEX_BIT, "Vertex stage reflection failed");
-        require(vertex.inputLocations == std::vector<std::uint32_t>{0, 1, 2, 3, 4},
+        require(vertex.inputLocations == std::vector<std::uint32_t>{0, 1, 2, 3, 4, 5},
                 "Vertex input reflection failed");
         require(vertex.descriptorBindings.size() == 4,
                 "Vertex descriptor binding count is incorrect");
@@ -119,23 +121,25 @@ int main() {
                     vertex.descriptorBindings[3].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 "GPU scene vertex-buffer reflection failed");
         require(fragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT, "Fragment stage reflection failed");
-        require(fragment.descriptorBindings.size() == 7 &&
+        require(fragment.descriptorBindings.size() == 9 &&
                     fragment.descriptorBindings[0].binding == 0 &&
                     fragment.descriptorBindings[0].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
                     fragment.descriptorBindings[1].binding == 2 &&
                     fragment.descriptorBindings[3].binding == 4 &&
-                    fragment.descriptorBindings[4].binding == 8 &&
-                    fragment.descriptorBindings[4].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
-                    fragment.descriptorBindings[5].binding == 10 &&
-                    fragment.descriptorBindings[5].type ==
+                    fragment.descriptorBindings[4].binding == 5 &&
+                    fragment.descriptorBindings[5].binding == 8 &&
+                    fragment.descriptorBindings[5].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                    fragment.descriptorBindings[6].binding == 10 &&
+                    fragment.descriptorBindings[6].type ==
                         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-                    fragment.descriptorBindings[5].count == 3 &&
-                    fragment.descriptorBindings[6].set == 1 &&
-                    fragment.descriptorBindings[6].binding == 0 &&
-                    fragment.descriptorBindings[6].count == 0,
+                    fragment.descriptorBindings[6].count == 3 &&
+                    fragment.descriptorBindings[7].binding == 18 &&
+                    fragment.descriptorBindings[8].set == 1 &&
+                    fragment.descriptorBindings[8].binding == 0 &&
+                    fragment.descriptorBindings[8].count == 0,
                 "PBR fragment descriptor reflection failed");
         for (std::size_t index = 1; index < fragment.descriptorBindings.size(); ++index) {
-            if (index == 4) {
+            if (index == 5) {
                 continue;
             }
             require(fragment.descriptorBindings[index].type ==
@@ -145,30 +149,36 @@ int main() {
         require(rayQueryFragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT,
                 "Ray-query fragment stage reflection failed");
         require(
-            rayQueryFragment.descriptorBindings.size() == 11 &&
+            rayQueryFragment.descriptorBindings.size() == 13 &&
                 rayQueryFragment.descriptorBindings[0].binding == 0 &&
                 rayQueryFragment.descriptorBindings[0].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
-                rayQueryFragment.descriptorBindings[4].binding == 6 &&
-                rayQueryFragment.descriptorBindings[4].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
-                rayQueryFragment.descriptorBindings[5].binding == 8 &&
+                rayQueryFragment.descriptorBindings[4].binding == 5 &&
+                rayQueryFragment.descriptorBindings[4].type ==
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                rayQueryFragment.descriptorBindings[5].binding == 6 &&
                 rayQueryFragment.descriptorBindings[5].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
-                rayQueryFragment.descriptorBindings[6].set == 0 &&
-                rayQueryFragment.descriptorBindings[6].binding == 11 &&
-                rayQueryFragment.descriptorBindings[6].type ==
+                rayQueryFragment.descriptorBindings[6].binding == 8 &&
+                rayQueryFragment.descriptorBindings[6].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                rayQueryFragment.descriptorBindings[7].set == 0 &&
+                rayQueryFragment.descriptorBindings[7].binding == 11 &&
+                rayQueryFragment.descriptorBindings[7].type ==
                     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR &&
-                rayQueryFragment.descriptorBindings[6].count == 1 &&
-                rayQueryFragment.descriptorBindings[7].binding == 12 &&
-                rayQueryFragment.descriptorBindings[7].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
-                rayQueryFragment.descriptorBindings[8].binding == 13 &&
+                rayQueryFragment.descriptorBindings[7].count == 1 &&
+                rayQueryFragment.descriptorBindings[8].binding == 12 &&
                 rayQueryFragment.descriptorBindings[8].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
-                rayQueryFragment.descriptorBindings[9].binding == 14 &&
+                rayQueryFragment.descriptorBindings[9].binding == 13 &&
                 rayQueryFragment.descriptorBindings[9].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
-                rayQueryFragment.descriptorBindings[10].set == 1 &&
-                rayQueryFragment.descriptorBindings[10].binding == 0 &&
-                rayQueryFragment.descriptorBindings[10].count == 0,
+                rayQueryFragment.descriptorBindings[10].binding == 14 &&
+                rayQueryFragment.descriptorBindings[10].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER &&
+                rayQueryFragment.descriptorBindings[11].binding == 18 &&
+                rayQueryFragment.descriptorBindings[11].type ==
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                rayQueryFragment.descriptorBindings[12].set == 1 &&
+                rayQueryFragment.descriptorBindings[12].binding == 0 &&
+                rayQueryFragment.descriptorBindings[12].count == 0,
             "Ray-query PBR descriptor reflection failed");
         require(shadowVertex.stage == VK_SHADER_STAGE_VERTEX_BIT &&
-                    shadowVertex.inputLocations == std::vector<std::uint32_t>{0, 2, 4} &&
+                    shadowVertex.inputLocations == std::vector<std::uint32_t>{0, 2, 4, 5} &&
                     shadowVertex.descriptorBindings.size() == 4 &&
                     shadowVertex.descriptorBindings[0].binding == 0 &&
                     shadowVertex.descriptorBindings[0].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
@@ -177,7 +187,7 @@ int main() {
                     shadowVertex.descriptorBindings[3].binding == 9,
                 "Directional-shadow vertex reflection failed");
         require(shadowFragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
-                    shadowFragment.inputLocations == std::vector<std::uint32_t>{0, 1, 2} &&
+                    shadowFragment.inputLocations == std::vector<std::uint32_t>{0, 1, 2, 3} &&
                     shadowFragment.descriptorBindings.size() == 2 &&
                     shadowFragment.descriptorBindings[0].set == 0 &&
                     shadowFragment.descriptorBindings[0].binding == 8 &&
@@ -201,11 +211,26 @@ int main() {
                     "Directional-shadow culling buffer reflection failed");
         }
         require(skyFragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
-                    skyFragment.descriptorBindings.size() == 2 &&
+                    skyFragment.descriptorBindings.size() == 7 &&
                     skyFragment.descriptorBindings[0].binding == 0 &&
                     skyFragment.descriptorBindings[0].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
                     skyFragment.descriptorBindings[1].binding == 5 &&
                     skyFragment.descriptorBindings[1].type ==
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                    skyFragment.descriptorBindings[2].binding == 15 &&
+                    skyFragment.descriptorBindings[2].type ==
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                    skyFragment.descriptorBindings[3].binding == 16 &&
+                    skyFragment.descriptorBindings[3].type ==
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                    skyFragment.descriptorBindings[4].binding == 17 &&
+                    skyFragment.descriptorBindings[4].type ==
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                    skyFragment.descriptorBindings[5].binding == 18 &&
+                    skyFragment.descriptorBindings[5].type ==
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                    skyFragment.descriptorBindings[6].binding == 19 &&
+                    skyFragment.descriptorBindings[6].type ==
                         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 "Sky fragment descriptor reflection failed");
         require(postTestFragment.stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
@@ -323,6 +348,26 @@ int main() {
                         temporalBinding.count == 1U,
                     "Temporal-upscaling descriptor reflection failed");
         }
+        require(atmosphereEnvironment.stage == VK_SHADER_STAGE_COMPUTE_BIT &&
+                    atmosphereEnvironment.descriptorBindings.size() == 7U,
+                "Atmosphere-environment shader reflection failed");
+        constexpr std::array atmosphereEnvironmentTypes{
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        };
+        for (std::size_t index = 0U; index < atmosphereEnvironmentTypes.size(); ++index) {
+            require(atmosphereEnvironment.descriptorBindings[index].set == 0U &&
+                        atmosphereEnvironment.descriptorBindings[index].binding == index &&
+                        atmosphereEnvironment.descriptorBindings[index].type ==
+                            atmosphereEnvironmentTypes[index] &&
+                        atmosphereEnvironment.descriptorBindings[index].count == 1U,
+                    "Atmosphere-environment descriptor interface is incorrect");
+        }
         require(pathRayGeneration.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR &&
                     pathRadianceMiss.stage == VK_SHADER_STAGE_MISS_BIT_KHR &&
                     pathShadowMiss.stage == VK_SHADER_STAGE_MISS_BIT_KHR &&
@@ -357,6 +402,11 @@ int main() {
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         };
         require(pathBindings.size() == pathTypes.size() + 1U,
                 "Path-tracing descriptor count is incorrect");

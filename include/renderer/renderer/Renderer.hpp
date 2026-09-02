@@ -1,10 +1,12 @@
 #pragma once
 
+#include "renderer/lighting/Atmosphere.hpp"
 #include "renderer/output/AovExport.hpp"
 #include "renderer/post/PostProcessing.hpp"
 #include "renderer/ray_tracing/AccelerationStructurePlan.hpp"
 #include "renderer/ray_tracing/RayTracingPolicy.hpp"
 #include "renderer/render_graph/RenderGraph.hpp"
+#include "renderer/renderer/EditorOverlay.hpp"
 #include "renderer/temporal/TemporalState.hpp"
 #include "renderer/upscaling/Upscaler.hpp"
 #include "renderer/visibility/Visibility.hpp"
@@ -17,6 +19,7 @@
 #include "renderer/vulkan/Shader.hpp"
 #include "renderer/vulkan/Swapchain.hpp"
 #include "renderer/vulkan/UploadContext.hpp"
+#include "renderer/weather/Weather.hpp"
 
 #include <volk.h>
 
@@ -31,11 +34,16 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
 namespace renderer::platform {
-class Window;
+class RenderSurface;
+}
+
+namespace renderer::scene {
+class Scene;
 }
 
 namespace renderer::nvidia {
@@ -79,6 +87,11 @@ enum class RenderMode : std::uint32_t {
     rasterized = 0,
     pathTraced = 1,
 };
+enum class CloudDebugView : std::uint32_t {
+    final = 1,
+    transmittance = 2,
+    shafts = 3,
+};
 enum class PathDenoiser : std::uint32_t {
     nrd = 0,
     rayReconstruction = 1,
@@ -102,6 +115,25 @@ enum class PathDebugView : std::uint32_t {
     variance = 15,
 };
 
+// Perspective camera supplied by an editor or game framework. Coordinates use
+// Genesis' right-handed, Y-up world convention. The renderer derives aspect
+// ratio from the current drawable so docked Qt viewports resize naturally.
+struct RendererCamera {
+    enum class Projection : std::uint32_t {
+        perspective,
+        orthographic,
+    };
+
+    glm::vec3 position{0.0F, 0.0F, 1.0F};
+    glm::vec3 forward{0.0F, 0.0F, -1.0F};
+    Projection projection = Projection::perspective;
+    float verticalFieldOfViewRadians = 0.872664626F;
+    // Full vertical world-space span for an orthographic camera.
+    float orthographicHeight = 10.0F;
+    float nearPlane = 0.01F;
+    float farPlane = 1000.0F;
+};
+
 inline constexpr std::uint32_t defaultPathBounceCount = 2U;
 inline constexpr std::uint32_t maximumPathBounceCount = 4U;
 inline constexpr std::uint32_t defaultPathInteractiveSampleCount = 3U;
@@ -111,8 +143,18 @@ inline constexpr std::uint32_t pathRussianRouletteStartDepth = 2U;
 
 struct RendererConfig {
     std::filesystem::path scenePath;
+    // An editor can provide the same scene IR directly instead of serializing
+    // to glTF first. Genesis packs this immutable snapshot into GPU residency.
+    std::shared_ptr<const scene::Scene> sceneSnapshot;
     bool sceneAnimationStaticPose = false;
     std::filesystem::path environmentPath;
+    // When present, replaces the fallback studio HDR environment with a
+    // physically based precomputed atmosphere. Explicit environmentPath wins.
+    std::optional<lighting::AtmosphereSettings> atmosphere;
+    weather::RainSettings rain;
+    // Demonstration-only continuous cycle from drizzle through storm and back.
+    bool weatherDemoEnabled = false;
+    float weatherDemoCycleSeconds = 90.0F;
     float exposureCompensationEv = 0.0F;
     float environmentRotationRadians = 0.0F;
     std::filesystem::path capturePath;
@@ -128,11 +170,27 @@ struct RendererConfig {
     // Dimensionless desired perceptual extent. 1.0 preserves the certified baseline.
     float bloomRadius = 1.0F;
     // Monochrome post-tone-map grain amplitude. Zero disables the effect.
-    float filmGrainIntensity = 0.015F;
+    float filmGrainIntensity = 0.0F;
     bool emissiveSphereDemo = false;
     bool directionalShadowDemo = false;
     bool hdriBackdropDemo = false;
     bool alphaShadowDemo = false;
+    bool atmosphereDemo = false;
+    // Optional deterministic camera controls used by atmosphere/cloud capture
+    // sweeps. Preset zero keeps the default view; 1-9 copy only the camera
+    // position from the matching Bruneton preset, leaving Sun/exposure alone.
+    std::uint32_t atmosphereCameraPreset = 0U;
+    float atmosphereCameraPitchRadians = 0.0872664626F;
+    float atmosphereCameraYawRadians = 0.0F;
+    glm::vec2 cloudInitialOffsetKm{72.0F, -15.5F};
+    // Replaces the visible atmosphere with a selected deterministic cloud
+    // diagnostic. Cached secondary lighting remains physical.
+    CloudDebugView cloudDebugView = CloudDebugView::final;
+    bool timeOfDayEnabled = false;
+    float timeOfDayHour = 16.0F;
+    float timeOfDayCycleSeconds = 120.0F;
+    float timeOfDayLatitudeDegrees = 35.0F;
+    std::uint32_t timeOfDayDayOfYear = 172U;
     bool shadowsEnabled = true;
     ray_tracing::Request rayTracingRequest = ray_tracing::Request::automatic;
     RayTracingTransformScript rayTracingTransformScript = RayTracingTransformScript::none;
@@ -142,6 +200,8 @@ struct RendererConfig {
     float upscalingRenderScale = 1.0F;
     nvidia::StreamlineRuntime* streamlineRuntime = nullptr;
     bool pathEnvironmentImportanceSampling = true;
+    // Angular radius in radians used to convolve path-traced environment-light visibility.
+    float pathShadowAngularRadius = 0.00872664626F;
     bool pathEmissiveTriangleSampling = true;
     std::uint32_t pathMaxBounces = defaultPathBounceCount;
     std::uint32_t pathInteractiveSamples = defaultPathInteractiveSampleCount;
@@ -155,11 +215,17 @@ struct RendererConfig {
     TemporalCameraScript temporalCameraScript = TemporalCameraScript::none;
     CameraStartView cameraStartView = CameraStartView::front;
     bool interactiveCameraInput = true;
+    // Reserves raster scene buffers for an editor to replace geometry without
+    // recreating the renderer, swapchain, pipelines, or baked IBL resources.
+    bool dynamicSceneUpdates = false;
+    // Enables a host-supplied grid/gizmo/selection pass after tone mapping.
+    // Rendered/final views leave this disabled for a clean presentation.
+    bool editorOverlayEnabled = false;
 };
 
 class Renderer final {
   public:
-    Renderer(platform::Window& window, const vulkan::Instance& instance,
+    Renderer(platform::RenderSurface& surfaceHost, const vulkan::Instance& instance,
              const vulkan::Device& device, RendererConfig config = {});
     ~Renderer();
 
@@ -168,6 +234,13 @@ class Renderer final {
 
     void drawFrame();
     void waitIdle();
+    // Supplying a camera transfers navigation ownership to the host. Passing
+    // nullopt returns to Genesis' built-in SDL/demo camera controller.
+    void setCamera(std::optional<RendererCamera> camera);
+    void setEditorOverlay(EditorOverlayFrame overlay);
+    // Returns false when the replacement exceeds the reserved editor capacity
+    // or changes resources that require a full renderer rebuild.
+    bool updateSceneSnapshot(std::shared_ptr<const scene::Scene> sceneSnapshot);
     void setViewVisibilityMask(RenderLayerMask mask) {
         mainView_.visibilityMask = mask;
         temporalState_.invalidateHistory();
@@ -232,6 +305,16 @@ class Renderer final {
         glm::vec4 shadowCascadeDepthRadii{0.0F};
         // Previous camera position used with previous-frame Hi-Z occlusion data.
         glm::vec4 previousCameraPosition{0.0F};
+        // Reference-demo camera XYZ and planet bottom radius W, in kilometers.
+        glm::vec4 atmosphereCamera{0.0F};
+        // Reference Z-up Sun direction; W enables the Bruneton lookup path.
+        glm::vec4 atmosphereSunDirection{0.0F};
+        // Inner/outer shell radii in km, coverage, and density.
+        glm::vec4 cloudLayerParameters{0.0F};
+        // Wind offset in km, horizontal scale in km, and enable flag.
+        glm::vec4 cloudWeatherParameters{0.0F};
+        // Rain intensity, simulation time, post-rain steam age, and accumulated wetness.
+        glm::vec4 weatherParameters{0.0F};
     };
 
     struct BloomControls {
@@ -250,7 +333,7 @@ class Renderer final {
         render_graph::ImageHandle scratch;
     };
 
-    static_assert(sizeof(FrameUniform) == 144 * sizeof(float));
+    static_assert(sizeof(FrameUniform) == 164 * sizeof(float));
 
     struct GraphFrameContext {
         std::uint32_t imageIndex = 0;
@@ -287,6 +370,15 @@ class Renderer final {
 
     static_assert(sizeof(PathReconstructionControls) == 2 * sizeof(std::uint32_t));
 
+    struct RainControls {
+        // intensity, simulation time, terminal speed, physical streak length
+        glm::vec4 amountTimeSpeedLength{0.0F};
+        // wind velocity XYZ and camera-local field distance
+        glm::vec4 windMaximumDistance{0.0F};
+    };
+
+    static_assert(sizeof(RainControls) == 8 * sizeof(float));
+
     void createFrameResources();
     void createCaptureBuffer();
     void createTemporalResources();
@@ -298,30 +390,37 @@ class Renderer final {
     void updateRayTracingInstanceBuffer(std::size_t frameIndex);
     void recordRayTracingTlasUpdate(VkCommandBuffer commandBuffer, std::size_t frameIndex);
     void createGraphicsPipelines();
+    void createEditorOverlayResources();
     void createRenderGraph();
     void createPathTracingRenderGraph();
     void importUpscalingHistoryImages();
     void updateUpscalingDescriptor();
     void updateToneMappingDescriptor();
+    void updateRainDescriptor();
     void updatePathTracingDescriptors();
     void updatePathHistoryDescriptors();
     void updatePathReconstructionDescriptors();
     void updatePathDenoisingDescriptors();
     void updateNrdDescriptors();
+    void updateAtmosphereEnvironmentDescriptors();
     void updateShadowDescriptor();
     void updateHiZDescriptors();
     void resetCamera();
+    void applyAtmosphereDemoCamera();
     void updateCamera();
     void updateFrameUniform(std::size_t frameIndex);
+    void updateEditorOverlayBuffer(std::size_t frameIndex);
     void recreateSwapchain();
     void recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageIndex,
                      std::size_t frameIndex, bool capture, bool exportAovs);
     void recordPbrPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
                        const GraphFrameContext& context);
     void recordPathTracingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context);
+    void recordAtmosphereEnvironmentPass(VkCommandBuffer commandBuffer,
+                                         const GraphFrameContext& context);
     void recordPathHistoryPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context);
     void recordPathReconstructionPass(VkCommandBuffer commandBuffer,
-                                      const GraphFrameContext& context);
+                                       const GraphFrameContext& context);
     void recordPathDenoisingPass(VkCommandBuffer commandBuffer, const GraphFrameContext& context,
                                  std::size_t passIndex);
     void recordNrdPreparePass(VkCommandBuffer commandBuffer, const GraphFrameContext& context);
@@ -348,6 +447,12 @@ class Renderer final {
     void recordToneMappingPass(VkCommandBuffer commandBuffer,
                                const render_graph::RenderGraph& graph,
                                const GraphFrameContext& context);
+    void recordRainPass(VkCommandBuffer commandBuffer,
+                        const GraphFrameContext& context);
+    void updateWeatherDemo(float deltaSeconds);
+    void recordEditorOverlayPass(VkCommandBuffer commandBuffer,
+                                 const render_graph::RenderGraph& graph,
+                                 const GraphFrameContext& context);
     void recordCapturePass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph);
     void writeCapture() const;
     void writePathAovExport() const;
@@ -356,6 +461,7 @@ class Renderer final {
         shadowCulling,
         shadowMap,
         pbrGeometry,
+        atmosphereEnvironment,
         pathTracing,
         pathHistory,
         pathReconstruction,
@@ -370,6 +476,7 @@ class Renderer final {
         reactiveMask,
         upscaling,
         toneMapping,
+        rain,
         count,
     };
     void recordBloomPass(VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
@@ -415,7 +522,7 @@ class Renderer final {
     static constexpr std::size_t directionalShadowCascadeCount = 3;
     static constexpr std::size_t gpuTimingPassCount =
         static_cast<std::size_t>(GpuTimingPass::count);
-    platform::Window& window_;
+    platform::RenderSurface& surfaceHost_;
     const vulkan::Instance& instance_;
     const vulkan::Device& device_;
     RendererConfig config_;
@@ -466,18 +573,33 @@ class Renderer final {
     std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight> uniformBuffers_{};
     std::unique_ptr<vulkan::Buffer> bloomControlsBuffer_;
     std::unique_ptr<vulkan::Buffer> captureReadbackBuffer_;
+    static constexpr VkDeviceSize editorOverlayBufferSize = 4U * 1024U * 1024U;
+    std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight>
+        editorOverlayVertexBuffers_{};
     std::unique_ptr<vulkan::Buffer> pathAovReadbackBuffer_;
     static constexpr std::size_t pathAovReadbackTargetCount =
         static_cast<std::size_t>(PathAovReadbackTarget::count);
     std::array<VkDeviceSize, pathAovReadbackTargetCount> pathAovReadbackOffsets_{};
     std::unique_ptr<vulkan::Buffer> environmentSamplingBuffer_;
     std::unique_ptr<vulkan::Buffer> emissiveTriangleBuffer_;
+#if RENDERER_ENABLE_NRD
     std::unique_ptr<nvidia::NrdVulkanDenoiser> nrdDenoiser_;
+#endif
     std::vector<std::unique_ptr<vulkan::Image>> textureImages_;
     std::vector<std::unique_ptr<vulkan::ImageView>> textureViews_;
     std::vector<std::unique_ptr<vulkan::Sampler>> textureSamplers_;
     std::unique_ptr<vulkan::Image> environmentImage_;
     std::unique_ptr<vulkan::ImageView> environmentView_;
+    std::unique_ptr<vulkan::Image> atmosphereTransmittanceImage_;
+    std::unique_ptr<vulkan::ImageView> atmosphereTransmittanceView_;
+    std::unique_ptr<vulkan::Image> atmosphereScatteringImage_;
+    std::unique_ptr<vulkan::ImageView> atmosphereScatteringView_;
+    std::unique_ptr<vulkan::Image> atmosphereIrradianceImage_;
+    std::unique_ptr<vulkan::ImageView> atmosphereIrradianceView_;
+    std::unique_ptr<vulkan::Image> cloudBaseNoiseImage_;
+    std::unique_ptr<vulkan::ImageView> cloudBaseNoiseView_;
+    std::unique_ptr<vulkan::Image> cloudDetailNoiseImage_;
+    std::unique_ptr<vulkan::ImageView> cloudDetailNoiseView_;
     std::unique_ptr<vulkan::Image> diffuseIrradianceImage_;
     std::unique_ptr<vulkan::ImageView> diffuseIrradianceView_;
     std::unique_ptr<vulkan::Image> prefilteredSpecularImage_;
@@ -554,6 +676,7 @@ class Renderer final {
     std::unique_ptr<vulkan::ImageView> dlssOutputView_;
     std::unique_ptr<vulkan::Sampler> iblSampler_;
     std::unique_ptr<vulkan::Sampler> brdfLutSampler_;
+    std::unique_ptr<vulkan::Sampler> proceduralNoiseSampler_;
     std::unique_ptr<vulkan::Sampler> hiZSampler_;
     std::unique_ptr<vulkan::Sampler> shadowSampler_;
     vulkan::UploadContext uploadContext_;
@@ -576,7 +699,11 @@ class Renderer final {
     std::unique_ptr<vulkan::ShaderModule> temporalUpscalingFragmentShader_;
     std::unique_ptr<vulkan::ShaderModule> toneMappingVertexShader_;
     std::unique_ptr<vulkan::ShaderModule> toneMappingFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> rainFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> editorOverlayVertexShader_;
+    std::unique_ptr<vulkan::ShaderModule> editorOverlayFragmentShader_;
     std::unique_ptr<vulkan::ShaderModule> taaFragmentShader_;
+    std::unique_ptr<vulkan::ShaderModule> atmosphereEnvironmentShader_;
     std::unique_ptr<vulkan::ShaderModule> pathTracingRayGenerationShader_;
     std::unique_ptr<vulkan::ShaderModule> pathTracingRadianceMissShader_;
     std::unique_ptr<vulkan::ShaderModule> pathTracingShadowMissShader_;
@@ -589,6 +716,8 @@ class Renderer final {
     std::unique_ptr<vulkan::ShaderModule> pathNrdResolveShader_;
     std::unique_ptr<vulkan::DescriptorSetLayout> pathTracingDescriptorSetLayout_;
     std::unique_ptr<vulkan::DescriptorPool> pathTracingDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> atmosphereEnvironmentDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> atmosphereEnvironmentDescriptorPool_;
     std::unique_ptr<vulkan::DescriptorSetLayout> pathHistoryDescriptorSetLayout_;
     std::unique_ptr<vulkan::DescriptorPool> pathHistoryDescriptorPool_;
     std::unique_ptr<vulkan::DescriptorSetLayout> pathReconstructionDescriptorSetLayout_;
@@ -623,6 +752,8 @@ class Renderer final {
     std::unique_ptr<vulkan::DescriptorPool> temporalUpscalingDescriptorPool_;
     std::unique_ptr<vulkan::DescriptorSetLayout> toneMappingDescriptorSetLayout_;
     std::unique_ptr<vulkan::DescriptorPool> toneMappingDescriptorPool_;
+    std::unique_ptr<vulkan::DescriptorSetLayout> rainDescriptorSetLayout_;
+    std::unique_ptr<vulkan::DescriptorPool> rainDescriptorPool_;
     std::unique_ptr<vulkan::GraphicsPipeline> graphicsPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> shadowPipeline_;
     std::unique_ptr<vulkan::ComputePipeline> shadowCullPipeline_;
@@ -640,6 +771,14 @@ class Renderer final {
     std::unique_ptr<vulkan::GraphicsPipeline> reactiveMaskPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> temporalUpscalingPipeline_;
     std::unique_ptr<vulkan::GraphicsPipeline> toneMappingPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> rainPipeline_;
+    std::unique_ptr<vulkan::ComputePipeline> atmosphereEnvironmentPipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> editorSceneTrianglePipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> editorSelectionTrianglePipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> editorDepthLinePipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> editorDepthTrianglePipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> editorOverlayTrianglePipeline_;
+    std::unique_ptr<vulkan::GraphicsPipeline> editorOverlayLinePipeline_;
     std::unique_ptr<vulkan::RayTracingPipeline> pathTracingPipeline_;
     std::unique_ptr<vulkan::ComputePipeline> pathHistoryPipeline_;
     std::unique_ptr<vulkan::ComputePipeline> pathReconstructionPipeline_;
@@ -650,6 +789,9 @@ class Renderer final {
     render_graph::ImageHandle graphSwapchainImage_;
     std::vector<render_graph::ImageHandle> graphTextureImages_;
     render_graph::ImageHandle graphEnvironmentImage_;
+    render_graph::ImageHandle graphAtmosphereTransmittanceImage_;
+    render_graph::ImageHandle graphAtmosphereScatteringImage_;
+    render_graph::ImageHandle graphAtmosphereIrradianceImage_;
     render_graph::ImageHandle graphDiffuseIrradianceImage_;
     render_graph::ImageHandle graphPrefilteredSpecularImage_;
     render_graph::ImageHandle graphBrdfLutImage_;
@@ -731,6 +873,7 @@ class Renderer final {
     std::array<render_graph::BufferHandle, directionalShadowCascadeCount>
         graphShadowDrawCountBuffers_{};
     render_graph::BufferHandle graphUniformBuffer_;
+    render_graph::BufferHandle graphEditorOverlayVertexBuffer_;
     render_graph::BufferHandle graphCaptureBuffer_;
     render_graph::BufferHandle graphPathAovReadbackBuffer_;
     std::array<Frame, framesInFlight> frames_{};
@@ -757,9 +900,42 @@ class Renderer final {
     float cameraYaw_ = -1.57079632679F;
     float cameraPitch_ = 0.0F;
     float environmentRotationRadians_ = 0.0F;
+    lighting::AtmosphereDemoView atmosphereDemoView_{};
+    float atmosphereBaseExposureEv_ = 0.0F;
+    float timeOfDayHour_ = 16.0F;
+    float timeOfDayCycleSeconds_ = 120.0F;
+    bool timeOfDayPaused_ = false;
+    // Start on a representative broken-cloud region instead of the unusually
+    // large clear cell at the procedural field's origin.
+    glm::vec2 cloudWindOffsetKm_{72.0F, -15.5F};
+    float rainSimulationTimeSeconds_ = 0.0F;
+    float rainWetnessAccumulation_ = 0.0F;
+    float rainSteamAgeSeconds_ = 0.0F;
+    float weatherDemoTimeSeconds_ = 0.0F;
+    float weatherDemoBaseWindDirectionRadians_ = 0.0F;
     float cameraNear_ = 0.01F;
     float cameraFar_ = 1000.0F;
     float cameraFovRadians_ = 0.7330382858F;
+    std::optional<RendererCamera> externalCamera_;
+    struct EditorOverlayRange {
+        std::uint32_t first = 0U;
+        std::uint32_t count = 0U;
+    };
+    struct EditorOverlayRanges {
+        EditorOverlayRange sceneTriangles;
+        EditorOverlayRange selectedFaceTriangles;
+        EditorOverlayRange gridLines;
+        EditorOverlayRange xRayMeshLines;
+        EditorOverlayRange xRayDepthScreenTriangles;
+        EditorOverlayRange xRayTriangles;
+        EditorOverlayRange meshLines;
+        EditorOverlayRange overlayWorldLines;
+        EditorOverlayRange depthScreenTriangles;
+        EditorOverlayRange overlayScreenTriangles;
+        EditorOverlayRange overlayScreenLines;
+    };
+    EditorOverlayFrame editorOverlay_;
+    EditorOverlayRanges editorOverlayRanges_;
     float temporalScriptOriginYaw_ = -1.57079632679F;
     glm::vec3 temporalScriptOrigin_{0.0F};
     std::chrono::steady_clock::time_point previousCameraUpdate_{};
@@ -790,6 +966,8 @@ class Renderer final {
     bool pathHistoryLayoutsInitialized_ = false;
     bool nrdExternalLayoutsInitialized_ = false;
     bool pathTracingResetPending_ = false;
+    bool atmosphereEnvironmentUpdatePending_ = true;
+    std::uint32_t atmosphereHistoryResetFramesRemaining_ = 0U;
     bool pathTracingReportWritten_ = false;
 };
 

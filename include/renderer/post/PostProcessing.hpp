@@ -87,6 +87,7 @@ struct ResourceMemory {
 [[nodiscard]] float exposureMultiplier(float exposureEv);
 [[nodiscard]] glm::vec3 applyExposure(const glm::vec3& color, float exposureEv);
 [[nodiscard]] glm::vec3 acesFitted(const glm::vec3& color);
+[[nodiscard]] glm::vec3 agxToneMap(const glm::vec3& color);
 [[nodiscard]] glm::vec3 compositeToneMap(const glm::vec3& hdr, const glm::vec3& bloom,
                                          float exposureEv);
 [[nodiscard]] ImageMetrics measure(const HdrImage& image);

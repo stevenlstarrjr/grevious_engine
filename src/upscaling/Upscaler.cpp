@@ -84,7 +84,7 @@ class SpatialUpscaler final : public IUpscaler {
         : qualityMode_(qualityMode), renderScale_(renderScale) {
         if (!std::isfinite(renderScale_) || renderScale_ < minimumSpatialRenderScale ||
             renderScale_ > maximumSpatialRenderScale) {
-            throw std::invalid_argument("Spatial render scale must be finite and in [0.5, 1.0]");
+            throw std::invalid_argument("Spatial render scale must be finite and in [0.5, 2.0]");
         }
         if (qualityMode_ == QualityMode::native) {
             throw std::invalid_argument("Spatial upscaling requires a scaled quality mode");
@@ -162,7 +162,7 @@ class TemporalUpscaler final : public IUpscaler {
     TemporalUpscaler(QualityMode qualityMode, float renderScale)
         : qualityMode_(qualityMode), renderScale_(renderScale) {
         if (!std::isfinite(renderScale_) || renderScale_ < minimumSpatialRenderScale ||
-            renderScale_ > maximumSpatialRenderScale) {
+            renderScale_ > maximumUpscalingRenderScale) {
             throw std::invalid_argument("Temporal render scale must be finite and in [0.5, 1.0]");
         }
         if (qualityMode_ == QualityMode::native) {
@@ -183,7 +183,7 @@ class TemporalUpscaler final : public IUpscaler {
             .sharpening = false,
             .dynamicResolution = false,
             .minimumRenderScale = minimumSpatialRenderScale,
-            .maximumRenderScale = maximumSpatialRenderScale,
+            .maximumRenderScale = maximumUpscalingRenderScale,
         };
     }
     [[nodiscard]] InputConventions inputConventions() const override { return {}; }
@@ -241,7 +241,7 @@ class DlssUpscaler final : public IUpscaler {
     DlssUpscaler(QualityMode qualityMode, float renderScale)
         : qualityMode_(qualityMode), renderScale_(renderScale) {
         if (!std::isfinite(renderScale_) || renderScale_ < minimumSpatialRenderScale ||
-            renderScale_ > maximumSpatialRenderScale) {
+            renderScale_ > maximumUpscalingRenderScale) {
             throw std::invalid_argument("DLSS render scale must be finite and in [0.5, 1.0]");
         }
         if (qualityMode_ == QualityMode::native) {
@@ -262,7 +262,7 @@ class DlssUpscaler final : public IUpscaler {
             .sharpening = false,
             .dynamicResolution = false,
             .minimumRenderScale = minimumSpatialRenderScale,
-            .maximumRenderScale = maximumSpatialRenderScale,
+            .maximumRenderScale = maximumUpscalingRenderScale,
         };
     }
     [[nodiscard]] InputConventions inputConventions() const override { return {}; }

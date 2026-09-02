@@ -26,6 +26,10 @@ layout(set = 0, binding = 1) uniform FrameData
     vec4 shadowCascadeSplits;
     vec4 shadowCascadeDepthRadii;
     vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
 } frameData;
 layout(set = 0, binding = 2) uniform sampler2D bloomColor;
 layout(set = 0, binding = 3) uniform sampler2D motionDepth;
@@ -127,6 +131,38 @@ vec3 applyFilmGrain(vec3 mapped)
 void main()
 {
     vec4 resolved = texture(hdrColor, uv);
+    // Ray Reconstruction is designed for surfaces with meaningful depth,
+    // normal, albedo, and hit-distance guides. Primary atmosphere misses have
+    // no surface guides, so retaining them in RR history produces large bright
+    // shapes that slowly fade as the Sun moves. For the final atmosphere view,
+    // composite the current exact path-traced background after reconstruction
+    // while leaving all finite scene surfaces in the reconstructed image.
+    if (frameData.temporalFlags.y == 0u &&
+        frameData.atmosphereSunDirection.w > 0.5 &&
+        frameData.environmentParameters.z >= 1.0) {
+        ivec2 motionSize = textureSize(motionDepth, 0);
+        ivec2 motionCoordinate = clamp(ivec2(uv * vec2(motionSize)),
+                                       ivec2(0), motionSize - 1);
+        bool infiniteBackground =
+            texelFetch(motionDepth, motionCoordinate, 0).w <= 0.0;
+        // A current-frame binary hit/miss mask is intentionally jittered at
+        // silhouettes. Replacing RR with the exact sky on those boundary
+        // samples makes the horizon alternate between two pipelines every
+        // frame. Only replace pixels safely inside the background; leave a
+        // one-texel guard band for RR to reconstruct and antialias.
+        bool backgroundInterior = infiniteBackground;
+        for (int y = -1; y <= 1 && backgroundInterior; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                ivec2 neighbor = clamp(motionCoordinate + ivec2(x, y),
+                                       ivec2(0), motionSize - 1);
+                backgroundInterior = backgroundInterior &&
+                    texelFetch(motionDepth, neighbor, 0).w <= 0.0;
+            }
+        }
+        if (backgroundInterior) {
+            resolved = vec4(texture(bloomColor, uv).rgb, 1.0);
+        }
+    }
     if (frameData.temporalFlags.y == 1u) {
         vec2 motion = texture(motionDepth, uv).xy;
         float magnitude = clamp(length(motion) * 64.0, 0.0, 1.0);
@@ -241,9 +277,6 @@ void main()
         hdr += texture(bloomColor, uv).rgb * bloomIntensity;
     }
     hdr *= max(frameData.cameraPositionExposure.w, 0.0);
-    bool pathTracedPresentation = frameData.environmentParameters.z >= 1.0;
-    vec3 mapped = pathTracedPresentation
-        ? rendererPathTracedDisplayFitted(hdr)
-        : rendererAcesFitted(hdr);
+    vec3 mapped = rendererAgx(hdr);
     outColor = vec4(applyFilmGrain(mapped), 1.0);
 }

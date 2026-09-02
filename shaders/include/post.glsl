@@ -15,21 +15,41 @@ vec3 rendererAcesFitted(vec3 color)
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
 }
 
-vec3 rendererPathTracedDisplayFitted(vec3 color)
+vec3 rendererAgxContrastApprox(vec3 x)
 {
-    // The compact ACES fit has a deliberately deep toe. That is attractive for
-    // ordinary raster lighting, but it crushes physically valid multi-bounce
-    // radiance in interiors when a sunlit opening is also visible. Preserve
-    // additional scene-referred shadow latitude before applying the unchanged
-    // ACES highlight shoulder. The boost falls away continuously with luminance,
-    // so direct sun and emissive highlights retain their existing white point.
-    float sceneLuminance = max(dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.0);
-    // Deep interiors need roughly three additional stops to coexist with a
-    // daylight opening on an SDR display. The exponential makes this a local
-    // shadow compression rather than a second global exposure: it is 8x at
-    // black, about 3.6x at middle-dark values, and effectively 1x in sunlight.
-    float shadowLatitude = 1.0 + 7.0 * exp(-12.0 * sceneLuminance);
-    return rendererAcesFitted(color * shadowLatitude);
+    vec3 x2 = x * x;
+    vec3 x4 = x2 * x2;
+    return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 -
+           6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232;
+}
+
+vec3 rendererAgx(vec3 color)
+{
+    // Minimal real-time AgX display transform. The inset/outset matrices place
+    // linear sRGB in AgX's working space, while the logarithmic 16.5-stop domain
+    // and sigmoid preserve separation in bright skies and reflections instead
+    // of driving each RGB channel independently into a hard white shoulder.
+    const mat3 agxInset = mat3(
+        0.842479062253094,  0.0423282422610123, 0.0423756549057051,
+        0.0784335999999992, 0.878468636469772,  0.0784336000000000,
+        0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+    const mat3 agxOutset = mat3(
+         1.19687900512017,   -0.0528968517574562, -0.0529716355144438,
+        -0.0980208811401368,  1.15190312990417,   -0.0980434501171241,
+        -0.0990297440797205, -0.0989611768448433,  1.15107367264116);
+    const float minEv = -12.47393;
+    const float maxEv = 4.026069;
+
+    vec3 working = agxInset * max(color, vec3(0.0));
+    working = clamp(log2(max(working, vec3(1.0e-10))), minEv, maxEv);
+    working = (working - minEv) / (maxEv - minEv);
+    working = rendererAgxContrastApprox(working);
+
+    // AgX's sigmoid is display encoded. Convert it back to linear light before
+    // writing to the sRGB swapchain so Vulkan performs the final sRGB encoding
+    // exactly once.
+    vec3 displayLinear = pow(max(agxOutset * working, vec3(0.0)), vec3(2.2));
+    return clamp(displayLinear, 0.0, 1.0);
 }
 
 #endif

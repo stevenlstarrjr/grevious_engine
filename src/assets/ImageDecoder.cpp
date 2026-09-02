@@ -17,20 +17,20 @@
 #include <string>
 
 namespace renderer::assets {
-namespace {
-
-constexpr std::size_t channelCount = 4;
-
-float srgbToLinear(float value) {
+float srgbToLinearChannel(float value) {
     return value <= 0.04045F ? value / 12.92F
                              : std::pow((value + 0.055F) / 1.055F, 2.4F);
 }
 
-float linearToSrgb(float value) {
+float linearToSrgbChannel(float value) {
     const float clamped = std::clamp(value, 0.0F, 1.0F);
     return clamped <= 0.0031308F ? clamped * 12.92F
                                 : 1.055F * std::pow(clamped, 1.0F / 2.4F) - 0.055F;
 }
+
+namespace {
+
+constexpr std::size_t channelCount = 4;
 
 std::uint8_t quantizeUnorm(float value) {
     return static_cast<std::uint8_t>(
@@ -172,7 +172,7 @@ DecodedImage downsample(const DecodedImage& source, ImageMipSemantic semantic) {
                     for (std::size_t channel = 0; channel < channelCount; ++channel) {
                         float value = read(sourceX, sourceY, channel);
                         if (source.colorSpace == ImageColorSpace::srgb && channel < 3U) {
-                            value = srgbToLinear(value);
+                            value = srgbToLinearChannel(value);
                         }
                         average[channel] += value * sampleWeight;
                     }
@@ -199,7 +199,7 @@ DecodedImage downsample(const DecodedImage& source, ImageMipSemantic semantic) {
                 average[2] = normalZ * 0.5F + 0.5F;
             } else if (source.colorSpace == ImageColorSpace::srgb) {
                 for (std::size_t channel = 0; channel < 3U; ++channel) {
-                    average[channel] = linearToSrgb(average[channel]);
+                    average[channel] = linearToSrgbChannel(average[channel]);
                 }
             }
             for (std::size_t channel = 0; channel < channelCount; ++channel) {

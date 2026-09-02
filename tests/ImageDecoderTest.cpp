@@ -102,6 +102,10 @@ int main() {
                     srgbMips.levels.back().unorm8[0] >= 187 &&
                     srgbMips.levels.back().unorm8[0] <= 188,
                 "sRGB mip generation did not average in linear light");
+        require(std::abs(ra::srgbToLinearChannel(0.5F) - 0.21404114F) < 1.0e-6F &&
+                    std::abs(ra::srgbToLinearChannel(0.04045F) - 0.0031308F) < 1.0e-6F &&
+                    std::abs(ra::linearToSrgbChannel(0.21404114F) - 0.5F) < 1.0e-6F,
+                "sRGB transfer functions do not match the glTF/Vulkan reference values");
 
         const ra::DecodedMipChain oddMips = ra::generateMipChain(makeUnormImage(
             3, 1, ra::ImageColorSpace::linear,

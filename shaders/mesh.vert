@@ -23,6 +23,10 @@ layout(set = 0, binding = 0) uniform FrameData
     vec4 shadowCascadeSplits;
     vec4 shadowCascadeDepthRadii;
     vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
 } frameData;
 
 layout(location = 0) in vec3 inPosition;
@@ -30,6 +34,7 @@ layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUv;
 layout(location = 3) in vec4 inTangent;
 layout(location = 4) in vec2 inUv1;
+layout(location = 5) in vec4 inColor;
 
 struct InstanceRecord
 {
@@ -69,6 +74,7 @@ layout(location = 5) out flat uint materialIndex;
 layout(location = 6) out vec4 currentClipPosition;
 layout(location = 7) out vec4 previousClipPosition;
 layout(location = 8) out flat uint sceneInstanceIndex;
+layout(location = 9) out vec4 vertexColor;
 
 void main()
 {
@@ -84,6 +90,7 @@ void main()
     float mirroredHandedness = (instance.meshMaterial.w & 1u) != 0u ? -1.0 : 1.0;
     worldTangent = vec4(transformedTangent, inTangent.w * mirroredHandedness);
     uv1 = inUv1;
+    vertexColor = inColor;
     materialIndex = instance.meshMaterial.y;
     gl_Position = frameData.viewProjection * vec4(worldPosition, 1.0);
     currentClipPosition = frameData.unjitteredViewProjection * vec4(worldPosition, 1.0);

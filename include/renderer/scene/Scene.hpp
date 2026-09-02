@@ -105,6 +105,11 @@ struct Material {
     MaterialQueue queue = MaterialQueue::opaque;
     float alphaCutoff = 0.5F;
     bool doubleSided = false;
+    // Weather material roles are explicit. Rain receivers develop capped
+    // puddles plus full-surface dampness; wet-coat materials develop a
+    // continuous glossy film suitable for paint, metal, roads, and equipment.
+    bool rainReceiver = false;
+    bool wetCoat = false;
 };
 
 enum class PrimitiveTopology : std::uint8_t {

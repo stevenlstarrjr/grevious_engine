@@ -154,8 +154,8 @@ bloom_delta="$("${metrics}" compare "${output_dir}/bloom_off_a.png" \
     "${output_dir}/bloom_on_final.png")"
 require_ge "$(field "${bloom_delta}" rmse)" 0.001 "bloom enabled/disabled image delta"
 
-# GPU isolation points supplement the complete CPU reference curves for ACES
-# fit and exp2(EV). Both series must be finite and monotonic.
+# GPU isolation points supplement the complete CPU reference curves for AgX
+# production output and exp2(EV). Both series must be finite and monotonic.
 previous_tone=-1
 for value in 0 0.000001 0.01 0.18 1 4 65504; do
     tag="${value//./_}"

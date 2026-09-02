@@ -6,6 +6,10 @@
 
 #include "include/pbr.glsl"
 #include "include/ibl.glsl"
+#define GENESIS_CLOUD_BASE_NOISE_BINDING 18
+#define GENESIS_CLOUD_DETAIL_NOISE_BINDING 19
+#include "include/genesis_clouds.glsl"
+#include "include/weather_wetness.glsl"
 #ifndef RENDERER_RAY_QUERY_SHADOWS
 #include "include/shadows.glsl"
 #endif
@@ -33,11 +37,17 @@ layout(set = 0, binding = 0) uniform FrameData
     vec4 shadowCascadeSplits;
     vec4 shadowCascadeDepthRadii;
     vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
+    vec4 weatherParameters;
 } frameData;
 
 layout(set = 0, binding = 2) uniform sampler2D diffuseIrradianceMap;
 layout(set = 0, binding = 3) uniform sampler2D prefilteredSpecularMap;
 layout(set = 0, binding = 4) uniform sampler2D brdfIntegrationLut;
+layout(set = 0, binding = 5) uniform sampler2D environmentMap;
 #ifdef RENDERER_RAY_QUERY_SHADOWS
 layout(set = 0, binding = 11) uniform accelerationStructureEXT sceneTlas;
 #else
@@ -97,6 +107,7 @@ layout(location = 5) in flat uint materialIndex;
 layout(location = 6) in vec4 currentClipPosition;
 layout(location = 7) in vec4 previousClipPosition;
 layout(location = 8) in flat uint sceneInstanceIndex;
+layout(location = 9) in vec4 vertexColor;
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec4 outMotion;
 layout(location = 2) out vec4 outNormal;
@@ -109,6 +120,8 @@ const uint EMISSIVE_TEXTURE_BIT = 1u << 4u;
 const uint ALPHA_MASK_MATERIAL_BIT = 1u << 0u;
 const uint ALPHA_BLEND_MATERIAL_BIT = 1u << 1u;
 const uint ADDITIVE_MATERIAL_BIT = 1u << 3u;
+const uint RAIN_RECEIVER_MATERIAL_BIT = 1u << 4u;
+const uint WET_COAT_MATERIAL_BIT = 1u << 5u;
 
 vec2 materialUv(MaterialRecord material, uint textureBit)
 {
@@ -118,8 +131,15 @@ vec2 materialUv(MaterialRecord material, uint textureBit)
 #ifdef RENDERER_RAY_QUERY_SHADOWS
 vec2 rayVertexUv(uint vertexIndex, bool useUv1)
 {
-    uint firstComponent = vertexIndex * 14u + (useUv1 ? 12u : 6u);
+    uint firstComponent = vertexIndex * 18u + (useUv1 ? 12u : 6u);
     return vec2(rayVertexData[firstComponent], rayVertexData[firstComponent + 1u]);
+}
+
+vec4 rayVertexColor(uint vertexIndex)
+{
+    uint firstComponent = vertexIndex * 18u + 14u;
+    return vec4(rayVertexData[firstComponent], rayVertexData[firstComponent + 1u],
+                rayVertexData[firstComponent + 2u], rayVertexData[firstComponent + 3u]);
 }
 
 bool rayCandidateBlocksLight(uint instanceIndex, uint primitiveIndex, vec2 barycentrics)
@@ -134,26 +154,27 @@ bool rayCandidateBlocksLight(uint instanceIndex, uint primitiveIndex, vec2 baryc
         return true;
     }
 
-    float alpha = material.baseColorFactor.a;
-    if ((material.textureState.y & BASE_COLOR_TEXTURE_BIT) == 0u) {
-        return alpha >= material.emissiveAlphaCutoff.a;
-    }
-
     uvec4 geometry = rayGeometryRanges[instance.meshMaterial.x];
     uint triangleFirstIndex = geometry.x + primitiveIndex * 3u;
     uvec3 triangle =
         uvec3(rayIndices[triangleFirstIndex], rayIndices[triangleFirstIndex + 1u],
               rayIndices[triangleFirstIndex + 2u]) + geometry.y;
     vec3 weights = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
-    bool useUv1 = (material.textureState.w & BASE_COLOR_TEXTURE_BIT) != 0u;
-    vec2 candidateUv = rayVertexUv(triangle.x, useUv1) * weights.x +
-                       rayVertexUv(triangle.y, useUv1) * weights.y +
-                       rayVertexUv(triangle.z, useUv1) * weights.z;
+    vec4 candidateColor = rayVertexColor(triangle.x) * weights.x +
+                          rayVertexColor(triangle.y) * weights.y +
+                          rayVertexColor(triangle.z) * weights.z;
+    float alpha = material.baseColorFactor.a * candidateColor.a;
+    if ((material.textureState.y & BASE_COLOR_TEXTURE_BIT) != 0u) {
+        bool useUv1 = (material.textureState.w & BASE_COLOR_TEXTURE_BIT) != 0u;
+        vec2 candidateUv = rayVertexUv(triangle.x, useUv1) * weights.x +
+                           rayVertexUv(triangle.y, useUv1) * weights.y +
+                           rayVertexUv(triangle.z, useUv1) * weights.z;
 
-    // Candidate rays have no useful screen-space texture derivatives. Base-level
-    // alpha is deterministic; ray-cone LOD selection belongs in a later quality pass.
-    alpha *= textureLod(materialTextures[nonuniformEXT(material.textureIndices.x)],
-                        candidateUv, 0.0).a;
+        // Candidate rays have no useful screen-space texture derivatives. Base-level
+        // alpha is deterministic; ray-cone LOD selection belongs in a later quality pass.
+        alpha *= textureLod(materialTextures[nonuniformEXT(material.textureIndices.x)],
+                            candidateUv, 0.0).a;
+    }
     return alpha >= material.emissiveAlphaCutoff.a;
 }
 
@@ -286,7 +307,8 @@ void main()
             materialTextures[nonuniformEXT(material.textureIndices.x)],
             materialUv(material, BASE_COLOR_TEXTURE_BIT));
     }
-    vec4 baseColor = material.baseColorFactor * sampledBaseColor;
+    vec4 baseColor = effectiveGltfBaseColor(
+        material.baseColorFactor, sampledBaseColor, vertexColor);
     if ((material.textureState.z & ALPHA_MASK_MATERIAL_BIT) != 0u &&
         baseColor.a < material.emissiveAlphaCutoff.a) {
         discard;
@@ -314,12 +336,48 @@ void main()
         tangentNormal.xy *= material.metallicRoughnessOcclusionNormal.w;
         normal = normalize(mat3(tangent, bitangent, normal) * tangentNormal);
     }
+    // Shared wetness staging darkens rain receivers before forming puddles.
+    uint weatherMaterialFlags = material.textureState.z &
+        (RAIN_RECEIVER_MATERIAL_BIT | WET_COAT_MATERIAL_BIT);
+    if (weatherMaterialFlags != 0u && frameData.weatherParameters.w > 0.0) {
+        GenesisWetnessLayers wetness = genesisRainWetnessLayers(
+            worldPosition, normal, frameData.weatherParameters.w,
+            frameData.weatherParameters.z);
+        if ((weatherMaterialFlags & RAIN_RECEIVER_MATERIAL_BIT) != 0u) {
+            baseColor.rgb *= mix(1.0, 0.48, wetness.dampness);
+            baseColor.rgb *= mix(1.0, 0.72, wetness.poolingDampness);
+            baseColor.rgb *= mix(1.0, 0.86, wetness.puddles);
+            perceptualRoughness = mix(
+                perceptualRoughness, 0.12, wetness.puddles);
+        }
+        if ((weatherMaterialFlags & WET_COAT_MATERIAL_BIT) != 0u) {
+            baseColor.rgb *= mix(1.0, 0.92, wetness.coating);
+            perceptualRoughness = mix(
+                perceptualRoughness, 0.055, wetness.coating);
+        }
+    }
     vec3 viewDirection = normalize(frameData.cameraPositionExposure.xyz - worldPosition);
     vec3 materialColor = baseColor.rgb;
 
     vec3 directionalLight = normalize(-frameData.directionalDirectionIntensity.xyz);
+    float cloudSunVisibility = genesisCloudSurfaceSunVisibility(
+        worldPosition, frameData.atmosphereCamera,
+        frameData.atmosphereSunDirection.xyz,
+        frameData.cloudLayerParameters, frameData.cloudWeatherParameters);
+    float cachedCloudEnergy = frameData.cloudWeatherParameters.w > 0.5
+                                  ? textureLod(
+                                        environmentMap,
+                                        directionToDualParaboloidUv(directionalLight),
+                                        0.0).a
+                                  : 1.0;
+    // Retain a subtle whole-sky energy response while the projected field owns
+    // the visible shadow pattern. This keeps overcast illumination coherent
+    // without recreating the previous uniform on/off shadow.
+    cloudSunVisibility *= mix(0.90, 1.0, cachedCloudEnergy);
     vec3 directionalRadiance = frameData.directionalColor.rgb *
-                               frameData.directionalDirectionIntensity.w;
+                                frameData.directionalDirectionIntensity.w *
+                                cloudSunVisibility *
+                                genesisCloudShadowTint(cloudSunVisibility);
     float sunVisibility = directionalShadowVisibility(worldPosition, normal, directionalLight);
     vec3 radiance = evaluateDirectLight(materialColor, metallic, perceptualRoughness,
                                         normal, viewDirection, directionalLight,
@@ -345,9 +403,21 @@ void main()
     vec3 fresnel = fresnelSchlickRoughness(normalDotView, f0, perceptualRoughness);
     vec3 diffuseWeight = (vec3(1.0) - fresnel) * (1.0 - metallic);
     float environmentRotation = frameData.environmentParameters.x;
+    float atmosphereAmbientScale = frameData.atmosphereSunDirection.w > 0.5
+                                       ? mix(0.025, 1.0,
+                                             smoothstep(-0.16, 0.08,
+                                                        frameData.atmosphereSunDirection.z))
+                                       : 1.0;
+    if (frameData.cloudWeatherParameters.w > 0.5) {
+        atmosphereAmbientScale *= mix(
+            1.0, 0.55,
+            clamp(frameData.cloudLayerParameters.z *
+                  frameData.cloudLayerParameters.w, 0.0, 1.0));
+    }
     vec3 irradiance = texture(
         diffuseIrradianceMap,
-        rotatedDirectionToLatLongUv(normal, environmentRotation)).rgb;
+        rotatedDirectionToLatLongUv(normal, environmentRotation)).rgb *
+        atmosphereAmbientScale;
     vec3 diffuseIndirect = diffuseWeight * materialColor * irradiance / PBR_PI;
 
     vec3 reflection = reflect(-viewDirection, normal);
@@ -355,7 +425,8 @@ void main()
     vec3 prefiltered = textureLod(prefilteredSpecularMap,
                                   rotatedDirectionToLatLongUv(reflection,
                                                               environmentRotation),
-                                  perceptualRoughness * maximumLod).rgb;
+                                  perceptualRoughness * maximumLod).rgb *
+                       atmosphereAmbientScale;
     vec2 brdf = texture(brdfIntegrationLut,
                         vec2(normalDotView, perceptualRoughness)).rg;
     vec3 specularIndirect = prefiltered * (f0 * brdf.x + brdf.y);

@@ -25,6 +25,10 @@ layout(set = 0, binding = 0) uniform FrameData
     vec4 shadowCascadeSplits;
     vec4 shadowCascadeDepthRadii;
     vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
 } frameData;
 
 layout(push_constant) uniform ShadowPushConstants
@@ -35,6 +39,7 @@ layout(push_constant) uniform ShadowPushConstants
 layout(location = 0) in vec3 inPosition;
 layout(location = 2) in vec2 inUv;
 layout(location = 4) in vec2 inUv1;
+layout(location = 5) in vec4 inColor;
 
 struct InstanceRecord
 {
@@ -68,6 +73,7 @@ layout(std430, set = 0, binding = 9) readonly buffer Transforms
 layout(location = 0) out vec2 uv;
 layout(location = 1) out vec2 uv1;
 layout(location = 2) out flat uint materialIndex;
+layout(location = 3) out vec4 vertexColor;
 
 void main()
 {
@@ -76,6 +82,7 @@ void main()
     TransformRecord transform = transforms[instance.meshMaterial.z];
     uv = inUv;
     uv1 = inUv1;
+    vertexColor = inColor;
     materialIndex = instance.meshMaterial.y;
     vec3 worldPosition = vec3(transform.world * vec4(inPosition, 1.0));
     vec4 cascadeCenterRadius = directionalShadowCascadeCenterRadius(

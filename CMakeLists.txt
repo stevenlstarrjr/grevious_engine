@@ -7,6 +7,8 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
 endif()
 
 option(RENDERER_VALIDATION_DEFAULT "Request Vulkan validation by default" ON)
+option(GENESIS_BUILD_SDL_APP "Build the SDL Genesis Render executable" ON)
+option(GENESIS_BUILD_TESTS "Build Genesis unit and integration tests" ${PROJECT_IS_TOP_LEVEL})
 option(RENDERER_ENABLE_NRD "Build the NVIDIA Real-time Denoiser backend" ON)
 if(WIN32)
     set(RENDERER_STREAMLINE_DEFAULT ON)
@@ -31,12 +33,16 @@ endif()
 
 find_package(Vulkan 1.3 REQUIRED)
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GENESIS_BUILD_SDL_APP)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(RENDERER_LIBDECOR REQUIRED libdecor-0)
 endif()
 
-foreach(required_submodule SDL volk VMA glm fastgltf simdjson)
+set(RENDERER_REQUIRED_SUBMODULES volk VMA glm fastgltf simdjson)
+if(GENESIS_BUILD_SDL_APP)
+    list(APPEND RENDERER_REQUIRED_SUBMODULES SDL)
+endif()
+foreach(required_submodule IN LISTS RENDERER_REQUIRED_SUBMODULES)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/${required_submodule}/CMakeLists.txt")
         message(FATAL_ERROR
             "Missing thirdparty/${required_submodule}; run git submodule update --init --recursive")
@@ -52,44 +58,46 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/stb/stb_image.h")
         "Missing thirdparty/stb; run git submodule update --init --recursive")
 endif()
 
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-set(SDL_STATIC ON CACHE BOOL "" FORCE)
-set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
-set(SDL_AUDIO OFF CACHE BOOL "" FORCE)
-set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
-set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
-set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
-set(SDL_GPU OFF CACHE BOOL "" FORCE)
-set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
-set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
-set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
-set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
-set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
-set(SDL_RENDER OFF CACHE BOOL "" FORCE)
-set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
-set(SDL_POWER OFF CACHE BOOL "" FORCE)
-set(SDL_TRAY OFF CACHE BOOL "" FORCE)
-set(SDL_NOTIFICATION OFF CACHE BOOL "" FORCE)
-set(SDL_OFFSCREEN OFF CACHE BOOL "" FORCE)
-set(SDL_VULKAN ON CACHE BOOL "" FORCE)
-set(SDL_KMSDRM OFF CACHE BOOL "" FORCE)
-set(SDL_LIBTHAI OFF CACHE BOOL "" FORCE)
-set(SDL_FRIBIDI OFF CACHE BOOL "" FORCE)
-set(SDL_X11 OFF CACHE BOOL "" FORCE)
-set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
-set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(SDL_WAYLAND_LIBDECOR ON CACHE BOOL "" FORCE)
-    set(SDL_WAYLAND_LIBDECOR_SHARED ON CACHE BOOL "" FORCE)
-    set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
-elseif(WIN32)
-    set(SDL_WAYLAND_LIBDECOR OFF CACHE BOOL "" FORCE)
-    set(SDL_WAYLAND_LIBDECOR_SHARED OFF CACHE BOOL "" FORCE)
-    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
-    set(SDL_DIRECTX ON CACHE BOOL "" FORCE)
+if(GENESIS_BUILD_SDL_APP)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SDL_AUDIO OFF CACHE BOOL "" FORCE)
+    set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
+    set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+    set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+    set(SDL_GPU OFF CACHE BOOL "" FORCE)
+    set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+    set(SDL_HIDAPI OFF CACHE BOOL "" FORCE)
+    set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
+    set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
+    set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+    set(SDL_RENDER OFF CACHE BOOL "" FORCE)
+    set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+    set(SDL_POWER OFF CACHE BOOL "" FORCE)
+    set(SDL_TRAY OFF CACHE BOOL "" FORCE)
+    set(SDL_NOTIFICATION OFF CACHE BOOL "" FORCE)
+    set(SDL_OFFSCREEN OFF CACHE BOOL "" FORCE)
+    set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+    set(SDL_KMSDRM OFF CACHE BOOL "" FORCE)
+    set(SDL_LIBTHAI OFF CACHE BOOL "" FORCE)
+    set(SDL_FRIBIDI OFF CACHE BOOL "" FORCE)
+    set(SDL_X11 OFF CACHE BOOL "" FORCE)
+    set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
+    set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(SDL_WAYLAND_LIBDECOR ON CACHE BOOL "" FORCE)
+        set(SDL_WAYLAND_LIBDECOR_SHARED ON CACHE BOOL "" FORCE)
+        set(SDL_WAYLAND ON CACHE BOOL "" FORCE)
+    elseif(WIN32)
+        set(SDL_WAYLAND_LIBDECOR OFF CACHE BOOL "" FORCE)
+        set(SDL_WAYLAND_LIBDECOR_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+        set(SDL_DIRECTX ON CACHE BOOL "" FORCE)
+    endif()
 endif()
 
 if(RENDERER_ENABLE_NRD)
@@ -115,10 +123,15 @@ if(RENDERER_ENABLE_NRD)
         REQUIRED)
     add_subdirectory(thirdparty/NRD EXCLUDE_FROM_ALL SYSTEM)
 endif()
-add_subdirectory(thirdparty/SDL EXCLUDE_FROM_ALL SYSTEM)
+if(GENESIS_BUILD_SDL_APP)
+    add_subdirectory(thirdparty/SDL EXCLUDE_FROM_ALL SYSTEM)
+endif()
 
 set(VOLK_INSTALL OFF CACHE BOOL "" FORCE)
 set(VOLK_PULL_IN_VULKAN ON CACHE BOOL "" FORCE)
+if(WIN32)
+    set(VOLK_STATIC_DEFINES "VK_USE_PLATFORM_WIN32_KHR" CACHE STRING "" FORCE)
+endif()
 add_subdirectory(thirdparty/volk EXCLUDE_FROM_ALL SYSTEM)
 
 set(VMA_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
@@ -220,7 +233,22 @@ target_include_directories(renderer_pbr PUBLIC include)
 target_link_libraries(renderer_pbr PUBLIC glm::glm)
 set_target_properties(renderer_pbr PROPERTIES CXX_EXTENSIONS OFF)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(renderer_pbr PRIVATE
+target_compile_options(renderer_pbr PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
+        -Wnon-virtual-dtor
+    )
+endif()
+
+add_library(renderer_procedural STATIC src/procedural/NoiseVolume.cpp)
+target_compile_features(renderer_procedural PUBLIC cxx_std_20)
+target_include_directories(renderer_procedural PUBLIC include)
+set_target_properties(renderer_procedural PROPERTIES CXX_EXTENSIONS OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(renderer_procedural PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -279,10 +307,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     )
 endif()
 
-add_library(renderer_ibl STATIC src/lighting/IblBaker.cpp)
+add_library(renderer_ibl STATIC
+    src/lighting/Atmosphere.cpp
+    src/lighting/IblBaker.cpp
+)
 target_compile_features(renderer_ibl PUBLIC cxx_std_20)
 target_include_directories(renderer_ibl PUBLIC include)
 target_link_libraries(renderer_ibl PUBLIC renderer_images glm::glm)
+target_compile_definitions(renderer_ibl PRIVATE
+    GENESIS_BRUNETON_ATMOSPHERE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/BrunetonAtmosphere/assets"
+)
 set_target_properties(renderer_ibl PROPERTIES CXX_EXTENSIONS OFF)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(renderer_ibl PRIVATE
@@ -395,12 +429,16 @@ set(RENDERER_SHADER_SOURCES
     shaders/bloom_downsample.frag
     shaders/bloom_blur_h.frag
     shaders/bloom_blur_v.frag
+    shaders/editor_overlay.frag
+    shaders/editor_overlay.vert
     shaders/taa.frag
     shaders/upscale_spatial.frag
     shaders/upscale_reactive.frag
     shaders/upscale_temporal.frag
     shaders/tonemap.vert
     shaders/tonemap.frag
+    shaders/rain.frag
+    shaders/atmosphere_environment.comp
     shaders/path_trace.rgen
     shaders/path_trace.rmiss
     shaders/path_trace_shadow.rmiss
@@ -413,6 +451,10 @@ set(RENDERER_SHADER_SOURCES
     shaders/path_nrd_resolve.comp
 )
 set(RENDERER_SHADER_HEADERS
+    shaders/include/bruneton_atmosphere.glsl
+    shaders/include/genesis_atmosphere.glsl
+    shaders/include/genesis_clouds.glsl
+    shaders/include/genesis_noise.glsl
     shaders/include/pbr.glsl
     shaders/include/ibl.glsl
     shaders/include/post.glsl
@@ -420,6 +462,7 @@ set(RENDERER_SHADER_HEADERS
     shaders/include/path_trace.glsl
     shaders/include/path_trace_bsdf.glsl
     shaders/include/path_trace_environment.glsl
+    shaders/include/weather_wetness.glsl
 )
 set(RENDERER_SHADER_OUTPUTS)
 foreach(shader_source IN LISTS RENDERER_SHADER_SOURCES)
@@ -465,10 +508,8 @@ add_custom_command(
 list(APPEND RENDERER_SHADER_OUTPUTS "${RENDERER_RAY_QUERY_SHADER_OUTPUT}")
 add_custom_target(renderer_shaders DEPENDS ${RENDERER_SHADER_OUTPUTS})
 
-add_executable(genesis_render
-    src/main.cpp
+set(GENESIS_RENDERER_SOURCES
     src/core/Log.cpp
-    src/platform/Window.cpp
     src/vulkan/Instance.cpp
     src/vulkan/Device.cpp
     src/vulkan/AccelerationStructure.cpp
@@ -482,73 +523,64 @@ add_executable(genesis_render
     src/vulkan/Swapchain.cpp
     src/render_graph/RenderGraph.cpp
     src/renderer/Renderer.cpp
+    src/renderer/RendererEditorOverlay.cpp
+    src/renderer/RendererPathDescriptors.cpp
+    src/renderer/RendererPathPasses.cpp
 )
-if(RENDERER_ENABLE_STREAMLINE)
-    target_sources(genesis_render PRIVATE src/nvidia/StreamlineRuntime.cpp)
+if(WIN32)
+    list(APPEND GENESIS_RENDERER_SOURCES src/platform/Win32RenderSurface.cpp)
 endif()
-add_dependencies(genesis_render renderer_shaders)
 
-target_compile_features(genesis_render PRIVATE cxx_std_20)
-target_include_directories(genesis_render PRIVATE include)
+add_library(genesis_renderer STATIC ${GENESIS_RENDERER_SOURCES})
+add_library(Genesis::Renderer ALIAS genesis_renderer)
 if(RENDERER_ENABLE_STREAMLINE)
-    target_include_directories(genesis_render PRIVATE "${RENDERER_STREAMLINE_ROOT}/include")
+    target_sources(genesis_renderer PRIVATE src/nvidia/StreamlineRuntime.cpp)
 endif()
-target_link_libraries(genesis_render PRIVATE
-    SDL3::SDL3-static
+add_dependencies(genesis_renderer renderer_shaders)
+
+target_compile_features(genesis_renderer PUBLIC cxx_std_20)
+target_include_directories(genesis_renderer PUBLIC include)
+if(RENDERER_ENABLE_STREAMLINE)
+    target_include_directories(genesis_renderer PRIVATE "${RENDERER_STREAMLINE_ROOT}/include")
+endif()
+target_link_libraries(genesis_renderer
+    PUBLIC
+        volk::volk
+        glm::glm
+    PRIVATE
     renderer_gltf
     renderer_ibl
     renderer_output
     renderer_gpu_scene
     renderer_post
+    renderer_procedural
     renderer_ray_tracing
     renderer_temporal
     renderer_upscaling
     renderer_vma
-    volk::volk
-    glm::glm
 )
 if(RENDERER_ENABLE_NRD)
-    target_link_libraries(genesis_render PRIVATE renderer_nrd)
-    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_NRD=1)
+    target_link_libraries(genesis_renderer PRIVATE renderer_nrd)
+    target_compile_definitions(genesis_renderer PUBLIC RENDERER_ENABLE_NRD=1)
 else()
-    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_NRD=0)
+    target_compile_definitions(genesis_renderer PUBLIC RENDERER_ENABLE_NRD=0)
 endif()
 if(RENDERER_ENABLE_STREAMLINE)
-    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_STREAMLINE=1)
-    set(RENDERER_STREAMLINE_RUNTIME_FILES
-        sl.interposer.dll
-        sl.common.dll
-        sl.dlss.dll
-        sl.dlss_d.dll
-        nvngx_dlss.dll
-        nvngx_dlssd.dll
-        nvngx_dlss.license.txt
-    )
-    foreach(streamline_runtime_file IN LISTS RENDERER_STREAMLINE_RUNTIME_FILES)
-        add_custom_command(TARGET genesis_render POST_BUILD
-            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${RENDERER_STREAMLINE_ROOT}/bin/x64/${streamline_runtime_file}"
-                "$<TARGET_FILE_DIR:genesis_render>/${streamline_runtime_file}"
-            VERBATIM
-        )
-    endforeach()
+    target_compile_definitions(genesis_renderer PUBLIC RENDERER_ENABLE_STREAMLINE=1)
+    set_property(TARGET genesis_renderer PROPERTY GENESIS_STREAMLINE_RUNTIME_DIR
+        "${RENDERER_STREAMLINE_ROOT}/bin/x64")
 else()
-    target_compile_definitions(genesis_render PRIVATE RENDERER_ENABLE_STREAMLINE=0)
+    target_compile_definitions(genesis_renderer PUBLIC RENDERER_ENABLE_STREAMLINE=0)
 endif()
-target_compile_definitions(genesis_render PRIVATE
+target_compile_definitions(genesis_renderer PRIVATE
     RENDERER_SHADER_DIR="${RENDERER_SHADER_OUTPUT_DIR}"
     RENDERER_PIPELINE_CACHE_PATH="${CMAKE_BINARY_DIR}/cache/$<CONFIG>/pipeline.bin"
+    RENDERER_MATERIAL_REFERENCE_DIR="${CMAKE_SOURCE_DIR}/reference/materials"
     RENDERER_BUILD_CONFIGURATION="$<CONFIG>"
 )
 
-if(RENDERER_VALIDATION_DEFAULT)
-    target_compile_definitions(genesis_render PRIVATE RENDERER_VALIDATION_DEFAULT=1)
-else()
-    target_compile_definitions(genesis_render PRIVATE RENDERER_VALIDATION_DEFAULT=0)
-endif()
-
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(genesis_render PRIVATE
+    target_compile_options(genesis_renderer PRIVATE
         -Wall
         -Wextra
         -Wpedantic
@@ -561,14 +593,74 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     )
 endif()
 
-set_target_properties(genesis_render PROPERTIES
+set_target_properties(genesis_renderer PROPERTIES
     CXX_EXTENSIONS OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Call this for any Windows executable that creates StreamlineRuntime. It keeps
+# the SDL demo and external Qt hosts on the same signed NVIDIA runtime files.
+function(genesis_copy_streamline_runtime target)
+    if(NOT TARGET "${target}")
+        message(FATAL_ERROR "genesis_copy_streamline_runtime: unknown target ${target}")
+    endif()
+    if(RENDERER_ENABLE_STREAMLINE)
+        set(streamline_runtime_files
+            sl.interposer.dll
+            sl.common.dll
+            sl.dlss.dll
+            sl.dlss_d.dll
+            nvngx_dlss.dll
+            nvngx_dlssd.dll
+            nvngx_dlss.license.txt
+        )
+        get_target_property(streamline_runtime_dir genesis_renderer
+            GENESIS_STREAMLINE_RUNTIME_DIR)
+        foreach(streamline_runtime_file IN LISTS streamline_runtime_files)
+            add_custom_command(TARGET "${target}" POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${streamline_runtime_dir}/${streamline_runtime_file}"
+                    "$<TARGET_FILE_DIR:${target}>/${streamline_runtime_file}"
+                VERBATIM
+            )
+        endforeach()
+    endif()
+endfunction()
+
+if(GENESIS_BUILD_SDL_APP)
+    add_executable(genesis_render
+        src/main.cpp
+        src/platform/Window.cpp
+    )
+    target_compile_features(genesis_render PRIVATE cxx_std_20)
+    target_link_libraries(genesis_render PRIVATE Genesis::Renderer SDL3::SDL3-static)
+    if(RENDERER_VALIDATION_DEFAULT)
+        target_compile_definitions(genesis_render PRIVATE RENDERER_VALIDATION_DEFAULT=1)
+    else()
+        target_compile_definitions(genesis_render PRIVATE RENDERER_VALIDATION_DEFAULT=0)
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(genesis_render PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Wnon-virtual-dtor
+            -Wno-missing-field-initializers
+        )
+    endif()
+    set_target_properties(genesis_render PROPERTIES
+        CXX_EXTENSIONS OFF
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    genesis_copy_streamline_runtime(genesis_render)
+endif()
+
 include(CTest)
-if(BUILD_TESTING)
-    add_test(NAME genesis_render_cli_help COMMAND genesis_render --help)
+if(BUILD_TESTING AND GENESIS_BUILD_TESTS)
+    if(GENESIS_BUILD_SDL_APP)
+        add_test(NAME genesis_render_cli_help COMMAND genesis_render --help)
+    endif()
 
     add_executable(aov_export_test tests/AovExportTest.cpp)
     target_compile_features(aov_export_test PRIVATE cxx_std_20)
@@ -698,6 +790,22 @@ if(BUILD_TESTING)
         )
     endif()
     add_test(NAME pbr_math COMMAND pbr_math_test)
+
+    add_executable(noise_volume_test tests/NoiseVolumeTest.cpp)
+    target_compile_features(noise_volume_test PRIVATE cxx_std_20)
+    target_link_libraries(noise_volume_test PRIVATE renderer_procedural)
+    set_target_properties(noise_volume_test PROPERTIES CXX_EXTENSIONS OFF)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(noise_volume_test PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wconversion
+            -Wshadow
+            -Wnon-virtual-dtor
+        )
+    endif()
+    add_test(NAME noise_volume COMMAND noise_volume_test)
 
     add_executable(gltf_pbr_integration_test tests/GltfPbrIntegrationTest.cpp)
     target_compile_features(gltf_pbr_integration_test PRIVATE cxx_std_20)

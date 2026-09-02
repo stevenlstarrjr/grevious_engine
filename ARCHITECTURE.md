@@ -7,9 +7,18 @@ device state, rendering resources, scene representation, render scheduling, and
 image reconstruction. It does not own physics, audio, scripting, gameplay,
 networking, an ECS, or editor infrastructure.
 
+The supported product hardware target is **NVIDIA RTX-capable graphics cards
+only**. Required devices provide Vulkan 1.3, acceleration structures, and the
+ray-tracing pipeline. CUDA, DLSS/Ray Reconstruction, and other NVIDIA-specific
+techniques are valid first-class implementation choices. Existing portable or
+raster reference paths may remain for diagnostics, CI logic, and techniques
+where rasterization is appropriate, but they do not define AMD, Intel,
+integrated, or software-GPU product support.
+
 The delivery sequence is raster PBR, hybrid raster/ray tracing, real-time GI,
-then an experimental low-sample path-traced mode. Rasterization remains the
-portable primary-visibility path; ray tracing is always optional.
+then an experimental low-sample path-traced mode. Rasterization and ray tracing
+are complementary techniques within the mandatory RTX platform rather than
+hardware-tier fallbacks.
 
 The pinned `reference/pbrt-v4` and `reference/pbr-book` submodules are
 references for radiometry, BSDFs, sampling, and light transport. The
@@ -234,7 +243,7 @@ splats never become collision geometry implicitly.
 | Current migration cost | No current backend exists, so selection has zero renderer migration cost. | Nothing must be removed; Jolt remains a possible future backend. |
 | Core game physics | Mature rigid bodies, collision, scene queries, joints, character controllers, and vehicles fit the desired host scope. | Covers the main game-oriented rigid-body/query/controller/vehicle scope with a smaller dependency. |
 | Extended simulation | PhysX supplies a broader unified family for GPU rigid bodies, FEM soft bodies, PBD particles/cloth, Blast, and Flow. | Comparable features would require separate evaluation or additional libraries. |
-| GPU acceleration | Optional CUDA paths can benefit NVIDIA hardware, including the current RTX 2060 Super, but are not portable. | Primarily CPU-oriented core avoids a CUDA deployment branch. |
+| GPU acceleration | CUDA paths are valid on the RTX-only target and may benefit simulation workloads, including PhysX PBD particles. They still require explicit Vulkan/CUDA synchronization and frame/VRAM budgeting. | Primarily CPU-oriented core avoids CUDA but gives up PhysX's NVIDIA GPU feature family. |
 | Build integration | Current official Linux flow is a separately generated/built SDK with more toolchain and packaging work. | Official CMake FetchContent example, C++17, and standard-library-only core are materially simpler to consume. |
 | Platform breadth | The current Genesis Render target is Linux, which PhysX supports; future non-Linux targets require a fresh support audit. | Officially supports a substantially broader desktop/mobile/console/architecture matrix. |
 | Determinism and threading | Must be measured against the host's replay, fixed-step, and async-query requirements. | Determinism and concurrent game access are explicit design goals, so it remains a credible fallback. |
@@ -255,7 +264,7 @@ SDK initialization private to the latter. Recommended options are conceptually:
 
 ```text
 ENGINE_PHYSICS_BACKEND=physx
-ENGINE_ENABLE_PHYSX_GPU=OFF       # portable default
+ENGINE_ENABLE_PHYSX_GPU=ON        # valid on the mandatory NVIDIA RTX target
 ENGINE_ENABLE_BLAST=OFF           # enable per product after prerequisites
 ENGINE_ENABLE_FLOW=OFF            # later volume feature
 ```
@@ -277,15 +286,15 @@ keep fracture authoring and cooking in offline tools where possible. Flow's
 current SDK supports Linux and provides a Vulkan implementation with shared-
 buffer/semaphore interop, but adopting that path requires explicit Vulkan
 external-resource ownership, queue synchronization, lifetime, and failure-
-fallback contracts. It must not bypass Genesis Render's render graph or make CUDA,
-Flow, or an NVIDIA driver mandatory for normal rendering.
+handling contracts. It must not bypass Genesis Render's render graph. The NVIDIA
+driver is already part of the supported platform; CUDA and Flow resources still
+require explicit ownership and synchronization rather than implicit coupling.
 
-The CPU PhysX configuration is the first portability baseline and must run with
-Genesis Render on NVIDIA, AMD, Intel, and software/CI Vulkan configurations. GPU physics
-is a separately detected host capability with CPU fallback. Vulkan rendering
-and CUDA simulation also compete for frame time, VRAM, upload bandwidth, and
-driver scheduling on NVIDIA systems; measure the combined workload rather than
-budgeting either system in isolation.
+CPU PhysX remains useful as a deterministic reference and for workloads that do
+not benefit from GPU execution, but cross-vendor and CPU fallbacks are not
+product requirements. Vulkan rendering and CUDA simulation compete for frame
+time, VRAM, upload bandwidth, and driver scheduling on RTX systems; measure the
+combined workload rather than budgeting either system in isolation.
 
 Reviewed upstream references:
 
@@ -302,13 +311,13 @@ Reviewed upstream references:
 | P0: boundary decision | Genesis Render docs plus future host design | No physics SDK type or link dependency in Genesis Render; ownership and data flows reviewed. | Complete in architecture only |
 | P1: renderer runtime-update contract | Genesis Render | Generation-checked render-instance handles; deterministic batched create/destroy/transform updates; raster current/previous transforms and RT dirty-instance updates agree; no physics names in API. | Deferred until current path-lighting prerequisites permit |
 | P2: backend-neutral physics API | Host engine | Fake/test backend exercises lifecycle, fixed-step, queries, events, serialization IDs, and transform extraction without PhysX headers. | Host work, can proceed in parallel |
-| P3: CPU PhysX Linux spike | Host engine | Pinned SDK builds reproducibly; rigid bodies, collision, ray/sweep/overlap queries, one joint, and controller smoke tests pass with CUDA absent; clean shutdown and leak checks. | Integrate first |
+| P3: PhysX host spike | Host engine | Pinned SDK builds reproducibly; rigid bodies, collision, ray/sweep/overlap queries, one joint, controller, and CUDA initialization smoke tests pass; clean shutdown and leak checks. | Integrate first |
 | P4: host-to-render bridge | Host plus Genesis Render API | Thousands of stable transform updates drive GPU Scene and TLAS without per-object draw submission; teleports/reset rules and add/remove churn are deterministic and measured. | After P1 and P3 |
-| P5: product physics features | Host engine | Controllers, vehicles, joints, cooking, streaming, soft-body/cloth/particles are added only with feature tests and CPU fallbacks or explicit unsupported capability. | Incremental, demand-driven |
+| P5: product physics features | Host engine | Controllers, vehicles, joints, cooking, streaming, soft-body/cloth/particles are added only with feature tests, measured CPU/GPU placement, and explicit unsupported-capability handling. | Incremental, demand-driven |
 | P6: Blast | Host plus asset tools | Offline fracture assets are versioned; split events create/destroy host bodies and render instances; fragment residency and BLAS/TLAS costs stay within measured budgets. | Deferred until P4 and explicit residency |
 | P7: CBT physics adapter | Host plus terrain data API | Stable terrain data versions feed asynchronous collision cooking; render and collision LOD changes do not invalidate live handles or block the render thread. | Deferred until CBT representation is stable |
 | P8: Flow and volume rendering | Host plus later Genesis Render volume subsystem | Sparse fields have a renderer-neutral snapshot contract; Vulkan interop/fallback is validated; raster/path volume output has motion/history data and a denoising budget. | Deferred until volume rendering prerequisites |
-| P9: optional GPU PhysX | Host engine | Runtime capability selection, CPU fallback, cross-vendor launch coverage, and combined CUDA/Vulkan frame/VRAM measurements pass. | Optional, after CPU production path |
+| P9: GPU PhysX integration | Host engine | CUDA/Vulkan ownership and synchronization are explicit; combined frame-time, VRAM, upload, and scheduling measurements pass on the supported RTX floor. | Demand-driven after the core PhysX host path |
 
 ### Scheduling and recommendation
 
@@ -333,13 +342,83 @@ Flow volumetrics remain after the opaque/path reconstruction prerequisites; an
 SDK selection is not a reason to pull them forward.
 
 The recommendation is to adopt PhysX as the **preferred first host backend now**
-without making it an irreversible engine ABI or a Genesis Render dependency. Keep the
-backend decision technically open until P3 proves reproducible CPU-only Linux
-builds, required game features, deployment/licensing, and host tests. If that
-spike fails its build, determinism, footprint, or portability gates, the
-renderer-neutral API makes Jolt a viable substitute. Even after PhysX passes,
-CPU PhysX remains the portable baseline, GPU PhysX is opt-in, and Jolt or
-another backend remains possible by contract.
+without making it an irreversible engine ABI or a Genesis Render dependency.
+Keep the backend boundary until P3 proves reproducible builds, required game
+features, deployment/licensing, and host tests. GPU PhysX is permitted on the
+RTX-only target when measurements justify it; CPU PhysX remains available for
+CPU-suitable workloads and deterministic comparison, not cross-vendor support.
+
+## Weather and precipitation
+
+The first precipitation slice is renderer-owned camera-local rain. A fullscreen
+analytic streak pass runs after temporal reconstruction and tone mapping, then
+alpha-composites into the swapchain before editor overlays, capture, and present.
+It samples the current device-depth image so distance-layered drops behind a
+surface are rejected while nearer drops remain visible. The same late pass
+samples the world-normal target and reconstructs visible surface positions to
+draw short-lived, perspective-correct contact ripples on upward-facing surfaces.
+Keeping precipitation
+outside TAA, the local path filters, DLSS Super Resolution, and Ray
+Reconstruction prevents fast streaks from becoming temporal trails or changing
+the ownership of reconstruction history.
+
+`weather::RainSettings` defines normalized intensity, terminal fall speed,
+physical streak length, camera-local field distance, and world-space wind
+velocity. Application-level `--wind-speed` and `--wind-direction` controls feed
+the same horizontal wind into cloud advection and rain. The rain shader keeps
+drop-position advection in a wind-independent vertical screen basis driven only
+by terminal fall speed. Instantaneous wind and low-frequency gust variation
+rotate the rendered streak axis but never multiply absolute simulation time;
+changing speed or direction therefore cannot reverse the drop phase. The
+optional weather demo continuously rotates the shared direction while cycling
+through drizzle, downpour, storm, and a zero-rain clearing interval, with wind
+speed from 3 to 32 m/s. During clearing, a shallow analytic vapor march samples
+fixed world-space noise with a rising vertical phase while the wetness reservoir
+evaporates. Materials use two independent scene/GPU roles in both raster and RTX
+closest-hit shading. `rainReceiver` materials evaluate stable world-space
+splash spots that darken locally, overlap, and merge across the exposed surface
+before a separate low-frequency puddle mask begins collecting water and stops
+at a bounded footprint.
+Each analytic spot deposits several successive dampness layers; those layers
+accumulate within a spot and add where neighboring spots overlap, producing
+progressively darker wet dirt without introducing puddle gloss. There is no
+uniform end-stage fill: the last dry gaps disappear only as deposited marks
+arrive at independently hashed times, mature locally, and intersect. Mature
+marks do not receive a shared global expansion factor. Each mark's repeated
+deposits occur as short staggered hit events, and dampness has no separate
+whole-ground opacity ramp. Added deposits use an asymptotic saturation response
+rather than a hard clamp, retaining spatial contrast between single and
+overlapping hits even near full wetness. Their arrivals are distributed linearly
+through the impact-damp phase, and mature neighbouring cells overlap so dry
+pixels cannot remain between them. Once impacts cover the receiver at reservoir
+0.72, the final local damp value at each raster fragment or RTX closest hit gates
+the pooling response. The complete future puddle footprint then darkens from
+reservoir 0.72 to 0.84 while remaining matte. Glossy water starts at the deepest
+basin points at 0.86 and expands with a slow-start curve through 1.0. Maximum
+reservoir accumulation is 0.025 per second, so the late stages remain visible for
+several seconds in the 90-second demo. The 0.033-per-second evaporation rate
+makes a fully saturated receiver take about 30 seconds to dry in the demo.
+The atmosphere-demo dirt derives a tangent-space relief normal from its 4K
+displacement texture and applies a 1.15 material normal scale; the source slope
+is boosted for readable wet/overcast relief. The current 100 km receiver is a
+two-triangle plane, so this is not geometric displacement or an RT silhouette
+change. That requires a bounded subdivided near-field receiver or a dedicated
+displaced intersection representation.
+`wetCoat` materials evaluate a third patch-to-continuous low-roughness film for
+roads, vehicle paint, grills, and similar non-porous surfaces. A persistent
+session reservoir rises with precipitation intensity and drives all three fixed
+world-space responses. The demo clears that reservoir at a bounded
+evaporation rate after precipitation stops. The splash marks are an analytic
+accumulation field rather than per-drop simulation deposits; drainage and saved wetness state remain
+future work. The initial precipitation and impact fields are renderer effects, not
+PhysX bodies. PhysX GPU particles remain an option for localized accumulated
+water, hail, or gameplay-relevant fluid interactions where measurements justify
+their simulation cost.
+
+Because rain composites after tone mapping, its color is display-referred. Sky,
+geometry, and impact tints interpolate from faint cool nighttime reflections to
+their daylight values using Sun elevation; the nighttime floor must remain near
+black so rain never appears emissive in an otherwise dark scene.
 
 ## Dual game/VFX rendering profiles
 
@@ -505,11 +584,11 @@ depth, shader-group handle/base alignment, and maximum SBT stride for allocation
 validation. Mesh-shader
 support is still detection-only because no mesh-shader owner/backend is live.
 
-No vendor ray-tracing or upscaling extension is foundational. Optional features
-retain raster fallbacks on AMD, Intel, NVIDIA, and conforming software Vulkan
-devices. `GPU_VENDOR_LIBRARIES.md` is the evaluation record for optional
-upscaling, denoising, profiling, and latency SDKs; those integrations remain
-behind renderer-owned interfaces and do not replace this architecture.
+Core ray tracing uses Vulkan acceleration structures, ray queries, and ray
+pipelines on the required NVIDIA RTX target. NVIDIA SDK integrations for
+upscaling, denoising, profiling, latency, CUDA, and simulation are permitted
+behind renderer-owned ownership boundaries. Diagnostic raster paths may still
+exercise non-RTX capability handling, but that is not product support.
 
 ## Milestone 8 hybrid ray-query shadows — complete baseline
 
@@ -648,7 +727,7 @@ in-place TLAS update -> ray dispatch into persistent radiance + first-hit AOVs
     -> path history validation -> temporal radiance reconstruction
     -> AOV-guided spatial denoising
     -> optional path AOV image-to-host readback
-    -> existing exposure/ACES-fit tone mapping -> optional capture -> present
+    -> exposure/AgX display transform -> optional capture -> present
 ```
 
 Raygen emits deterministic subpixel camera rays and incrementally averages one
@@ -861,7 +940,7 @@ GPU-generated 2048x2048 raster shadow maps. The IBL path
 uses an unclamped lat-long environment, cosine-weighted diffuse irradiance,
 eight GGX-prefiltered specular mips, and a two-channel split-sum BRDF LUT. Three
 half-resolution graphics passes downsample and blur bright energy before the
-bloom result is composited with exposure compensation and ACES-fit tone mapping.
+bloom result is composited with exposure compensation and the AgX display transform.
 Meshes use counter-clockwise front faces. The camera projection flips Y for
 Vulkan framebuffer coordinates, so the raster pipeline retains CCW classification;
 changing either side requires changing and visually validating the other.
@@ -1088,7 +1167,7 @@ Linear HDR PBR
     -> native/spatial/temporal upscaler boundary
     -> bloom composite
     -> exposure compensation
-    -> ACES-fit tone mapping
+    -> AgX display transform
     -> sRGB swapchain image
 ```
 
@@ -1130,11 +1209,14 @@ without changing the renderer-facing configuration.
 
 Exposure is a single scalar `exp2(exposureEV)`, applied once after HDR and bloom
 are composited. `EV +1` is therefore 2x and `EV -1` is 0.5x in linear space.
-The existing ACES-fit curve then clamps display-referred RGB to `[0, 1]`; black
-has no offset. `--debug-view hdr` visualizes the pre-bloom resolved input through
-the fit, while `--debug-view bloom` visualizes the isolated blurred bloom image
-through the fit. These are diagnostic encodings, not alternate production
-orders.
+The production display transform is real-time AgX: linear sRGB is inset into the
+AgX working space, encoded across a 16.5-stop logarithmic domain, passed through
+the default AgX contrast sigmoid, transformed back to linear sRGB, and clamped
+to `[0, 1]` before the sRGB swapchain encodes it. This shared raster/path curve
+rolls bright colors and reflections toward white while retaining hue and
+highlight separation. `--debug-view hdr` and `--debug-view bloom` retain the
+compact ACES fit as intentionally simple diagnostic encodings, not alternate
+production orders.
 
 The full-resolution HDR, motion, normal, and depth images and current bloom
 level images are render-graph transients. Bloom memory and graph ownership are
@@ -1178,7 +1260,7 @@ wait requires a generation-retired swapchain/resource owner and is future
 lifetime work, not a post-correctness change.
 
 `renderer_post` is the CPU reference for extraction, exact filter footprints,
-linear clamp sampling, exposure, ACES fit, finite-value metrics, and resource
+linear clamp sampling, exposure, AgX plus diagnostic ACES fits, finite-value metrics, and resource
 byte accounting. `--post-test` replaces only the raster HDR producer with
 controlled black, constant, impulse, square, line, multiple-source,
 checkerboard, or moving-source data; the live TAA, bloom, tone, graph, capture,
@@ -1208,18 +1290,25 @@ post tests.
 ## Future CBT adaptive terrain architecture — PLANNED
 
 Large-scale and planetary terrain is a future renderer milestone; no terrain
-runtime is implemented by the current raster-shadow, ray-tracing, temporal, or
-post-processing work. Its preferred refinement architecture is a Concurrent
-Binary Tree (CBT), or a closely related binary refinement representation chosen
-after evaluating the relevant research and reference implementations. CBT owns
-compact topology/refinement state, deterministic parallel split and merge,
-conforming adaptive triangulation, and bounded GPU traversal. Mesh shaders are
+runtime is implemented by the current atmosphere/cloud, raster-shadow,
+ray-tracing, temporal, or post-processing work. The intended planet topology is
+a cube sphere: six connected cube faces projected onto a sphere, with terrain
+height/displacement applied to that spherical surface. Its preferred refinement
+architecture is a Concurrent Binary Tree (CBT), or a closely related binary
+refinement representation chosen after evaluating the relevant research and
+reference implementations. CBT owns compact topology/refinement state,
+camera-distance and projected screen-space-error driven split/merge,
+deterministic parallel updates, conforming adaptive triangulation, and bounded
+GPU traversal. Refinement must remain crack-free both between adjacent levels
+and across cube-face boundaries, and it must preserve local detail near the
+camera while the planet remains representable at global scale. Mesh shaders are
 only an optional way to render CBT output; they are not the terrain algorithm.
 
 The planned view path is:
 
 ```text
-Coarse manifold base mesh (flat, cube sphere, icosahedron, or another topology)
+Six-face cube-sphere manifold
+    -> sphere projection plus independent terrain displacement data
     -> visibility layer and planetary horizon rejection
     -> frustum rejection
     -> projected geometric-error evaluation
@@ -1272,9 +1361,9 @@ procedural intersection, or another bounded representation; rebuilding one
 planet-wide highest-detail BLAS every frame is not an acceptable fixed design.
 
 `VK_EXT_mesh_shader` systems may consume visible CBT bisectors through indirect
-mesh-task dispatch. The mandatory non-mesh-shader path remains Vulkan compute
-work generation followed by indexed indirect rendering, or another measured
-portable GPU-driven backend. Neither path may require CPU traversal of every
+mesh-task dispatch. The non-mesh-shader path remains Vulkan compute work
+generation followed by indexed indirect rendering, or another measured
+GPU-driven backend. Neither path may require CPU traversal of every
 terrain node each frame. Refinement, culling, work generation, raster cost,
 terrain memory, and streaming bandwidth must be profiled independently against
 16.67 ms (60 FPS) and 8.33 ms (120 FPS) targets.
@@ -1327,7 +1416,7 @@ PBRT-derived work must update that ledger and its corresponding reference test.
 | Physically based cameras | ADAPT FOR REALTIME | Physical exposure and optional lens effects; raster pinhole remains baseline. |
 | Ray differentials | ADAPT FOR REALTIME | Raster derivatives normally; approximate ray cones/differentials for RT LOD. |
 | Texture filtering | ADAPT FOR REALTIME | Hardware anisotropic filtering plus ray-cone LOD for traced rays. |
-| Acceleration structures | ADAPT FOR REALTIME | Vulkan BLAS/TLAS with update/compaction policy; raster fallback is mandatory. |
+| Acceleration structures | ADAPT FOR REALTIME | Vulkan BLAS/TLAS with update/compaction policy on the mandatory RTX target; raster remains available for material techniques not represented in the RT path. |
 
 Full spectral rendering is REJECTED for the initial and near-term renderer: all
 transport is linear RGB. The interfaces should avoid embedding display-referred
@@ -1472,9 +1561,9 @@ dependency belongs in the renderer library itself.
   blended/transmission shadows, and configurable quality remain production-raster work.
   This raster prerequisite completed before Milestone 8 began.
 - Milestone 8 is complete at the first visible hybrid effect. A
-  complete supported AS/ray-query/ray-pipeline dependency set is enabled on
-  capable devices, unsupported or blended/additive automatic paths fall back to
-  raster, and required mode fails explicitly when its contract cannot be met.
+  complete AS/ray-query/ray-pipeline dependency set is enabled on the supported
+  RTX target; blended/additive automatic paths use raster, and required mode
+  fails explicitly when its material contract cannot be met.
   Sixteen Debug/Release tests pass;
   Intel automatic/off raster captures are exact under Vulkan validation. On the
   RTX 2060 Super, Debug and Release each build two BLAS and one TLAS, execute

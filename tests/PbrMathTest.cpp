@@ -1,3 +1,4 @@
+#include "renderer/lighting/DirectionalLightControls.hpp"
 #include "renderer/materials/PbrMath.hpp"
 
 #include <glm/geometric.hpp>
@@ -17,6 +18,7 @@
 namespace {
 
 namespace rm = renderer::materials;
+namespace rl = renderer::lighting;
 
 void require(bool condition, std::string_view message) {
     if (!condition) {
@@ -35,6 +37,11 @@ bool closeRelative(float lhs, float rhs, float tolerance = 1.0e-5F) {
 bool close(const glm::vec3& lhs, const glm::vec3& rhs, float tolerance = 1.0e-5F) {
     return close(lhs.x, rhs.x, tolerance) && close(lhs.y, rhs.y, tolerance) &&
            close(lhs.z, rhs.z, tolerance);
+}
+
+bool close(const glm::vec4& lhs, const glm::vec4& rhs, float tolerance = 1.0e-5F) {
+    return close(lhs.x, rhs.x, tolerance) && close(lhs.y, rhs.y, tolerance) &&
+           close(lhs.z, rhs.z, tolerance) && close(lhs.w, rhs.w, tolerance);
 }
 
 bool closeRelative(const glm::vec3& lhs, const glm::vec3& rhs, float tolerance = 1.0e-5F) {
@@ -355,6 +362,39 @@ void testLightUnitsAndHdrPreservation() {
             "Direct-light evaluation incorrectly clamped HDR radiance");
 }
 
+void testEffectiveGltfBaseColor() {
+    const glm::vec4 factor(0.8F, 0.6F, 0.4F, 0.5F);
+    const glm::vec4 textureSample(0.5F, 0.25F, 1.0F, 0.8F);
+    const glm::vec4 vertexColor(0.25F, 0.5F, 0.75F, 0.4F);
+    require(close(rm::effectiveGltfBaseColor(factor, textureSample, vertexColor),
+                  glm::vec4(0.1F, 0.075F, 0.3F, 0.16F)),
+            "glTF base color did not multiply factor, texture, and COLOR_0 RGBA");
+    require(close(rm::effectiveGltfBaseColor(factor, textureSample, glm::vec4(1.0F)),
+                  factor * textureSample),
+            "Missing COLOR_0 did not default to white");
+}
+
+void testDirectionalLightAndShadowControlsAreIndependent() {
+    constexpr std::uint32_t cascadeCount = 3U;
+    const rl::DirectionalLightControls litAndShadowed =
+        rl::makeDirectionalLightControls(3.5F, true, cascadeCount);
+    require(close(litAndShadowed.intensity, 3.5F) &&
+                litAndShadowed.activeShadowCascadeCount == cascadeCount,
+            "Enabled directional light did not retain its shadow controls");
+
+    const rl::DirectionalLightControls litWithoutShadows =
+        rl::makeDirectionalLightControls(3.5F, false, cascadeCount);
+    require(close(litWithoutShadows.intensity, 3.5F) &&
+                litWithoutShadows.activeShadowCascadeCount == 0U,
+            "Disabling directional shadows incorrectly disabled the light");
+
+    const rl::DirectionalLightControls disabledLight =
+        rl::makeDirectionalLightControls(0.0F, true, cascadeCount);
+    require(close(disabledLight.intensity, 0.0F) &&
+                disabledLight.activeShadowCascadeCount == 0U,
+            "A disabled directional light retained shadow work");
+}
+
 } // namespace
 
 int main() {
@@ -368,6 +408,8 @@ int main() {
         testPathRussianRouletteSurvivalProbability();
         testAreaLightSolidAnglePdf();
         testLightUnitsAndHdrPreservation();
+        testEffectiveGltfBaseColor();
+        testDirectionalLightAndShadowControlsAreIndependent();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

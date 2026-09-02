@@ -119,7 +119,7 @@ void testCapabilitiesAndConventions() {
                 temporalCapabilities.reactiveMask && !temporalCapabilities.sharpening &&
                 !temporalCapabilities.dynamicResolution &&
                 temporalCapabilities.minimumRenderScale == minimumSpatialRenderScale &&
-                temporalCapabilities.maximumRenderScale == maximumSpatialRenderScale,
+                temporalCapabilities.maximumRenderScale == maximumUpscalingRenderScale,
             "Temporal backend capabilities are incorrect");
     const BackendCapabilities dlssCapabilities = dlss->capabilities();
     require(dlssCapabilities.reconstruction == ReconstructionType::temporal &&
@@ -160,10 +160,15 @@ void testSpatialExtentPolicy() {
     require(upscaler->renderExtent({1920U, 1080U}) == Extent{1280U, 720U} &&
                 upscaler->renderExtent({1279U, 719U}) == Extent{853U, 479U},
             "Spatial upscaling produced an incorrect rounded render extent");
+    const std::unique_ptr<IUpscaler> supersampler = createUpscaler(Backend::spatial, 1.5F);
+    require(supersampler->renderExtent({1280U, 720U}) == Extent{1920U, 1080U},
+            "Spatial supersampling did not produce a 1080p render extent for a 720p window");
     requireInvalid([&] { (void)createUpscaler(Backend::spatial, 0.49F); },
                    "Spatial upscaling accepted a scale below its supported range");
-    requireInvalid([&] { (void)createUpscaler(Backend::spatial, 1.01F); },
+    requireInvalid([&] { (void)createUpscaler(Backend::spatial, 2.01F); },
                    "Spatial upscaling accepted a scale above its supported range");
+    requireInvalid([&] { (void)createUpscaler(Backend::temporal, 1.01F); },
+                   "Temporal upscaling accepted a supersampling scale");
     requireInvalid([&] { (void)createUpscaler(Backend::native, 0.75F); },
                    "Native upscaling accepted a reduced render scale");
     requireInvalid(

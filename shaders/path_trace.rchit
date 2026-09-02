@@ -11,6 +11,10 @@
 #include "include/path_trace.glsl"
 #include "include/path_trace_bsdf.glsl"
 #include "include/path_trace_environment.glsl"
+#define GENESIS_CLOUD_BASE_NOISE_BINDING 27
+#define GENESIS_CLOUD_DETAIL_NOISE_BINDING 28
+#include "include/genesis_clouds.glsl"
+#include "include/weather_wetness.glsl"
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT sceneTlas;
 layout(set = 0, binding = 2) uniform FrameData
@@ -36,6 +40,11 @@ layout(set = 0, binding = 2) uniform FrameData
     vec4 shadowCascadeSplits;
     vec4 shadowCascadeDepthRadii;
     vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
+    vec4 weatherParameters;
 } frameData;
 
 layout(std430, set = 0, binding = 3) readonly buffer Vertices
@@ -128,6 +137,8 @@ const uint NORMAL_TEXTURE_BIT = 1u << 2u;
 const uint OCCLUSION_TEXTURE_BIT = 1u << 3u;
 const uint EMISSIVE_TEXTURE_BIT = 1u << 4u;
 const uint MIRRORED_TRANSFORM_INSTANCE_BIT = 1u << 0u;
+const uint RAIN_RECEIVER_MATERIAL_BIT = 1u << 4u;
+const uint WET_COAT_MATERIAL_BIT = 1u << 5u;
 
 struct PathTriangleSurface
 {
@@ -138,27 +149,34 @@ struct PathTriangleSurface
 
 vec3 vertexPosition(uint vertexIndex)
 {
-    uint firstComponent = vertexIndex * 14u;
+    uint firstComponent = vertexIndex * 18u;
     return vec3(vertexData[firstComponent], vertexData[firstComponent + 1u],
                 vertexData[firstComponent + 2u]);
 }
 
 vec3 vertexNormal(uint vertexIndex)
 {
-    uint firstComponent = vertexIndex * 14u + 3u;
+    uint firstComponent = vertexIndex * 18u + 3u;
     return vec3(vertexData[firstComponent], vertexData[firstComponent + 1u],
                 vertexData[firstComponent + 2u]);
 }
 
 vec2 vertexUv(uint vertexIndex, bool useUv1)
 {
-    uint firstComponent = vertexIndex * 14u + (useUv1 ? 12u : 6u);
+    uint firstComponent = vertexIndex * 18u + (useUv1 ? 12u : 6u);
     return vec2(vertexData[firstComponent], vertexData[firstComponent + 1u]);
 }
 
 vec4 vertexTangent(uint vertexIndex)
 {
-    uint firstComponent = vertexIndex * 14u + 8u;
+    uint firstComponent = vertexIndex * 18u + 8u;
+    return vec4(vertexData[firstComponent], vertexData[firstComponent + 1u],
+                vertexData[firstComponent + 2u], vertexData[firstComponent + 3u]);
+}
+
+vec4 vertexColor(uint vertexIndex)
+{
+    uint firstComponent = vertexIndex * 18u + 14u;
     return vec4(vertexData[firstComponent], vertexData[firstComponent + 1u],
                 vertexData[firstComponent + 2u], vertexData[firstComponent + 3u]);
 }
@@ -372,7 +390,10 @@ void writePathDirectRadianceAov(vec3 directRadiance)
 {
     ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
     uint sampleIndex = controls.sampleIndex;
-    if (sampleIndex > 0u) {
+    // Ray Reconstruction consumes a fresh noisy signal every frame. Keep its
+    // direct component equally fresh so total - direct remains a valid
+    // indirect-light candidate for the reuse pass.
+    if (controls.fixedPrimarySample < 2u && sampleIndex > 0u) {
         float count = float(sampleIndex);
         directRadiance =
             (imageLoad(directRadianceImage, pixel).rgb * count + directRadiance) /
@@ -385,6 +406,9 @@ void writePathDirectRadianceAov(vec3 directRadiance)
 void main()
 {
     uint currentDepth = payload.depth;
+    if (currentDepth == 0u) {
+        payload.primaryHitDistance = max(gl_HitTEXT, 0.0);
+    }
     if (currentDepth == 1u) {
         payload.firstLobeHitDistance = max(gl_HitTEXT, 0.0);
     }
@@ -439,8 +463,11 @@ void main()
             material.textureIndices.x, BASE_COLOR_TEXTURE_BIT, material,
             surface, weights, rayConeWidth);
     }
-    vec3 baseColor = clamp(material.baseColorFactor.rgb * sampledBaseColor.rgb,
-                           vec3(0.0), vec3(1.0));
+    vec4 interpolatedVertexColor = vertexColor(triangle.x) * weights.x +
+                                   vertexColor(triangle.y) * weights.y +
+                                   vertexColor(triangle.z) * weights.z;
+    vec3 baseColor = effectiveGltfBaseColor(
+        material.baseColorFactor, sampledBaseColor, interpolatedVertexColor).rgb;
 
     float metallic = material.metallicRoughnessOcclusionNormal.x;
     float roughness = material.metallicRoughnessOcclusionNormal.y;
@@ -480,6 +507,25 @@ void main()
         normal = dot(mappedNormal, geometricNormal) > 0.0 ? mappedNormal : geometricNormal;
     }
 
+    // Shared wetness staging darkens rain receivers before forming puddles.
+    uint weatherMaterialFlags = material.textureState.z &
+        (RAIN_RECEIVER_MATERIAL_BIT | WET_COAT_MATERIAL_BIT);
+    if (weatherMaterialFlags != 0u && frameData.weatherParameters.w > 0.0) {
+        GenesisWetnessLayers wetness = genesisRainWetnessLayers(
+            position, normal, frameData.weatherParameters.w,
+            frameData.weatherParameters.z);
+        if ((weatherMaterialFlags & RAIN_RECEIVER_MATERIAL_BIT) != 0u) {
+            baseColor *= mix(1.0, 0.48, wetness.dampness);
+            baseColor *= mix(1.0, 0.72, wetness.poolingDampness);
+            baseColor *= mix(1.0, 0.86, wetness.puddles);
+            roughness = mix(roughness, 0.12, wetness.puddles);
+        }
+        if ((weatherMaterialFlags & WET_COAT_MATERIAL_BIT) != 0u) {
+            baseColor *= mix(1.0, 0.92, wetness.coating);
+            roughness = mix(roughness, 0.055, wetness.coating);
+        }
+    }
+
     if (currentDepth == 0u && controls.sampleInFrame + 1u == controls.samplesThisFrame) {
         writePathFirstHitAovs(objectPosition, transform, baseColor, roughness,
                               geometricNormal, normal);
@@ -511,21 +557,32 @@ void main()
     uint sampledContinuationLobe = 2u;
 
     vec3 lightDirection = normalize(-frameData.directionalDirectionIntensity.xyz);
-    if (frameData.shadowCascadeSplits.w > 0.0 && dot(normal, lightDirection) > 0.0) {
-        shadowVisibility = 0.0;
-        traceRayEXT(sceneTlas,
-                    gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                    0xff, 1, 2, 1, position + geometricNormal * rayBias,
-                    rayBias, lightDirection, 1.0e27, 1);
-        vec3 incident = frameData.directionalColor.rgb *
-                        max(frameData.directionalDirectionIntensity.w, 0.0);
+    float cloudSunVisibility = genesisCloudSurfaceSunVisibility(
+        position, frameData.atmosphereCamera,
+        frameData.atmosphereSunDirection.xyz,
+        frameData.cloudLayerParameters, frameData.cloudWeatherParameters);
+    float directionalIntensity = max(frameData.directionalDirectionIntensity.w, 0.0) *
+                                 cloudSunVisibility;
+    float directionalNoL = max(dot(normal, lightDirection), 0.0);
+    if (directionalIntensity > 0.0 && directionalNoL > 0.0) {
+        shadowVisibility = 1.0;
+        if (frameData.shadowCascadeSplits.w > 0.0) {
+            shadowVisibility = 0.0;
+            traceRayEXT(sceneTlas,
+                        gl_RayFlagsTerminateOnFirstHitEXT |
+                            gl_RayFlagsSkipClosestHitShaderEXT,
+                        0xff, 1, 2, 1, position + geometricNormal * rayBias,
+                        rayBias, lightDirection, 1.0e27, 1);
+        }
+        vec3 incident = frameData.directionalColor.rgb * directionalIntensity *
+                        genesisCloudShadowTint(cloudSunVisibility);
         vec3 diffuseBrdf;
         vec3 specularBrdf;
         evaluateMetallicRoughnessBrdfLobes(
             baseColor, metallic, roughness, normal, viewDirection, lightDirection,
             diffuseBrdf, specularBrdf);
-        float noL = max(dot(normal, lightDirection), 0.0);
-        vec3 visibleIncident = shadowVisibility * max(incident, vec3(0.0)) * noL;
+        vec3 visibleIncident =
+            shadowVisibility * max(incident, vec3(0.0)) * directionalNoL;
         directDiffuseRadiance += visibleIncident * diffuseBrdf;
         directSpecularRadiance += visibleIncident * specularBrdf;
     }
@@ -563,7 +620,9 @@ void main()
 
     PathEnvironmentSample environmentSample = samplePathEnvironment(
         state, frameData.environmentParameters.x,
-        frameData.environmentParameters.y > 0.5);
+        frameData.environmentParameters.y > 0.5,
+        max(frameData.pointColorRange.w, 0.0),
+        frameData.atmosphereSunDirection.w > 0.5);
     float environmentNoL = dot(normal, environmentSample.direction);
     if (environmentSample.pdf > 0.0 && environmentNoL > 0.0 &&
         dot(geometricNormal, environmentSample.direction) > 0.0) {

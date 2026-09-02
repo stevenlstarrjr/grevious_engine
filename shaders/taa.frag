@@ -35,6 +35,10 @@ layout(set = 0, binding = 7) uniform FrameData
     vec4 shadowCascadeSplits;
     vec4 shadowCascadeDepthRadii;
     vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
 } frameData;
 
 layout(location = 0) in vec2 uv;
@@ -80,8 +84,14 @@ void main()
     if (!finiteVector(normal)) {
         normal = vec4(0.5, 0.5, 1.0, 0.0);
     }
-    vec2 jitterCorrection = (frameData.temporalJitter.zw -
-                             frameData.temporalJitter.xy) / vec2(size);
+    // Geometry is rasterized with projection jitter; the procedural sky is
+    // deliberately evaluated at unjittered pixel centers. Applying the camera
+    // correction to both shifts sky history a second time and produces a
+    // one-pixel repeating wobble even when the camera is stationary.
+    vec2 jitterCorrection = normal.a > 0.5
+        ? (frameData.temporalJitter.zw - frameData.temporalJitter.xy) /
+              vec2(size)
+        : vec2(0.0);
     vec2 previousUv = uv - motion.xy + jitterCorrection;
 
     bool insideHistory = all(greaterThanEqual(previousUv, vec2(0.0))) &&

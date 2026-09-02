@@ -107,6 +107,11 @@ float visibleGgxReflectionPdf(float perceptualRoughness, const glm::vec3& normal
 
 } // namespace
 
+glm::vec4 effectiveGltfBaseColor(const glm::vec4& factor, const glm::vec4& textureSample,
+                                 const glm::vec4& vertexColor) {
+    return glm::clamp(factor * textureSample * vertexColor, glm::vec4(0.0F), glm::vec4(1.0F));
+}
+
 float perceptualRoughnessToAlpha(float roughness) {
     const float clamped = saturate(roughness);
     return std::max(clamped * clamped, minimumAlpha);

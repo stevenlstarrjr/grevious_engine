@@ -23,6 +23,11 @@ enum class ImageMipSemantic : std::uint8_t {
     tangentSpaceNormal,
 };
 
+// IEC 61966-2-1 transfer functions used by CPU mip filtering. Vulkan's SRGB
+// image formats apply the same decode when material textures are sampled.
+[[nodiscard]] float srgbToLinearChannel(float value);
+[[nodiscard]] float linearToSrgbChannel(float value);
+
 struct DecodedImage {
     std::uint32_t width = 0;
     std::uint32_t height = 0;

@@ -12,9 +12,13 @@
 #include "renderer/assets/ImageWriter.hpp"
 #include "renderer/core/Log.hpp"
 #include "renderer/gpu_scene/GpuScene.hpp"
+#include "renderer/lighting/Atmosphere.hpp"
+#include "renderer/lighting/DirectionalLightControls.hpp"
 #include "renderer/lighting/IblBaker.hpp"
-#include "renderer/platform/Window.hpp"
+#include "renderer/platform/RenderSurface.hpp"
+#include "renderer/procedural/NoiseVolume.hpp"
 #include "renderer/ray_tracing/AccelerationStructurePlan.hpp"
+#include "renderer/scene/Scene.hpp"
 #include "renderer/temporal/TemporalSampling.hpp"
 #include "renderer/vulkan/AccelerationStructure.hpp"
 #include "renderer/vulkan/Buffer.hpp"
@@ -52,6 +56,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -172,9 +177,14 @@ VkDeviceSize multiplyDeviceSize(VkDeviceSize left, VkDeviceSize right) {
 }
 
 vulkan::Swapchain createInitialSwapchain(const vulkan::Instance& instance,
-                                         const vulkan::Device& device, platform::Window& window,
+                                         const vulkan::Device& device,
+                                         platform::RenderSurface& surfaceHost,
                                          bool transferSource) {
-    const auto [width, height] = window.waitForDrawableSize();
+    const auto [width, height] = surfaceHost.waitForDrawableSize();
+    if (width == 0U || height == 0U) {
+        throw std::runtime_error(
+            "Genesis requires a nonzero drawable size when the renderer is created");
+    }
     return vulkan::Swapchain(instance, device, width, height, transferSource);
 }
 
@@ -355,14 +365,103 @@ CpuScenePayload makeAlphaShadowScenePayload() {
     return payload;
 }
 
+std::filesystem::path atmosphereGroundTexturePath(std::string_view filename) {
+    return std::filesystem::path(RENDERER_MATERIAL_REFERENCE_DIR) /
+           "dirt_floor_4k" / "textures" / filename;
+}
+
+CpuScenePayload::Texture loadAtmosphereGroundTexture(
+    std::string_view filename, assets::ImageColorSpace colorSpace,
+    assets::ImageMipSemantic mipSemantic, std::string label) {
+    assets::DecodedImage image = assets::loadDecodedImage(
+        atmosphereGroundTexturePath(filename), colorSpace);
+    return {
+        .mips = assets::generateMipChain(std::move(image), mipSemantic),
+        .sampler = scene::Sampler{},
+        .label = std::move(label),
+    };
+}
+
+CpuScenePayload::Texture makeAtmosphereGroundNormalTexture() {
+    assets::DecodedImage height = assets::loadDecodedImage(
+        atmosphereGroundTexturePath("dirt_floor_disp_4k.png"),
+        assets::ImageColorSpace::linear);
+    assets::DecodedImage normal{
+        .width = height.width,
+        .height = height.height,
+        .componentType = assets::ImageComponentType::unorm8,
+        .colorSpace = assets::ImageColorSpace::linear,
+    };
+    normal.unorm8.resize(height.texelCount() * 4U);
+
+    const auto sampleHeight = [&](std::int64_t x, std::int64_t y) {
+        const std::int64_t width = static_cast<std::int64_t>(height.width);
+        const std::int64_t heightExtent = static_cast<std::int64_t>(height.height);
+        x = (x % width + width) % width;
+        y = (y % heightExtent + heightExtent) % heightExtent;
+        const std::size_t offset =
+            (static_cast<std::size_t>(y) * height.width +
+             static_cast<std::size_t>(x)) * 4U;
+        return height.componentType == assets::ImageComponentType::float32
+                   ? height.float32[offset]
+                   : static_cast<float>(height.unorm8[offset]) / 255.0F;
+    };
+    const auto encodeNormal = [](float value) {
+        return static_cast<std::uint8_t>(std::lround(
+            std::clamp(value * 0.5F + 0.5F, 0.0F, 1.0F) * 255.0F));
+    };
+
+    // The source displacement represents one four-metre material tile. Boost
+    // its height-derived slope so the dirt retains readable relief under flat
+    // overcast light and after its albedo darkens from rain. This is bump
+    // relief; true geometric/RT displacement requires a subdivided receiver.
+    constexpr float gradientScale = 38.4F;
+    for (std::uint32_t y = 0U; y < height.height; ++y) {
+        for (std::uint32_t x = 0U; x < height.width; ++x) {
+            const float gradientX =
+                (sampleHeight(static_cast<std::int64_t>(x) + 1, y) -
+                 sampleHeight(static_cast<std::int64_t>(x) - 1, y)) *
+                gradientScale;
+            const float gradientY =
+                (sampleHeight(x, static_cast<std::int64_t>(y) + 1) -
+                 sampleHeight(x, static_cast<std::int64_t>(y) - 1)) *
+                gradientScale;
+            const glm::vec3 tangentNormal =
+                glm::normalize(glm::vec3{-gradientX, -gradientY, 1.0F});
+            const std::size_t offset =
+                (static_cast<std::size_t>(y) * height.width + x) * 4U;
+            normal.unorm8[offset + 0U] = encodeNormal(tangentNormal.x);
+            normal.unorm8[offset + 1U] = encodeNormal(tangentNormal.y);
+            normal.unorm8[offset + 2U] = encodeNormal(tangentNormal.z);
+            normal.unorm8[offset + 3U] = 255U;
+        }
+    }
+
+    return {
+        .mips = assets::generateMipChain(
+            std::move(normal), assets::ImageMipSemantic::tangentSpaceNormal),
+        .sampler = scene::Sampler{},
+        .label = "dirt_floor derived displacement normal",
+    };
+}
+
 CpuScenePayload makeProceduralScenePayload(bool emissiveSphereDemo, bool directionalShadowDemo,
-                                           bool hdriBackdropDemo, bool alphaShadowDemo) {
+                                           bool hdriBackdropDemo, bool alphaShadowDemo,
+                                           bool atmosphereDemo) {
     if (alphaShadowDemo) {
         return makeAlphaShadowScenePayload();
     }
     SphereMesh fineSphere = createSphereMesh(24U, 48U);
     SphereMesh coarseSphere = createSphereMesh(12U, 24U);
     gpu_scene::SceneRecords scene = gpu_scene::makePbrSphereGrid();
+    if (atmosphereDemo) {
+        // The sphere matrix doubles as an opt-in wet-coat material preview:
+        // unlike the ground's damp/puddle response, these surfaces progress
+        // toward one continuous glossy film across metallic/roughness values.
+        for (gpu_scene::MaterialRecord& material : scene.materials) {
+            material.textureState.z |= gpu_scene::wetCoatMaterial;
+        }
+    }
     if (emissiveSphereDemo) {
         scene.instances.resize(1);
         scene.materials.resize(1);
@@ -418,19 +517,39 @@ CpuScenePayload makeProceduralScenePayload(bool emissiveSphereDemo, bool directi
         gpu_scene::LodSourceRecord{.primitiveIndex = 0U, .minimumProjectedDiameter = 96.0F},
         gpu_scene::LodSourceRecord{.primitiveIndex = 1U, .minimumProjectedDiameter = 0.0F},
     };
-    if (directionalShadowDemo || hdriBackdropDemo || emissiveSphereDemo) {
+    if (directionalShadowDemo || hdriBackdropDemo || emissiveSphereDemo || atmosphereDemo) {
         const std::uint32_t planeFirstIndex = static_cast<std::uint32_t>(indices.size());
         const std::int32_t planeVertexOffset = static_cast<std::int32_t>(vertices.size());
-        constexpr std::array<glm::vec3, 4> planePositions{
-            glm::vec3{-4.2F, -3.2F, 0.0F}, glm::vec3{4.2F, -3.2F, 0.0F},
-            glm::vec3{4.2F, 3.2F, 0.0F}, glm::vec3{-4.2F, 3.2F, 0.0F}};
-        constexpr std::array<glm::vec2, 4> planeUvs{glm::vec2{0.0F, 0.0F}, glm::vec2{1.0F, 0.0F},
-                                                    glm::vec2{1.0F, 1.0F}, glm::vec2{0.0F, 1.0F}};
+        constexpr float atmospherePlaneHalfExtent = 50'000.0F;
+        // The atmosphere plane spans 100 km; 25,000 repeats preserve the
+        // material's intended four-metre world-space footprint.
+        constexpr float atmospherePlaneTileCount = 25'000.0F;
+        const float planeHalfExtent = atmosphereDemo ? atmospherePlaneHalfExtent : 4.2F;
+        const float planeVerticalHalfExtent = atmosphereDemo ? atmospherePlaneHalfExtent : 3.2F;
+        const float tileCount = atmosphereDemo ? atmospherePlaneTileCount : 1.0F;
+        const std::array<glm::vec3, 4> planePositions = atmosphereDemo
+            ? std::array<glm::vec3, 4>{
+                  glm::vec3{-planeHalfExtent, 0.0F, -planeVerticalHalfExtent},
+                  glm::vec3{-planeHalfExtent, 0.0F, planeVerticalHalfExtent},
+                  glm::vec3{planeHalfExtent, 0.0F, planeVerticalHalfExtent},
+                  glm::vec3{planeHalfExtent, 0.0F, -planeVerticalHalfExtent}}
+            : std::array<glm::vec3, 4>{
+                  glm::vec3{-planeHalfExtent, -planeVerticalHalfExtent, 0.0F},
+                  glm::vec3{planeHalfExtent, -planeVerticalHalfExtent, 0.0F},
+                  glm::vec3{planeHalfExtent, planeVerticalHalfExtent, 0.0F},
+                  glm::vec3{-planeHalfExtent, planeVerticalHalfExtent, 0.0F}};
+        const std::array<glm::vec2, 4> planeUvs = atmosphereDemo
+            ? std::array<glm::vec2, 4>{glm::vec2{0.0F, 0.0F}, glm::vec2{0.0F, tileCount},
+                                       glm::vec2{tileCount, tileCount}, glm::vec2{tileCount, 0.0F}}
+            : std::array<glm::vec2, 4>{glm::vec2{0.0F, 0.0F}, glm::vec2{1.0F, 0.0F},
+                                       glm::vec2{1.0F, 1.0F}, glm::vec2{0.0F, 1.0F}};
+        const glm::vec3 planeNormal = atmosphereDemo ? glm::vec3(0.0F, 1.0F, 0.0F)
+                                                      : glm::vec3(0.0F, 0.0F, 1.0F);
         for (std::size_t vertex = 0; vertex < planePositions.size(); ++vertex) {
             vertices.push_back({.position = planePositions[vertex],
-                                .normal = {0.0F, 0.0F, 1.0F},
+                                .normal = planeNormal,
                                 .uv0 = planeUvs[vertex],
-                                .tangent = {1.0F, 0.0F, 0.0F, 1.0F},
+                                .tangent = {1.0F, 0.0F, 0.0F, atmosphereDemo ? -1.0F : 1.0F},
                                 .uv1 = planeUvs[vertex]});
         }
         indices.insert(indices.end(), {0U, 1U, 2U, 0U, 2U, 3U});
@@ -438,22 +557,43 @@ CpuScenePayload makeProceduralScenePayload(bool emissiveSphereDemo, bool directi
                               .firstIndex = planeFirstIndex,
                               .vertexOffset = planeVertexOffset,
                               .materialIndex = static_cast<std::uint32_t>(scene.materials.size()),
-                              .centerRadius = {0.0F, 0.0F, 0.0F, 5.3F}});
+                              .centerRadius = {0.0F, 0.0F, 0.0F,
+                                               std::sqrt(planeHalfExtent * planeHalfExtent +
+                                                         planeVerticalHalfExtent *
+                                                             planeVerticalHalfExtent)}});
         primitiveLods.push_back({.firstLod = 2U, .lodCount = 1U});
         lodSources.push_back({.primitiveIndex = 2U, .minimumProjectedDiameter = 0.0F});
 
         const std::uint32_t materialIndex = static_cast<std::uint32_t>(scene.materials.size());
         const std::uint32_t transformIndex = static_cast<std::uint32_t>(scene.transforms.size());
         scene.materials.push_back({
-            .baseColorFactor = {0.16F, 0.18F, 0.22F, 1.0F},
+            .baseColorFactor = atmosphereDemo ? glm::vec4(1.0F)
+                                              : glm::vec4(0.16F, 0.18F, 0.22F, 1.0F),
             .emissiveAlphaCutoff = {0.0F, 0.0F, 0.0F, 0.5F},
-            .metallicRoughnessOcclusionNormal = {0.0F, 0.82F, 1.0F, 1.0F},
+            .metallicRoughnessOcclusionNormal = {0.0F, atmosphereDemo ? 1.0F : 0.82F,
+                                                  1.0F, atmosphereDemo ? 1.15F : 1.0F},
+            .textureIndices = atmosphereDemo ? glm::uvec4(1U, 2U, 3U, 2U)
+                                             : glm::uvec4(0U),
+            .textureState = atmosphereDemo
+                                ? glm::uvec4(
+                                      0U,
+                                      gpu_scene::baseColorTextureBit |
+                                          gpu_scene::metallicRoughnessTextureBit |
+                                          gpu_scene::normalTextureBit |
+                                          gpu_scene::occlusionTextureBit,
+                                             gpu_scene::rainReceiverMaterial, 0U)
+                                : glm::uvec4(0U),
         });
-        const glm::mat4 planeWorld = glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.0F, -0.55F));
+        const glm::vec3 planeCenter = atmosphereDemo ? glm::vec3(0.0F, -2.55F, 0.0F)
+                                                      : glm::vec3(0.0F, 0.0F, -0.55F);
+        const glm::mat4 planeWorld = glm::translate(glm::mat4(1.0F), planeCenter);
         scene.transforms.push_back({.world = planeWorld,
                                     .normalToWorld = glm::transpose(glm::inverse(planeWorld)),
                                     .previousWorld = planeWorld});
-        scene.instances.push_back({.centerRadius = {0.0F, 0.0F, -0.55F, 5.3F},
+        scene.instances.push_back({.centerRadius = {
+                                       planeCenter,
+                                       std::sqrt(planeHalfExtent * planeHalfExtent +
+                                                 planeVerticalHalfExtent * planeVerticalHalfExtent)},
                                    .meshMaterial = {1U, materialIndex, transformIndex, 0U}});
     }
     gpu_scene::MeshletHierarchy hierarchy =
@@ -472,18 +612,81 @@ CpuScenePayload makeProceduralScenePayload(bool emissiveSphereDemo, bool directi
                      : (directionalShadowDemo
                             ? "procedural directional-shadow demo"
                             : (hdriBackdropDemo ? "procedural HDRI backdrop demo"
-                                                : "procedural PBRT-checked sphere grid")),
+                                                 : (atmosphereDemo
+                                                        ? "procedural atmosphere terrain"
+                                                        : "procedural PBRT-checked sphere grid"))),
     };
+    if (atmosphereDemo) {
+        payload.textures.push_back(loadAtmosphereGroundTexture(
+            "dirt_floor_diff_4k.jpg", assets::ImageColorSpace::srgb,
+            assets::ImageMipSemantic::colorOrData,
+            "dirt_floor base color"));
+        payload.textures.push_back(loadAtmosphereGroundTexture(
+            "dirt_floor_arm_4k.jpg", assets::ImageColorSpace::linear,
+            assets::ImageMipSemantic::colorOrData,
+            "dirt_floor ARM"));
+        payload.textures.push_back(makeAtmosphereGroundNormalTexture());
+    }
     payload.meshletWork = gpu_scene::makeMeshletWorkRecords(hierarchy.primitiveLods, hierarchy.lods,
                                                             hierarchy.meshlets, payload.instances);
     return payload;
 }
 
-CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath,
-                                     bool allowAnimationStaticPose) {
-    assets::GltfImportOptions importOptions;
-    importOptions.allowAnimationStaticPose = allowAnimationStaticPose;
-    scene::Scene source = assets::importGltf(scenePath, importOptions);
+// Vulkan residency and descriptor sets remain valid even when an editor has no
+// renderable objects yet.  The anchor is real, valid geometry with a zero
+// visibility mask: it allocates the renderer's required non-empty GPU tables
+// without contributing a raster draw, a shadow, or a ray-traced hit.
+CpuScenePayload makeEmptyScenePayload(std::string label) {
+    std::vector<gpu_scene::VertexRecord> vertices{
+        {.position = {-0.001F, -0.001F, 0.0F}},
+        {.position = {0.001F, -0.001F, 0.0F}},
+        {.position = {0.0F, 0.001F, 0.0F}},
+    };
+    std::vector<std::uint32_t> indices{0U, 1U, 2U};
+    std::vector<gpu_scene::PrimitiveRecord> primitives{
+        {.indexCount = 3U,
+         .firstIndex = 0U,
+         .vertexOffset = 0,
+         .materialIndex = 0U,
+         .centerRadius = {0.0F, 0.0F, 0.0F, 0.002F}},
+    };
+    std::vector<gpu_scene::PrimitiveLodRange> primitiveLods{
+        {.firstLod = 0U, .lodCount = 1U},
+    };
+    std::vector<gpu_scene::LodSourceRecord> lodSources{
+        {.primitiveIndex = 0U, .minimumProjectedDiameter = 0.0F},
+    };
+    std::vector<gpu_scene::InstanceRecord> instances{
+        {.centerRadius = {0.0F, 0.0F, 0.0F, 0.002F},
+         .meshMaterial = {0U, 0U, 0U, 0U},
+         .visibilityLayer = {0U, 0U, 0U, 0U}},
+    };
+    std::vector<gpu_scene::MaterialRecord> materials(1U);
+    std::vector<gpu_scene::TransformRecord> transforms(1U);
+    gpu_scene::MeshletHierarchy hierarchy = gpu_scene::buildMeshletHierarchy(
+        vertices, indices, primitives, primitiveLods, lodSources);
+    CpuScenePayload payload{
+        .vertices = std::move(vertices),
+        .indices = std::move(indices),
+        .instances = std::move(instances),
+        .materials = std::move(materials),
+        .transforms = std::move(transforms),
+        .primitives = std::move(primitives),
+        .primitiveLods = std::move(hierarchy.primitiveLods),
+        .lodSources = std::move(lodSources),
+        .label = std::move(label),
+    };
+    payload.meshletWork = gpu_scene::makeMeshletWorkRecords(
+        payload.primitiveLods, hierarchy.lods, hierarchy.meshlets,
+        payload.instances);
+    return payload;
+}
+
+CpuScenePayload makeScenePayload(const scene::Scene& source, std::string label) {
+    if (source.primitives().empty() ||
+        scene::evaluate(source).meshInstances.empty()) {
+        return makeEmptyScenePayload(std::move(label));
+    }
     enum class TextureUsage : std::uint8_t { linearData, srgbColor, normal, count };
     constexpr std::size_t textureUsageCount = static_cast<std::size_t>(TextureUsage::count);
     std::vector<std::array<bool, textureUsageCount>> usages(source.textures().size());
@@ -576,11 +779,19 @@ CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath,
         .primitiveLods = std::move(packed.primitiveLods),
         .lodSources = std::move(packed.lodSources),
         .textures = std::move(textures),
-        .label = scenePath.string(),
+        .label = std::move(label),
     };
     payload.meshletWork = gpu_scene::makeMeshletWorkRecords(payload.primitiveLods, packed.lods,
                                                             packed.meshlets, payload.instances);
     return payload;
+}
+
+CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath,
+                                     bool allowAnimationStaticPose) {
+    assets::GltfImportOptions importOptions;
+    importOptions.allowAnimationStaticPose = allowAnimationStaticPose;
+    scene::Scene source = assets::importGltf(scenePath, importOptions);
+    return makeScenePayload(source, scenePath.string());
 }
 
 glm::vec3 cameraForward(float yaw, float pitch) {
@@ -614,7 +825,8 @@ VkSamplerAddressMode samplerAddressMode(scene::WrapMode mode) {
     return VK_SAMPLER_ADDRESS_MODE_REPEAT;
 }
 
-VkSamplerCreateInfo materialSamplerInfo(const scene::Sampler& sampler, std::uint32_t mipLevels) {
+VkSamplerCreateInfo materialSamplerInfo(const scene::Sampler& sampler, std::uint32_t mipLevels,
+                                        float maximumAnisotropy) {
     if (mipLevels == 0) {
         throw std::runtime_error("Material sampler requires at least one mip level");
     }
@@ -631,8 +843,8 @@ VkSamplerCreateInfo materialSamplerInfo(const scene::Sampler& sampler, std::uint
         .addressModeV = samplerAddressMode(sampler.wrapV),
         .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
         .mipLodBias = 0.0F,
-        .anisotropyEnable = VK_FALSE,
-        .maxAnisotropy = 1.0F,
+        .anisotropyEnable = VK_TRUE,
+        .maxAnisotropy = std::clamp(maximumAnisotropy, 1.0F, 16.0F),
         .compareEnable = VK_FALSE,
         .compareOp = VK_COMPARE_OP_ALWAYS,
         .minLod = 0.0F,
@@ -644,9 +856,9 @@ VkSamplerCreateInfo materialSamplerInfo(const scene::Sampler& sampler, std::uint
 
 } // namespace
 
-Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
+Renderer::Renderer(platform::RenderSurface& surfaceHost, const vulkan::Instance& instance,
                    const vulkan::Device& device, RendererConfig config)
-    : window_(window), instance_(instance), device_(device), config_(std::move(config)),
+    : surfaceHost_(surfaceHost), instance_(instance), device_(device), config_(std::move(config)),
       upscaler_(upscaling::createUpscaler({
           .backend = config_.upscalingBackend,
           .qualityMode = config_.upscalingQualityMode,
@@ -654,11 +866,125 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
       })),
       streamlineRuntime_(config_.streamlineRuntime),
       mainView_(config_.view),
-      swapchain_(createInitialSwapchain(instance, device, window, !config_.capturePath.empty())),
+      swapchain_(
+          createInitialSwapchain(instance, device, surfaceHost, !config_.capturePath.empty())),
       memoryAllocator_(device), pipelineCache_(device, RENDERER_PIPELINE_CACHE_PATH),
       uploadContext_(device, memoryAllocator_),
-      environmentRotationRadians_(config_.environmentRotationRadians) {
+      environmentRotationRadians_(config_.environmentRotationRadians),
+      atmosphereBaseExposureEv_(config_.exposureCompensationEv),
+      timeOfDayHour_(config_.timeOfDayHour),
+      timeOfDayCycleSeconds_(config_.timeOfDayCycleSeconds),
+      cloudWindOffsetKm_(config_.cloudInitialOffsetKm),
+      weatherDemoBaseWindDirectionRadians_(
+          std::atan2(config_.rain.windVelocityMetersPerSecond.z,
+                     config_.rain.windVelocityMetersPerSecond.x)) {
     try {
+        if (config_.sceneSnapshot && !config_.scenePath.empty()) {
+            throw std::runtime_error(
+                "RendererConfig cannot specify both sceneSnapshot and scenePath");
+        }
+        if (!std::isfinite(config_.atmosphereCameraPitchRadians) ||
+            config_.atmosphereCameraPitchRadians < glm::radians(-85.0F) ||
+            config_.atmosphereCameraPitchRadians > glm::radians(89.0F) ||
+            !std::isfinite(config_.atmosphereCameraYawRadians) ||
+            config_.atmosphereCameraPreset > 9U ||
+            !std::isfinite(config_.cloudInitialOffsetKm.x) ||
+            !std::isfinite(config_.cloudInitialOffsetKm.y)) {
+            throw std::runtime_error("Atmosphere debug camera settings are invalid");
+        }
+        if (config_.weatherDemoEnabled &&
+            (!config_.rain.enabled || !config_.atmosphere.has_value() ||
+             !config_.atmosphere->clouds.enabled ||
+             !std::isfinite(config_.weatherDemoCycleSeconds) ||
+             config_.weatherDemoCycleSeconds < 12.0F ||
+             config_.weatherDemoCycleSeconds > 300.0F)) {
+            throw std::runtime_error(
+                "Weather demo requires rain, clouds, and a cycle in [12, 300] seconds");
+        }
+        if (config_.atmosphereCameraPreset != 0U) {
+            if (!config_.atmosphereDemo || !config_.atmosphere.has_value()) {
+                throw std::runtime_error(
+                    "Atmosphere camera presets require the interactive atmosphere demo");
+            }
+            const lighting::AtmosphereDemoView preset =
+                lighting::atmosphereDemoPreset(config_.atmosphereCameraPreset);
+            atmosphereDemoView_.viewDistanceMeters = preset.viewDistanceMeters;
+            atmosphereDemoView_.viewZenithAngleRadians =
+                preset.viewZenithAngleRadians;
+            atmosphereDemoView_.viewAzimuthAngleRadians =
+                preset.viewAzimuthAngleRadians;
+            core::log(core::LogLevel::info, "Atmosphere debug camera preset ",
+                      config_.atmosphereCameraPreset, ": distance ",
+                      atmosphereDemoView_.viewDistanceMeters, " m");
+        }
+        if (config_.timeOfDayEnabled) {
+            if (!config_.atmosphereDemo || !config_.atmosphere.has_value()) {
+                throw std::runtime_error(
+                    "Time of day requires the interactive atmosphere demo");
+            }
+            if (!std::isfinite(timeOfDayHour_) ||
+                !std::isfinite(timeOfDayCycleSeconds_) ||
+                timeOfDayCycleSeconds_ < 5.0F || timeOfDayCycleSeconds_ > 86'400.0F ||
+                !std::isfinite(config_.timeOfDayLatitudeDegrees) ||
+                config_.timeOfDayLatitudeDegrees < -89.9F ||
+                config_.timeOfDayLatitudeDegrees > 89.9F ||
+                config_.timeOfDayDayOfYear == 0U ||
+                config_.timeOfDayDayOfYear > 365U) {
+                throw std::runtime_error("Renderer time-of-day settings are invalid");
+            }
+            timeOfDayHour_ -= 24.0F * std::floor(timeOfDayHour_ / 24.0F);
+            lighting::applyTimeOfDaySun(
+                atmosphereDemoView_, timeOfDayHour_,
+                {.latitudeDegrees = config_.timeOfDayLatitudeDegrees,
+                 .dayOfYear = config_.timeOfDayDayOfYear});
+            core::log(core::LogLevel::info, "Time of day: ", timeOfDayHour_,
+                      " h, latitude ", config_.timeOfDayLatitudeDegrees,
+                      " degrees, day ", config_.timeOfDayDayOfYear,
+                      ", full cycle ", timeOfDayCycleSeconds_, " s");
+        }
+        if (config_.weatherDemoEnabled) {
+            updateWeatherDemo(0.0F);
+            core::log(core::LogLevel::info, "Weather demo: ",
+                      config_.weatherDemoCycleSeconds,
+                      " s drizzle/downpour/storm/clearing cycle, rain intensity 0-1, "
+                      "wind 3-32 m/s with post-rain steam and evaporation");
+        }
+        if (config_.atmosphere.has_value() && config_.atmosphere->clouds.enabled) {
+            const lighting::CloudSettings& clouds = config_.atmosphere->clouds;
+            core::log(core::LogLevel::info,
+                      "Clouds: procedural planetary shell, coverage ", clouds.coverage,
+                      ", density ", clouds.density, ", altitude ",
+                      clouds.baseAltitudeMeters, "-",
+                      clouds.baseAltitudeMeters + clouds.thicknessMeters,
+                      " m, scale ", clouds.horizontalScaleMeters,
+                      " m, wind ", clouds.windSpeedMetersPerSecond, " m/s");
+        }
+        const weather::RainSettings& rain = config_.rain;
+        if (!std::isfinite(rain.intensity) || rain.intensity < 0.0F || rain.intensity > 1.0F ||
+            !std::isfinite(rain.fallSpeedMetersPerSecond) ||
+            rain.fallSpeedMetersPerSecond < 1.0F || rain.fallSpeedMetersPerSecond > 100.0F ||
+            !std::isfinite(rain.streakLengthMeters) || rain.streakLengthMeters < 0.05F ||
+            rain.streakLengthMeters > 5.0F || !std::isfinite(rain.maximumDistanceMeters) ||
+            rain.maximumDistanceMeters < 2.0F || rain.maximumDistanceMeters > 250.0F ||
+            !std::isfinite(rain.windVelocityMetersPerSecond.x) ||
+            !std::isfinite(rain.windVelocityMetersPerSecond.y) ||
+            !std::isfinite(rain.windVelocityMetersPerSecond.z)) {
+            throw std::runtime_error("Renderer rain settings are invalid");
+        }
+        if (rain.enabled) {
+            core::log(core::LogLevel::info, "Rain: camera-local GPU field, intensity ",
+                      rain.intensity, ", terminal speed ", rain.fallSpeedMetersPerSecond,
+                      " m/s, maximum distance ", rain.maximumDistanceMeters,
+                      " m, wind (", rain.windVelocityMetersPerSecond.x, ", ",
+                      rain.windVelocityMetersPerSecond.y, ", ",
+                      rain.windVelocityMetersPerSecond.z, ") m/s");
+        }
+        if (config_.dynamicSceneUpdates &&
+            (pathTracingEnabled() ||
+             config_.rayTracingRequest != ray_tracing::Request::disabled)) {
+            throw std::runtime_error(
+                "Dynamic editor scene updates require raster mode with ray tracing disabled");
+        }
         if (config_.hdriBackdropDemo) {
             config_.shadowsEnabled = false;
             core::log(core::LogLevel::info,
@@ -680,14 +1006,22 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
                     "Path tracing requires an interactive sample count in [1, " +
                     std::to_string(maximumPathInteractiveSampleCount) + "]");
             }
+            constexpr float maximumShadowAngularRadius =
+                5.0F * std::numbers::pi_v<float> / 180.0F;
+            if (!std::isfinite(config_.pathShadowAngularRadius) ||
+                config_.pathShadowAngularRadius < 0.0F ||
+                config_.pathShadowAngularRadius > maximumShadowAngularRadius) {
+                throw std::runtime_error(
+                    "Path shadow angular radius must be finite and in [0, 5] degrees");
+            }
             config_.taaEnabled = false;
             config_.bloomEnabled = false;
             config_.occlusionCullingEnabled = false;
             if (rayReconstructionEnabled()) {
                 core::log(core::LogLevel::info,
-                          "Render mode: realtime noisy path tracing (raster TAA, bloom, Hi-Z, "
-                          "local temporal filtering, and NRD disabled; one fresh sample per "
-                          "frame feeds NVIDIA DLSS Ray Reconstruction)");
+                           "Render mode: realtime noisy path tracing (raster TAA, bloom, Hi-Z, "
+                           "local temporal filtering, and NRD disabled; one fresh sample per "
+                           "frame feeds NVIDIA DLSS Ray Reconstruction)");
             } else {
                 core::log(core::LogLevel::info,
                           "Render mode: interactive progressive path tracing (raster TAA, bloom, "
@@ -703,6 +1037,14 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
             }
             core::log(core::LogLevel::info,
                       "Path reconstruction view: ", pathDebugViewName(config_.pathDebugView));
+            core::log(core::LogLevel::info, "Path environment shadow angular radius: ",
+                      config_.pathShadowAngularRadius * 180.0F / std::numbers::pi_v<float>,
+                      " degrees");
+            if (!config_.environmentPath.empty()) {
+                core::log(core::LogLevel::info,
+                          "Path lighting: explicit HDRI only; procedural directional and point "
+                          "lights disabled");
+            }
         } else {
             core::log(core::LogLevel::info, "Render mode: rasterized");
         }
@@ -867,6 +1209,12 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
             !supportsOptimalFormat(device_, brdfLutFormat, iblFeatures)) {
             throw std::runtime_error("Required floating-point IBL texture formats are unavailable");
         }
+        if (config_.atmosphere.has_value() &&
+            !supportsOptimalFormat(device_, iblColorFormat,
+                                   iblFeatures | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            throw std::runtime_error(
+                "RGBA32F storage images are unavailable for dynamic atmosphere lighting");
+        }
         createFrameResources();
         createCaptureBuffer();
         createSceneResources();
@@ -874,6 +1222,7 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         createUpscalingHistoryResources();
         createPathTracingResources();
         createGraphicsPipelines();
+        createEditorOverlayResources();
         createRenderGraph();
         if (pathTracingEnabled()) {
             updatePathTracingDescriptors();
@@ -888,8 +1237,10 @@ Renderer::Renderer(platform::Window& window, const vulkan::Instance& instance,
         } else {
             updateShadowDescriptor();
         }
+        updateAtmosphereEnvironmentDescriptors();
         updateUpscalingDescriptor();
         updateToneMappingDescriptor();
+        updateRainDescriptor();
         if (!pathTracingEnabled()) {
             updateHiZDescriptors();
         }
@@ -927,6 +1278,16 @@ VkExtent2D Renderer::renderExtent() const {
 }
 
 void Renderer::drawFrame() {
+    // The dynamic atmosphere cache changes the freshly uploaded environment
+    // image from sampled to storage layout on its first use. Finish that one
+    // startup upload before recording the reusable per-frame transition; this
+    // avoids racing the transfer queue's final layout transition. Subsequent
+    // cloud updates remain fully asynchronous on the graphics queue.
+    if (sceneUploadPending_ && config_.atmosphere.has_value() &&
+        config_.atmosphere->clouds.enabled) {
+        uploadContext_.wait(sceneUpload_.value);
+        sceneUploadPending_ = false;
+    }
     updateCamera();
     const bool animatedPathScene = pathTracingEnabled() && config_.rayTracingTransformScript !=
                                                                RayTracingTransformScript::none;
@@ -955,6 +1316,7 @@ void Renderer::drawFrame() {
                       "vkWaitSemaphores(frame slot)");
         collectGpuTimings(frameIndex_);
     }
+    updateEditorOverlayBuffer(frameIndex_);
 
     std::uint32_t imageIndex = 0;
     const VkResult acquireResult = swapchain_.acquire(frame.imageAvailable, imageIndex);
@@ -989,13 +1351,12 @@ void Renderer::drawFrame() {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
             .semaphore = sceneUpload_.semaphore,
             .value = sceneUpload_.value,
-            .stageMask =
-                VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
-                VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT |
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                (pathTracingEnabled() ? VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
-                                      : VkPipelineStageFlags2{0U}),
+            // The first graphics submission can transition an uploaded image
+            // before its eventual shader access (for example, the atmosphere
+            // cache changes from sampled to storage layout). Waiting at every
+            // command stage also orders that transition against the transfer
+            // queue's final upload transition.
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         };
     }
     const std::uint64_t completionValue = nextTimelineValue_++;
@@ -1077,7 +1438,7 @@ void Renderer::drawFrame() {
         .pImageIndices = &imageIndex,
     };
     const VkResult presentResult = vkQueuePresentKHR(device_.presentQueue(), &presentInfo);
-    const bool resized = window_.consumeFramebufferResize();
+    const bool resized = surfaceHost_.consumeFramebufferResize();
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR ||
         resized || acquireResult == VK_SUBOPTIMAL_KHR) {
         recreateSwapchain();
@@ -1108,6 +1469,128 @@ void Renderer::waitIdle() {
     }
 }
 
+bool Renderer::updateSceneSnapshot(
+    std::shared_ptr<const scene::Scene> sceneSnapshot) {
+    if (!config_.dynamicSceneUpdates || !sceneSnapshot || pathTracingEnabled() ||
+        rayTracingFoundationEnabled_) {
+        return false;
+    }
+
+    const std::string label = sceneSnapshot->name().empty()
+                                  ? "embedded editor scene update"
+                                  : sceneSnapshot->name();
+    CpuScenePayload scene = makeScenePayload(*sceneSnapshot, label);
+    if (!scene.textures.empty() || textureImages_.size() != 1U) {
+        // Changing bindless texture residency requires a deliberate full rebuild.
+        return false;
+    }
+    const auto fits = [](auto const& records,
+                         std::unique_ptr<vulkan::Buffer> const& buffer) {
+        using Record = typename std::remove_cvref_t<decltype(records)>::value_type;
+        return buffer && records.size() <=
+            static_cast<std::size_t>(buffer->size() / sizeof(Record));
+    };
+    if (!fits(scene.vertices, vertexBuffer_) || !fits(scene.indices, indexBuffer_) ||
+        !fits(scene.instances, instanceBuffer_) ||
+        !fits(scene.materials, materialBuffer_) ||
+        !fits(scene.transforms, transformBuffer_) ||
+        !fits(scene.meshletWork, meshletWorkBuffer_) ||
+        scene.meshletWork.size() >
+            static_cast<std::size_t>(visibleInstanceBuffer_->size() /
+                                     sizeof(std::uint32_t)) ||
+        scene.meshletWork.size() > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+
+    waitIdle();
+    const std::array bufferUploads{
+        vulkan::BufferUpload{.destination = vertexBuffer_.get(),
+                             .data = std::as_bytes(std::span(scene.vertices))},
+        vulkan::BufferUpload{.destination = indexBuffer_.get(),
+                             .data = std::as_bytes(std::span(scene.indices))},
+        vulkan::BufferUpload{.destination = instanceBuffer_.get(),
+                             .data = std::as_bytes(std::span(scene.instances))},
+        vulkan::BufferUpload{.destination = materialBuffer_.get(),
+                             .data = std::as_bytes(std::span(scene.materials))},
+        vulkan::BufferUpload{.destination = transformBuffer_.get(),
+                             .data = std::as_bytes(std::span(scene.transforms))},
+        vulkan::BufferUpload{.destination = meshletWorkBuffer_.get(),
+                             .data = std::as_bytes(std::span(scene.meshletWork))},
+    };
+    sceneUpload_ = uploadContext_.upload(bufferUploads);
+    sceneUploadPending_ = true;
+    sceneWorkItemCount_ = static_cast<std::uint32_t>(scene.meshletWork.size());
+
+    glm::vec3 minimum(std::numeric_limits<float>::infinity());
+    glm::vec3 maximum(-std::numeric_limits<float>::infinity());
+    for (const gpu_scene::InstanceRecord& instance : scene.instances) {
+        const glm::vec3 center(instance.centerRadius);
+        const glm::vec3 radius(instance.centerRadius.w);
+        minimum = glm::min(minimum, center - radius);
+        maximum = glm::max(maximum, center + radius);
+    }
+    sceneMinimum_ = minimum;
+    sceneMaximum_ = maximum;
+    sceneCenter_ = (minimum + maximum) * 0.5F;
+    sceneRadius_ = std::max(glm::length((maximum - minimum) * 0.5F), 1.0e-4F);
+    config_.sceneSnapshot = std::move(sceneSnapshot);
+    temporalState_.reset();
+    hiZReady_ = false;
+    pathTracingResetPending_ = true;
+    core::log(core::LogLevel::info, "Updated live editor scene in place: ",
+              scene.vertices.size(), " vertices, ", scene.indices.size(),
+              " indices, ", scene.meshletWork.size(), " work candidates");
+    return true;
+}
+
+void Renderer::setCamera(std::optional<RendererCamera> camera) {
+    if (camera) {
+        const float forwardLengthSquared = glm::dot(camera->forward, camera->forward);
+        const bool finitePosition = std::isfinite(camera->position.x) &&
+                                    std::isfinite(camera->position.y) &&
+                                    std::isfinite(camera->position.z);
+        const bool finiteForward = std::isfinite(camera->forward.x) &&
+                                   std::isfinite(camera->forward.y) &&
+                                   std::isfinite(camera->forward.z);
+        const bool validPerspective =
+            camera->projection != RendererCamera::Projection::perspective ||
+            (std::isfinite(camera->verticalFieldOfViewRadians) &&
+             camera->verticalFieldOfViewRadians > glm::radians(1.0F) &&
+             camera->verticalFieldOfViewRadians < glm::radians(179.0F));
+        const bool validOrthographic =
+            camera->projection != RendererCamera::Projection::orthographic ||
+            (std::isfinite(camera->orthographicHeight) &&
+             camera->orthographicHeight > 0.0F);
+        if (!finitePosition || !finiteForward || forwardLengthSquared <= 1.0e-12F ||
+            !validPerspective || !validOrthographic ||
+            !std::isfinite(camera->nearPlane) || !std::isfinite(camera->farPlane) ||
+            camera->nearPlane <= 0.0F || camera->farPlane <= camera->nearPlane) {
+            throw std::invalid_argument("Renderer camera contains an invalid perspective pose");
+        }
+        if (pathTracingEnabled() &&
+            camera->projection == RendererCamera::Projection::orthographic) {
+            throw std::invalid_argument(
+                "The clean path-traced view currently requires a perspective camera");
+        }
+        camera->forward = glm::normalize(camera->forward);
+    }
+    const bool projectionChanged = externalCamera_.has_value() != camera.has_value() ||
+                                   (externalCamera_ && camera &&
+                                    (externalCamera_->projection != camera->projection ||
+                                     externalCamera_->verticalFieldOfViewRadians !=
+                                         camera->verticalFieldOfViewRadians ||
+                                     externalCamera_->orthographicHeight !=
+                                         camera->orthographicHeight ||
+                                     externalCamera_->nearPlane != camera->nearPlane ||
+                                     externalCamera_->farPlane != camera->farPlane));
+    externalCamera_ = std::move(camera);
+    if (projectionChanged) {
+        temporalState_.invalidateHistory();
+        hiZReady_ = false;
+        pathTracingResetPending_ = true;
+    }
+}
+
 void Renderer::writeGpuTimestamp(VkCommandBuffer commandBuffer, std::size_t frameIndex,
                                  GpuTimingPass pass, bool end) const {
     if (timestampQueryPool_ == VK_NULL_HANDLE) {
@@ -1122,6 +1605,8 @@ void Renderer::writeGpuTimestamp(VkCommandBuffer commandBuffer, std::size_t fram
         stage = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
     } else if (pass == GpuTimingPass::pbrGeometry) {
         stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    } else if (pass == GpuTimingPass::atmosphereEnvironment) {
+        stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     } else if (pass == GpuTimingPass::pathTracing) {
         stage = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
     } else if (pass == GpuTimingPass::pathHistory || pass == GpuTimingPass::pathReconstruction ||
@@ -1176,6 +1661,7 @@ void Renderer::writeGpuTimingReport() {
         "directional shadow culling",
         "directional shadow map",
         "PBR geometry draw",
+        "dynamic atmosphere environment",
         "path tracing",
         "path history validation",
         "path temporal reconstruction",
@@ -1190,6 +1676,7 @@ void Renderer::writeGpuTimingReport() {
         "reactive-mask generation",
         rayReconstructionEnabled() ? "NVIDIA DLSS Ray Reconstruction" : "upscaling",
         "composite/exposure/tone mapping",
+        "rain composite",
     };
     static_assert(names.size() == gpuTimingPassCount);
     VkPhysicalDeviceProperties properties{};
@@ -1254,6 +1741,9 @@ void Renderer::writeGpuTimingReport() {
            << "Film grain intensity: " << config_.filmGrainIntensity << '\n'
            << "Path environment sampling: "
            << (config_.pathEnvironmentImportanceSampling ? "importance" : "uniform") << '\n'
+           << "Path shadow angular radius: "
+           << config_.pathShadowAngularRadius * 180.0F / std::numbers::pi_v<float>
+           << " degrees\n"
            << "Path emissive-triangle sampling: "
            << (pathTracingEnabled() && config_.pathEmissiveTriangleSampling ? "enabled"
                                                                             : "disabled")
@@ -1665,7 +2155,9 @@ void Renderer::createPathTracingResources() {
     }
     pathDenoisedImage_ = createPathImage(pathTracingAovFormat_);
     pathDenoisedView_ = std::make_unique<vulkan::ImageView>(device_, *pathDenoisedImage_);
-#if RENDERER_ENABLE_NRD
+    // These three noisy-signal AOVs are part of the path-tracing shader ABI even when the
+    // optional NRD backend is not compiled.  The portable reconstruction path also relies on
+    // the shader having valid storage-image bindings for them.
     nrdDiffuseInputImage_ = createPathImage(pathTracingAovFormat_);
     nrdDiffuseInputView_ =
         std::make_unique<vulkan::ImageView>(device_, *nrdDiffuseInputImage_);
@@ -1674,6 +2166,7 @@ void Renderer::createPathTracingResources() {
         std::make_unique<vulkan::ImageView>(device_, *nrdSpecularInputImage_);
     nrdMaterialImage_ = createPathImage(pathTracingAovFormat_);
     nrdMaterialView_ = std::make_unique<vulkan::ImageView>(device_, *nrdMaterialImage_);
+#if RENDERER_ENABLE_NRD
     if (!rayReconstructionEnabled()) {
         nrdMotionImage_ = createPathImage(pathTracingAovFormat_);
         nrdMotionView_ = std::make_unique<vulkan::ImageView>(device_, *nrdMotionImage_);
@@ -1805,11 +2298,20 @@ void Renderer::createSceneResources() {
         core::log(core::LogLevel::info,
                   "glTF animation policy: importing authored initial transforms as a static pose");
     }
-    CpuScenePayload scene =
-        config_.scenePath.empty()
-            ? makeProceduralScenePayload(config_.emissiveSphereDemo, config_.directionalShadowDemo,
-                                         config_.hdriBackdropDemo, config_.alphaShadowDemo)
-            : loadGltfScenePayload(config_.scenePath, config_.sceneAnimationStaticPose);
+    CpuScenePayload scene;
+    if (config_.sceneSnapshot) {
+        const std::string label = config_.sceneSnapshot->name().empty()
+                                      ? "embedded editor scene"
+                                      : config_.sceneSnapshot->name();
+        scene = makeScenePayload(*config_.sceneSnapshot, label);
+    } else if (!config_.scenePath.empty()) {
+        scene = loadGltfScenePayload(config_.scenePath, config_.sceneAnimationStaticPose);
+    } else {
+        scene = makeProceduralScenePayload(config_.emissiveSphereDemo,
+                                           config_.directionalShadowDemo,
+                                           config_.hdriBackdropDemo, config_.alphaShadowDemo,
+                                           config_.atmosphereDemo);
+    }
     if (pathTracingEnabled() && scene.textures.empty()) {
         // The procedural PBR grid marks the renderer's fallback descriptor as a
         // base-color texture. Factor-only path shading deliberately bypasses it.
@@ -1921,10 +2423,31 @@ void Renderer::createSceneResources() {
         rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery || pathTracingEnabled()
             ? static_cast<VkBufferUsageFlags>(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
             : VkBufferUsageFlags{0U};
+    const auto reservedBytes = [this](VkDeviceSize used, VkDeviceSize minimumBytes) {
+        if (!config_.dynamicSceneUpdates) {
+            return used;
+        }
+        return std::max(minimumBytes, used + used / 2U);
+    };
+    const VkDeviceSize vertexBytes = reservedBytes(
+        vertices.size() * sizeof(gpu_scene::VertexRecord), 8U * 1024U * 1024U);
+    const VkDeviceSize indexBytes = reservedBytes(
+        indices.size() * sizeof(std::uint32_t), 2U * 1024U * 1024U);
+    const VkDeviceSize instanceBytes = reservedBytes(
+        instances.size() * sizeof(gpu_scene::InstanceRecord), 512U * 1024U);
+    const VkDeviceSize materialBytes = reservedBytes(
+        materials.size() * sizeof(gpu_scene::MaterialRecord), 256U * 1024U);
+    const VkDeviceSize transformBytes = reservedBytes(
+        transforms.size() * sizeof(gpu_scene::TransformRecord), 1024U * 1024U);
+    const VkDeviceSize meshletWorkBytes = reservedBytes(
+        workItems.size() * sizeof(gpu_scene::MeshletWorkRecord), 4U * 1024U * 1024U);
+    const std::size_t workItemCapacity = static_cast<std::size_t>(
+        meshletWorkBytes / sizeof(gpu_scene::MeshletWorkRecord));
+
     vertexBuffer_ = std::make_unique<vulkan::Buffer>(
         device_, memoryAllocator_,
         vulkan::BufferCreateInfo{
-            .size = vertices.size() * sizeof(gpu_scene::VertexRecord),
+            .size = vertexBytes,
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | rayTracingGeometryUsage |
                      rayShaderGeometryReadUsage,
@@ -1934,7 +2457,7 @@ void Renderer::createSceneResources() {
     indexBuffer_ = std::make_unique<vulkan::Buffer>(
         device_, memoryAllocator_,
         vulkan::BufferCreateInfo{
-            .size = indices.size() * sizeof(std::uint32_t),
+            .size = indexBytes,
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | rayTracingGeometryUsage |
                      rayShaderGeometryReadUsage,
@@ -1944,7 +2467,7 @@ void Renderer::createSceneResources() {
     instanceBuffer_ = std::make_unique<vulkan::Buffer>(
         device_, memoryAllocator_,
         vulkan::BufferCreateInfo{
-            .size = instances.size() * sizeof(gpu_scene::InstanceRecord),
+            .size = instanceBytes,
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -1953,7 +2476,7 @@ void Renderer::createSceneResources() {
     materialBuffer_ = std::make_unique<vulkan::Buffer>(
         device_, memoryAllocator_,
         vulkan::BufferCreateInfo{
-            .size = materials.size() * sizeof(gpu_scene::MaterialRecord),
+            .size = materialBytes,
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -1962,7 +2485,7 @@ void Renderer::createSceneResources() {
     transformBuffer_ = std::make_unique<vulkan::Buffer>(
         device_, memoryAllocator_,
         vulkan::BufferCreateInfo{
-            .size = transforms.size() * sizeof(gpu_scene::TransformRecord),
+            .size = transformBytes,
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -1984,7 +2507,7 @@ void Renderer::createSceneResources() {
     meshletWorkBuffer_ = std::make_unique<vulkan::Buffer>(
         device_, memoryAllocator_,
         vulkan::BufferCreateInfo{
-            .size = workItems.size() * sizeof(gpu_scene::MeshletWorkRecord),
+            .size = meshletWorkBytes,
             .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
             .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -1994,7 +2517,7 @@ void Renderer::createSceneResources() {
         return std::make_unique<vulkan::Buffer>(
             device_, memoryAllocator_,
             vulkan::BufferCreateInfo{
-                .size = workItems.size() * sizeof(std::uint32_t),
+                .size = workItemCapacity * sizeof(std::uint32_t),
                 .usage =
                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -2005,7 +2528,7 @@ void Renderer::createSceneResources() {
         return std::make_unique<vulkan::Buffer>(
             device_, memoryAllocator_,
             vulkan::BufferCreateInfo{
-                .size = workItems.size() * sizeof(gpu_scene::DrawIndexedIndirectRecord),
+                .size = workItemCapacity * sizeof(gpu_scene::DrawIndexedIndirectRecord),
                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                 .requiredMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -2118,16 +2641,60 @@ void Renderer::createSceneResources() {
             std::make_unique<vulkan::ImageView>(device_, *textureImages_.back()));
         textureSamplers_.push_back(std::make_unique<vulkan::Sampler>(
             device_, materialSamplerInfo(texture.sampler,
-                                         static_cast<std::uint32_t>(texture.mips.levels.size()))));
+                                         static_cast<std::uint32_t>(texture.mips.levels.size()),
+                                         device_.properties().limits.maxSamplerAnisotropy)));
     }
 
     const auto bakeStart = std::chrono::steady_clock::now();
-    lighting::FloatImage environment =
-        config_.environmentPath.empty()
-            ? lighting::makeProceduralStudioEnvironment()
-            : lighting::toLinearFloatImage(
-                  assets::loadDecodedImage(config_.environmentPath, assets::ImageColorSpace::srgb));
+    lighting::FloatImage environment;
+    if (!config_.environmentPath.empty()) {
+        environment = lighting::toLinearFloatImage(
+            assets::loadDecodedImage(config_.environmentPath,
+                                     assets::ImageColorSpace::srgb));
+    } else if (config_.atmosphere.has_value()) {
+        environment =
+            lighting::makePrecomputedAtmosphereEnvironment(*config_.atmosphere);
+    } else {
+        environment = lighting::makeProceduralStudioEnvironment();
+    }
     lighting::IblAssets ibl = lighting::bakeImageBasedLighting(std::move(environment));
+    lighting::AtmospherePrecomputedLuts atmosphereLuts;
+    VkExtent3D atmosphereTransmittanceExtent{1U, 1U, 1U};
+    VkExtent3D atmosphereScatteringExtent{1U, 1U, 1U};
+    VkExtent3D atmosphereIrradianceExtent{1U, 1U, 1U};
+    if (config_.atmosphere.has_value()) {
+        atmosphereLuts = lighting::loadAtmospherePrecomputedLuts();
+        atmosphereTransmittanceExtent = {lighting::brunetonTransmittanceWidth,
+                                         lighting::brunetonTransmittanceHeight, 1U};
+        atmosphereScatteringExtent = {lighting::brunetonScatteringWidth,
+                                      lighting::brunetonScatteringHeight,
+                                      lighting::brunetonScatteringDepth};
+        atmosphereIrradianceExtent = {lighting::brunetonIrradianceWidth,
+                                      lighting::brunetonIrradianceHeight, 1U};
+    } else {
+        atmosphereLuts.transmittance = {1.0F, 1.0F, 1.0F, 1.0F};
+        atmosphereLuts.scattering = {0.0F, 0.0F, 0.0F, 0.0F};
+        atmosphereLuts.irradiance = {0.0F, 0.0F, 0.0F, 1.0F};
+    }
+    const bool generateCloudNoise = config_.atmosphere.has_value() &&
+                                    config_.atmosphere->clouds.enabled;
+    const auto noiseGenerationStart = std::chrono::steady_clock::now();
+    procedural::CloudNoiseVolumes cloudNoise =
+        procedural::makeCloudNoiseVolumes(generateCloudNoise ? 128U : 4U,
+                                          generateCloudNoise ? 32U : 4U);
+    const auto noiseGenerationMilliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - noiseGenerationStart)
+            .count();
+    const auto noiseBytes = [](const procedural::NoiseVolume& volume) {
+        std::size_t bytes = 0U;
+        for (const procedural::NoiseVolumeLevel& level : volume.levels) {
+            bytes += level.texels.size();
+        }
+        return bytes;
+    };
+    const std::size_t cloudNoiseBytes =
+        noiseBytes(cloudNoise.base) + noiseBytes(cloudNoise.detail);
     lighting::EnvironmentSamplingDistribution environmentSampling;
     if (pathTracingEnabled()) {
         environmentSampling = lighting::buildEnvironmentSamplingDistribution(ibl.environment);
@@ -2144,12 +2711,16 @@ void Renderer::createSceneResources() {
             core::LogLevel::info, "Path-tracing environment sampler: ", environmentSampling.width,
             "x", environmentSampling.height, " alias table, ", environmentSamplingBuffer_->size(),
             " bytes; ",
-            config_.pathEnvironmentImportanceSampling ? "solid-angle luminance" : "uniform-sphere",
+            config_.pathEnvironmentImportanceSampling && !config_.atmosphere.has_value()
+                ? "solid-angle luminance"
+                : "uniform-sphere",
             " sampling and power-heuristic MIS enabled");
     }
-    const auto bakeMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::steady_clock::now() - bakeStart)
-                                      .count();
+    const auto bakeMilliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - bakeStart)
+            .count() -
+        noiseGenerationMilliseconds;
     const std::uint32_t specularMipCount =
         static_cast<std::uint32_t>(ibl.prefilteredSpecular.levels.size());
     environmentImage_ = std::make_unique<vulkan::Image>(
@@ -2157,10 +2728,74 @@ void Renderer::createSceneResources() {
         vulkan::ImageCreateInfo{
             .extent = {ibl.environment.width, ibl.environment.height, 1},
             .format = iblColorFormat,
-            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                     (config_.atmosphere.has_value() ? VK_IMAGE_USAGE_STORAGE_BIT : 0U),
             .queueFamilies = sharing,
         });
     environmentView_ = std::make_unique<vulkan::ImageView>(device_, *environmentImage_);
+    atmosphereTransmittanceImage_ = std::make_unique<vulkan::Image>(
+        device_, memoryAllocator_,
+        vulkan::ImageCreateInfo{
+            .extent = atmosphereTransmittanceExtent,
+            .format = iblColorFormat,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                     (config_.atmosphere.has_value() ? VK_IMAGE_USAGE_STORAGE_BIT : 0U),
+            .queueFamilies = sharing,
+        });
+    atmosphereTransmittanceView_ =
+        std::make_unique<vulkan::ImageView>(device_, *atmosphereTransmittanceImage_);
+    atmosphereScatteringImage_ = std::make_unique<vulkan::Image>(
+        device_, memoryAllocator_,
+        vulkan::ImageCreateInfo{
+            .extent = atmosphereScatteringExtent,
+            .format = iblColorFormat,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .type = VK_IMAGE_TYPE_3D,
+            .queueFamilies = sharing,
+        });
+    atmosphereScatteringView_ = std::make_unique<vulkan::ImageView>(
+        device_, *atmosphereScatteringImage_,
+        vulkan::ImageViewCreateInfo{.type = VK_IMAGE_VIEW_TYPE_3D});
+    atmosphereIrradianceImage_ = std::make_unique<vulkan::Image>(
+        device_, memoryAllocator_,
+        vulkan::ImageCreateInfo{
+            .extent = atmosphereIrradianceExtent,
+            .format = iblColorFormat,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .queueFamilies = sharing,
+        });
+    atmosphereIrradianceView_ =
+        std::make_unique<vulkan::ImageView>(device_, *atmosphereIrradianceImage_);
+    cloudBaseNoiseImage_ = std::make_unique<vulkan::Image>(
+        device_, memoryAllocator_,
+        vulkan::ImageCreateInfo{
+            .extent = {cloudNoise.base.levels.front().extent,
+                       cloudNoise.base.levels.front().extent,
+                       cloudNoise.base.levels.front().extent},
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .type = VK_IMAGE_TYPE_3D,
+            .mipLevels = static_cast<std::uint32_t>(cloudNoise.base.levels.size()),
+            .queueFamilies = sharing,
+        });
+    cloudBaseNoiseView_ = std::make_unique<vulkan::ImageView>(
+        device_, *cloudBaseNoiseImage_,
+        vulkan::ImageViewCreateInfo{.type = VK_IMAGE_VIEW_TYPE_3D});
+    cloudDetailNoiseImage_ = std::make_unique<vulkan::Image>(
+        device_, memoryAllocator_,
+        vulkan::ImageCreateInfo{
+            .extent = {cloudNoise.detail.levels.front().extent,
+                       cloudNoise.detail.levels.front().extent,
+                       cloudNoise.detail.levels.front().extent},
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .type = VK_IMAGE_TYPE_3D,
+            .mipLevels = static_cast<std::uint32_t>(cloudNoise.detail.levels.size()),
+            .queueFamilies = sharing,
+        });
+    cloudDetailNoiseView_ = std::make_unique<vulkan::ImageView>(
+        device_, *cloudDetailNoiseImage_,
+        vulkan::ImageViewCreateInfo{.type = VK_IMAGE_VIEW_TYPE_3D});
     diffuseIrradianceImage_ = std::make_unique<vulkan::Image>(
         device_, memoryAllocator_,
         vulkan::ImageCreateInfo{
@@ -2201,6 +2836,11 @@ void Renderer::createSceneResources() {
     brdfSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     brdfSamplerInfo.maxLod = 0.0F;
     brdfLutSampler_ = std::make_unique<vulkan::Sampler>(device_, brdfSamplerInfo);
+    VkSamplerCreateInfo proceduralNoiseSamplerInfo = samplerInfo;
+    proceduralNoiseSamplerInfo.maxLod = static_cast<float>(
+        std::max(cloudNoise.base.levels.size(), cloudNoise.detail.levels.size()) - 1U);
+    proceduralNoiseSampler_ =
+        std::make_unique<vulkan::Sampler>(device_, proceduralNoiseSamplerInfo);
     VkSamplerCreateInfo hiZSamplerInfo = brdfSamplerInfo;
     hiZSamplerInfo.magFilter = VK_FILTER_NEAREST;
     hiZSamplerInfo.minFilter = VK_FILTER_NEAREST;
@@ -2263,7 +2903,8 @@ void Renderer::createSceneResources() {
     for (const CpuScenePayload::Texture& texture : scene.textures) {
         materialMipCount += texture.mips.levels.size();
     }
-    imageUploads.reserve(static_cast<std::size_t>(specularMipCount) + materialMipCount + 4U);
+    imageUploads.reserve(static_cast<std::size_t>(specularMipCount) + materialMipCount +
+                         cloudNoise.base.levels.size() + cloudNoise.detail.levels.size() + 7U);
     imageUploads.push_back({.destination = textureImages_.front().get(),
                             .data = std::as_bytes(std::span(texturePixels))});
     for (std::size_t textureIndex = 0; textureIndex < scene.textures.size(); ++textureIndex) {
@@ -2278,6 +2919,26 @@ void Renderer::createSceneResources() {
     }
     imageUploads.push_back({.destination = environmentImage_.get(),
                             .data = std::as_bytes(std::span(ibl.environment.texels))});
+    imageUploads.push_back({.destination = atmosphereTransmittanceImage_.get(),
+                            .data = std::as_bytes(std::span(atmosphereLuts.transmittance))});
+    imageUploads.push_back({.destination = atmosphereScatteringImage_.get(),
+                            .data = std::as_bytes(std::span(atmosphereLuts.scattering))});
+    imageUploads.push_back({.destination = atmosphereIrradianceImage_.get(),
+                            .data = std::as_bytes(std::span(atmosphereLuts.irradiance))});
+    for (std::uint32_t level = 0U; level < cloudNoise.base.levels.size(); ++level) {
+        imageUploads.push_back({
+            .destination = cloudBaseNoiseImage_.get(),
+            .data = std::as_bytes(std::span(cloudNoise.base.levels[level].texels)),
+            .mipLevel = level,
+        });
+    }
+    for (std::uint32_t level = 0U; level < cloudNoise.detail.levels.size(); ++level) {
+        imageUploads.push_back({
+            .destination = cloudDetailNoiseImage_.get(),
+            .data = std::as_bytes(std::span(cloudNoise.detail.levels[level].texels)),
+            .mipLevel = level,
+        });
+    }
     imageUploads.push_back({.destination = diffuseIrradianceImage_.get(),
                             .data = std::as_bytes(std::span(ibl.diffuseIrradiance.texels))});
     for (std::uint32_t level = 0; level < specularMipCount; ++level) {
@@ -2382,8 +3043,16 @@ void Renderer::createSceneResources() {
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "tonemap.vert.spv");
     toneMappingFragmentShader_ =
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "tonemap.frag.spv");
+    if (config_.rain.enabled) {
+        rainFragmentShader_ =
+            std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "rain.frag.spv");
+    }
     taaFragmentShader_ =
         std::make_unique<vulkan::ShaderModule>(device_, shaderDirectory / "taa.frag.spv");
+    if (config_.atmosphere.has_value()) {
+        atmosphereEnvironmentShader_ = std::make_unique<vulkan::ShaderModule>(
+            device_, shaderDirectory / "atmosphere_environment.comp.spv");
+    }
     if (pathTracingEnabled()) {
         pathTracingRayGenerationShader_ = std::make_unique<vulkan::ShaderModule>(
             device_, shaderDirectory / "path_trace.rgen.spv");
@@ -2417,7 +3086,8 @@ void Renderer::createSceneResources() {
         postTestFragmentShader_->reflection().descriptorBindings.front().binding != 0U ||
         postTestFragmentShader_->reflection().descriptorBindings.front().type !=
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
-        vertexShader_->reflection().inputLocations != std::vector<std::uint32_t>{0, 1, 2, 3, 4}) {
+        vertexShader_->reflection().inputLocations !=
+            std::vector<std::uint32_t>{0, 1, 2, 3, 4, 5}) {
         throw std::runtime_error("Shader reflection does not match the PBR mesh pipeline");
     }
     const std::array<const vulkan::ShaderReflection*, 3> reflections{
@@ -2433,7 +3103,7 @@ void Renderer::createSceneResources() {
     };
     const bool usesRayQuery = rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery;
     bool validPbrBindings =
-        bindings.size() == (usesRayQuery ? 14U : 11U) &&
+        bindings.size() == (usesRayQuery ? 19U : 16U) &&
         hasBinding(0, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1) &&
         hasBinding(0, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
         hasBinding(0, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
@@ -2449,6 +3119,11 @@ void Renderer::createSceneResources() {
                             hasBinding(0, 14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1)
                       : hasBinding(0, 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                    directionalShadowCascadeCount)) &&
+        hasBinding(0, 15, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 17, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 18, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
+        hasBinding(0, 19, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1) &&
         hasBinding(1, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0);
     if (!validPbrBindings) {
         throw std::runtime_error("Shader reflection found an unexpected descriptor interface");
@@ -2498,9 +3173,11 @@ void Renderer::createSceneResources() {
         });
     };
     if (shadowVertexShader_->reflection().stage != VK_SHADER_STAGE_VERTEX_BIT ||
-        shadowVertexShader_->reflection().inputLocations != std::vector<std::uint32_t>{0, 2, 4} ||
+        shadowVertexShader_->reflection().inputLocations !=
+            std::vector<std::uint32_t>{0, 2, 4, 5} ||
         shadowFragmentShader_->reflection().stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
-        shadowFragmentShader_->reflection().inputLocations != std::vector<std::uint32_t>{0, 1, 2} ||
+        shadowFragmentShader_->reflection().inputLocations !=
+            std::vector<std::uint32_t>{0, 1, 2, 3} ||
         shadowBindings.size() != 6 ||
         !hasShadowBinding(0, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1) ||
         !hasShadowBinding(0, 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1) ||
@@ -2717,6 +3394,66 @@ void Renderer::createSceneResources() {
     toneMappingDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
         device_, *toneMappingDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
 
+    if (config_.rain.enabled) {
+        const std::array<const vulkan::ShaderReflection*, 2> rainReflections{
+            &toneMappingVertexShader_->reflection(), &rainFragmentShader_->reflection()};
+        const auto rainBindings = vulkan::mergeDescriptorBindings(rainReflections);
+        if (rainFragmentShader_->reflection().stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
+            rainBindings.size() != 3U || rainBindings[0].set != 0U ||
+            rainBindings[0].binding != 0U ||
+            rainBindings[0].type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+            rainBindings[0].count != 1U || rainBindings[1].set != 0U ||
+            rainBindings[1].binding != 1U ||
+            rainBindings[1].type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+            rainBindings[1].count != 1U || rainBindings[2].set != 0U ||
+            rainBindings[2].binding != 2U ||
+            rainBindings[2].type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+            rainBindings[2].count != 1U) {
+            throw std::runtime_error("Shader reflection does not match the rain composite");
+        }
+        rainDescriptorSetLayout_ =
+            std::make_unique<vulkan::DescriptorSetLayout>(device_, 0, rainBindings);
+        rainDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
+            device_, *rainDescriptorSetLayout_, static_cast<std::uint32_t>(framesInFlight));
+    }
+
+    if (config_.atmosphere.has_value()) {
+        const auto& atmosphereEnvironmentBindings =
+            atmosphereEnvironmentShader_->reflection().descriptorBindings;
+        constexpr std::array expectedAtmosphereEnvironmentTypes{
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        };
+        bool validAtmosphereEnvironmentBindings =
+            atmosphereEnvironmentShader_->reflection().stage == VK_SHADER_STAGE_COMPUTE_BIT &&
+            atmosphereEnvironmentBindings.size() == expectedAtmosphereEnvironmentTypes.size();
+        for (std::size_t bindingIndex = 0U;
+             validAtmosphereEnvironmentBindings &&
+             bindingIndex < atmosphereEnvironmentBindings.size(); ++bindingIndex) {
+            validAtmosphereEnvironmentBindings =
+                atmosphereEnvironmentBindings[bindingIndex].set == 0U &&
+                atmosphereEnvironmentBindings[bindingIndex].binding == bindingIndex &&
+                atmosphereEnvironmentBindings[bindingIndex].type ==
+                    expectedAtmosphereEnvironmentTypes[bindingIndex] &&
+                atmosphereEnvironmentBindings[bindingIndex].count == 1U;
+        }
+        if (!validAtmosphereEnvironmentBindings) {
+            throw std::runtime_error(
+                "Shader reflection does not match atmosphere environment generation");
+        }
+        atmosphereEnvironmentDescriptorSetLayout_ =
+            std::make_unique<vulkan::DescriptorSetLayout>(
+                device_, 0, atmosphereEnvironmentBindings);
+        atmosphereEnvironmentDescriptorPool_ = std::make_unique<vulkan::DescriptorPool>(
+            device_, *atmosphereEnvironmentDescriptorSetLayout_,
+            static_cast<std::uint32_t>(framesInFlight));
+    }
+
     if (pathTracingEnabled()) {
         const std::array<const vulkan::ShaderReflection*, 5> pathTracingReflections{
             &pathTracingRayGenerationShader_->reflection(),
@@ -2751,6 +3488,11 @@ void Renderer::createSceneResources() {
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         };
         bool validPathTracingBindings =
             pathTracingRayGenerationShader_->reflection().stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR &&
@@ -2989,6 +3731,31 @@ void Renderer::createSceneResources() {
             .imageView = environmentView_->handle(),
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         };
+        const VkDescriptorImageInfo atmosphereTransmittanceInfo{
+            .sampler = iblSampler_->handle(),
+            .imageView = atmosphereTransmittanceView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo atmosphereScatteringInfo{
+            .sampler = iblSampler_->handle(),
+            .imageView = atmosphereScatteringView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo atmosphereIrradianceInfo{
+            .sampler = iblSampler_->handle(),
+            .imageView = atmosphereIrradianceView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo cloudBaseNoiseInfo{
+            .sampler = proceduralNoiseSampler_->handle(),
+            .imageView = cloudBaseNoiseView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkDescriptorImageInfo cloudDetailNoiseInfo{
+            .sampler = proceduralNoiseSampler_->handle(),
+            .imageView = cloudDetailNoiseView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
         const std::array writes{
             VkWriteDescriptorSet{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -3061,6 +3828,46 @@ void Renderer::createSceneResources() {
                 .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .pBufferInfo = &transformInfo,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptorPool_->set(index),
+                .dstBinding = 15,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &atmosphereTransmittanceInfo,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptorPool_->set(index),
+                .dstBinding = 16,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &atmosphereScatteringInfo,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptorPool_->set(index),
+                .dstBinding = 17,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &atmosphereIrradianceInfo,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptorPool_->set(index),
+                .dstBinding = 18,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &cloudBaseNoiseInfo,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = descriptorPool_->set(index),
+                .dstBinding = 19,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &cloudDetailNoiseInfo,
             },
         };
         vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
@@ -3351,9 +4158,19 @@ void Renderer::createSceneResources() {
     core::log(core::LogLevel::info, "IBL reference bake: ", ibl.environment.width, "x",
               ibl.environment.height, " environment, ", specularMipCount, " specular mips, ",
               bakeMilliseconds, " ms");
-    core::log(core::LogLevel::info, config_.environmentPath.empty()
-                                        ? "IBL source: procedural HDR studio"
-                                        : "IBL source: " + config_.environmentPath.string());
+    core::log(core::LogLevel::info, "Procedural noise volumes: ",
+              cloudNoise.base.levels.front().extent, "^3 base + ",
+              cloudNoise.detail.levels.front().extent, "^3 detail, ",
+              cloudNoise.base.levels.size(), "/", cloudNoise.detail.levels.size(),
+              " mip levels, ",
+              static_cast<double>(cloudNoiseBytes) / (1024.0 * 1024.0), " MiB, ",
+              noiseGenerationMilliseconds, " ms deterministic generation");
+    core::log(core::LogLevel::info,
+              !config_.environmentPath.empty()
+                  ? "IBL source: " + config_.environmentPath.string()
+                  : config_.atmosphere.has_value()
+                        ? "IBL source: Bruneton precomputed Earth atmosphere"
+                        : "IBL source: procedural HDR studio");
     core::log(core::LogLevel::info, "GPU scene: ", instances.size(), " instances, ",
               materials.size(), " materials, ", textureImages_.size(), "/", maxBindlessTextures,
               " bindless texture descriptors resident");
@@ -3373,6 +4190,16 @@ void Renderer::createSceneResources() {
     core::log(core::LogLevel::info,
               "Controls: WASD move, Q/E down/up, Shift boost, hold right mouse to look, "
               "Left/Right rotate environment, Escape releases mouse, R reframes scene");
+    if (config_.atmosphereDemo) {
+        core::log(core::LogLevel::info,
+                  "Atmosphere controls: Ctrl+left-drag Sun, +/- exposure, 1-9 Bruneton "
+                  "presets; right mouse and WASD retain normal camera control");
+        if (config_.timeOfDayEnabled) {
+            core::log(core::LogLevel::info,
+                      "Time controls: T pause/resume, [/] slower/faster, ,/. scrub "
+                      "back/forward 15 minutes; manual Sun drag pauses playback");
+        }
+    }
 }
 
 void Renderer::createRayTracingResources(std::span<const gpu_scene::TransformRecord> transforms) {
@@ -4039,6 +4866,18 @@ void Renderer::createGraphicsPipelines() {
                      .cache = pipelineCache_.handle(),
                      .descriptorSetLayouts = std::span(&cullingSetLayout, 1),
                  });
+    atmosphereEnvironmentPipeline_.reset();
+    if (config_.atmosphere.has_value()) {
+        const VkDescriptorSetLayout atmosphereEnvironmentSetLayout =
+            atmosphereEnvironmentDescriptorSetLayout_->handle();
+        atmosphereEnvironmentPipeline_ = std::make_unique<vulkan::ComputePipeline>(
+            device_, vulkan::ComputePipelineCreateInfo{
+                         .shader = atmosphereEnvironmentShader_.get(),
+                         .cache = pipelineCache_.handle(),
+                         .descriptorSetLayouts =
+                             std::span(&atmosphereEnvironmentSetLayout, 1),
+                     });
+    }
     shadowCullPipeline_ = std::make_unique<vulkan::ComputePipeline>(
         device_, vulkan::ComputePipelineCreateInfo{
                      .shader = shadowCullShader_.get(),
@@ -4102,8 +4941,15 @@ void Renderer::createGraphicsPipelines() {
             .format = VK_FORMAT_R32G32_SFLOAT,
             .offset = offsetof(gpu_scene::VertexRecord, uv1),
         },
+        VkVertexInputAttributeDescription{
+            .location = 5,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(gpu_scene::VertexRecord, color),
+        },
     };
-    constexpr std::array shadowAttributes{attributes[0], attributes[2], attributes[4]};
+    constexpr std::array shadowAttributes{attributes[0], attributes[2], attributes[4],
+                                          attributes[5]};
     graphicsPipeline_ = std::make_unique<vulkan::GraphicsPipeline>(
         device_, vulkan::GraphicsPipelineCreateInfo{
                      .vertexShader = vertexShader_.get(),
@@ -4254,6 +5100,27 @@ void Renderer::createGraphicsPipelines() {
                      .cache = pipelineCache_.handle(),
                      .descriptorSetLayouts = std::span(&toneMappingSetLayout, 1),
                  });
+
+    rainPipeline_.reset();
+    if (config_.rain.enabled) {
+        const VkDescriptorSetLayout rainSetLayout = rainDescriptorSetLayout_->handle();
+        const VkPushConstantRange rainPush{
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(RainControls),
+        };
+        rainPipeline_ = std::make_unique<vulkan::GraphicsPipeline>(
+            device_, vulkan::GraphicsPipelineCreateInfo{
+                         .vertexShader = toneMappingVertexShader_.get(),
+                         .fragmentShader = rainFragmentShader_.get(),
+                         .colorFormat = swapchain_.format(),
+                         .cullMode = VK_CULL_MODE_NONE,
+                         .alphaBlendEnable = true,
+                         .cache = pipelineCache_.handle(),
+                         .descriptorSetLayouts = std::span(&rainSetLayout, 1),
+                         .pushConstantRanges = std::span(&rainPush, 1),
+                     });
+    }
 
     pathTracingPipeline_.reset();
     pathHistoryPipeline_.reset();
@@ -4553,7 +5420,6 @@ void Renderer::createPathTracingRenderGraph() {
     graphPathDenoisedImage_ = renderGraph_->importImage("Path multi-scale denoised radiance",
                                                         pathDenoisedImage_->handle(),
                                                         colorSubresource, {}, QueueType::graphics);
-#if RENDERER_ENABLE_NRD
     graphNrdDiffuseInputImage_ = renderGraph_->importImage(
         "NRD diffuse noisy radiance", nrdDiffuseInputImage_->handle(), colorSubresource, {},
         QueueType::graphics);
@@ -4563,6 +5429,7 @@ void Renderer::createPathTracingRenderGraph() {
     graphNrdMaterialImage_ = renderGraph_->importImage(
         "NRD material factors", nrdMaterialImage_->handle(), colorSubresource, {},
         QueueType::graphics);
+#if RENDERER_ENABLE_NRD
     if (!rayReconstructionEnabled()) {
         graphNrdMotionImage_ = renderGraph_->importImage(
             "NRD motion guide", nrdMotionImage_->handle(), colorSubresource, {},
@@ -4584,6 +5451,15 @@ void Renderer::createPathTracingRenderGraph() {
     graphEnvironmentImage_ =
         renderGraph_->importImage("HDR environment", environmentImage_->handle(), colorSubresource,
                                   environmentState, QueueType::graphics, concurrentUpload);
+    graphAtmosphereTransmittanceImage_ = renderGraph_->importImage(
+        "Atmosphere transmittance LUT", atmosphereTransmittanceImage_->handle(), colorSubresource,
+        environmentState, QueueType::graphics, concurrentUpload);
+    graphAtmosphereScatteringImage_ = renderGraph_->importImage(
+        "Atmosphere scattering LUT", atmosphereScatteringImage_->handle(), colorSubresource,
+        environmentState, QueueType::graphics, concurrentUpload);
+    graphAtmosphereIrradianceImage_ = renderGraph_->importImage(
+        "Atmosphere irradiance LUT", atmosphereIrradianceImage_->handle(), colorSubresource,
+        environmentState, QueueType::graphics, concurrentUpload);
     graphVertexBuffer_ = renderGraph_->importBuffer("Scene vertices", vertexBuffer_->handle(), 0U,
                                                     vertexBuffer_->size(), storageReadState,
                                                     QueueType::graphics, concurrentUpload);
@@ -4636,6 +5512,47 @@ void Renderer::createPathTracingRenderGraph() {
                                        pathAovReadbackBuffer_->size(), {}, QueueType::graphics);
     }
 
+    if (config_.atmosphere.has_value()) {
+        const render_graph::PassHandle atmosphereEnvironmentPass = renderGraph_->addPass(
+            "Dynamic atmosphere environment", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+                   const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error(
+                        "Atmosphere environment pass requires frame context");
+                }
+                recordAtmosphereEnvironmentPass(
+                    commandBuffer, *static_cast<const GraphFrameContext*>(userData));
+            });
+        renderGraph_->writeImage(
+            atmosphereEnvironmentPass, graphEnvironmentImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_GENERAL,
+            });
+        constexpr ImageState atmosphereComputeReadState{
+            .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        renderGraph_->readImage(atmosphereEnvironmentPass,
+                                graphAtmosphereTransmittanceImage_,
+                                atmosphereComputeReadState);
+        renderGraph_->readImage(atmosphereEnvironmentPass,
+                                graphAtmosphereScatteringImage_,
+                                atmosphereComputeReadState);
+        renderGraph_->readImage(atmosphereEnvironmentPass,
+                                graphAtmosphereIrradianceImage_,
+                                atmosphereComputeReadState);
+        renderGraph_->readBuffer(
+            atmosphereEnvironmentPass, graphUniformBuffer_,
+            BufferState{
+                .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+            });
+    }
+
     const render_graph::PassHandle pathTracingPass = renderGraph_->addPass(
         "Progressive path tracing", QueueType::graphics,
         [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
@@ -4675,6 +5592,9 @@ void Renderer::createPathTracingRenderGraph() {
     renderGraph_->readWriteImage(pathTracingPass,
                                  graphRayReconstructionSpecularHitDistanceImage_, pathOutputState);
     renderGraph_->readImage(pathTracingPass, graphEnvironmentImage_, environmentState);
+    renderGraph_->readImage(pathTracingPass, graphAtmosphereTransmittanceImage_, environmentState);
+    renderGraph_->readImage(pathTracingPass, graphAtmosphereScatteringImage_, environmentState);
+    renderGraph_->readImage(pathTracingPass, graphAtmosphereIrradianceImage_, environmentState);
     renderGraph_->readBuffer(pathTracingPass, graphVertexBuffer_, storageReadState);
     renderGraph_->readBuffer(pathTracingPass, graphIndexBuffer_, storageReadState);
     renderGraph_->readBuffer(pathTracingPass, graphInstanceBuffer_, storageReadState);
@@ -5151,6 +6071,37 @@ void Renderer::createPathTracingRenderGraph() {
                                  .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                              });
 
+    render_graph::PassHandle finalPresentationPass = toneMappingPass;
+    if (config_.rain.enabled) {
+        const render_graph::PassHandle rainPass = renderGraph_->addPass(
+            "Rain composite", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+                   const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error("Rain pass requires frame context");
+                }
+                recordRainPass(commandBuffer,
+                               *static_cast<const GraphFrameContext*>(userData));
+            });
+        renderGraph_->addDependency(finalPresentationPass, rainPass);
+        renderGraph_->readImage(rainPass, graphPathTracingDepthImage_, pathDebugReadState);
+        renderGraph_->readImage(rainPass, graphPathTracingNormalImage_, pathDebugReadState);
+        renderGraph_->readBuffer(rainPass, graphUniformBuffer_,
+                                 BufferState{
+                                     .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                     .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+                                 });
+        renderGraph_->readWriteImage(
+            rainPass, graphSwapchainImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .access = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+        finalPresentationPass = rainPass;
+    }
+
     if (graphCaptureBuffer_) {
         const render_graph::PassHandle capturePass = renderGraph_->addPass(
             "Capture readback", QueueType::graphics,
@@ -5161,6 +6112,7 @@ void Renderer::createPathTracingRenderGraph() {
                     recordCapturePass(commandBuffer, graph);
                 }
             });
+        renderGraph_->addDependency(finalPresentationPass, capturePass);
         renderGraph_->readImage(capturePass, graphSwapchainImage_,
                                 ImageState{
                                     .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -5172,9 +6124,11 @@ void Renderer::createPathTracingRenderGraph() {
                                       .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
                                       .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                   });
+        finalPresentationPass = capturePass;
     }
     const render_graph::PassHandle presentPass =
         renderGraph_->addPass("Present transition", QueueType::graphics);
+    renderGraph_->addDependency(finalPresentationPass, presentPass);
     renderGraph_->readImage(presentPass, graphSwapchainImage_,
                             ImageState{
                                 .stages = VK_PIPELINE_STAGE_2_NONE,
@@ -5183,6 +6137,7 @@ void Renderer::createPathTracingRenderGraph() {
                             });
     renderGraph_->compile();
     core::log(core::LogLevel::info,
+              config_.atmosphere.has_value() ? "Dynamic atmosphere cache -> " : "",
               rayReconstructionEnabled()
                   ? "Render graph compiled: TLAS update -> noisy path tracing"
                   : "Render graph compiled: TLAS update -> progressive path tracing -> path "
@@ -5202,6 +6157,7 @@ void Renderer::createPathTracingRenderGraph() {
                          ? " -> NVIDIA DLSS Ray Reconstruction -> tone mapping"
                          : " -> NVIDIA DLSS Super Resolution -> tone mapping")
                   : " -> Native upscaling -> tone mapping",
+              config_.rain.enabled ? " -> Rain" : "",
               graphCaptureBuffer_ ? " -> Capture" : "", " -> Present");
     if (spatialUpscalingEnabled()) {
         const VkExtent2D outputExtent = swapchain_.extent();
@@ -5278,6 +6234,15 @@ void Renderer::createRenderGraph() {
     graphEnvironmentImage_ =
         renderGraph_->importImage("HDR environment", environmentImage_->handle(), colorSubresource,
                                   sampledImageState, QueueType::graphics, concurrentUpload);
+    graphAtmosphereTransmittanceImage_ = renderGraph_->importImage(
+        "Atmosphere transmittance LUT", atmosphereTransmittanceImage_->handle(), colorSubresource,
+        sampledImageState, QueueType::graphics, concurrentUpload);
+    graphAtmosphereScatteringImage_ = renderGraph_->importImage(
+        "Atmosphere scattering LUT", atmosphereScatteringImage_->handle(), colorSubresource,
+        sampledImageState, QueueType::graphics, concurrentUpload);
+    graphAtmosphereIrradianceImage_ = renderGraph_->importImage(
+        "Atmosphere irradiance LUT", atmosphereIrradianceImage_->handle(), colorSubresource,
+        sampledImageState, QueueType::graphics, concurrentUpload);
     graphDiffuseIrradianceImage_ = renderGraph_->importImage(
         "Diffuse irradiance", diffuseIrradianceImage_->handle(), colorSubresource,
         sampledImageState, QueueType::graphics, concurrentUpload);
@@ -5484,6 +6449,57 @@ void Renderer::createRenderGraph() {
             .access = VK_ACCESS_2_UNIFORM_READ_BIT,
         },
         QueueType::graphics);
+    if (config_.atmosphere.has_value()) {
+        const render_graph::PassHandle atmosphereEnvironmentPass = renderGraph_->addPass(
+            "Dynamic atmosphere environment", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+                   const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error(
+                        "Atmosphere environment pass requires frame context");
+                }
+                recordAtmosphereEnvironmentPass(
+                    commandBuffer, *static_cast<const GraphFrameContext*>(userData));
+            });
+        renderGraph_->writeImage(
+            atmosphereEnvironmentPass, graphEnvironmentImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_GENERAL,
+            });
+        constexpr ImageState atmosphereComputeReadState{
+            .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .access = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        renderGraph_->readImage(atmosphereEnvironmentPass,
+                                graphAtmosphereTransmittanceImage_,
+                                atmosphereComputeReadState);
+        renderGraph_->readImage(atmosphereEnvironmentPass,
+                                graphAtmosphereScatteringImage_,
+                                atmosphereComputeReadState);
+        renderGraph_->readImage(atmosphereEnvironmentPass,
+                                graphAtmosphereIrradianceImage_,
+                                atmosphereComputeReadState);
+        renderGraph_->readBuffer(
+            atmosphereEnvironmentPass, graphUniformBuffer_,
+            BufferState{
+                .stages = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+            });
+    }
+    graphEditorOverlayVertexBuffer_ = {};
+    if (config_.editorOverlayEnabled) {
+        graphEditorOverlayVertexBuffer_ = renderGraph_->importBuffer(
+            "Editor overlay vertices", editorOverlayVertexBuffers_[0]->handle(), 0,
+            editorOverlayVertexBuffers_[0]->size(),
+            BufferState{
+                .stages = VK_PIPELINE_STAGE_2_HOST_BIT,
+                .access = VK_ACCESS_2_HOST_WRITE_BIT,
+            },
+            QueueType::graphics);
+    }
     graphCaptureBuffer_ = {};
     if (captureReadbackBuffer_) {
         graphCaptureBuffer_ =
@@ -5825,6 +6841,9 @@ void Renderer::createRenderGraph() {
         renderGraph_->readImage(pbrPass, texture, sampledImageState);
     }
     renderGraph_->readImage(pbrPass, graphEnvironmentImage_, sampledImageState);
+    renderGraph_->readImage(pbrPass, graphAtmosphereTransmittanceImage_, sampledImageState);
+    renderGraph_->readImage(pbrPass, graphAtmosphereScatteringImage_, sampledImageState);
+    renderGraph_->readImage(pbrPass, graphAtmosphereIrradianceImage_, sampledImageState);
     renderGraph_->readImage(pbrPass, graphDiffuseIrradianceImage_, sampledImageState);
     renderGraph_->readImage(pbrPass, graphPrefilteredSpecularImage_, sampledImageState);
     renderGraph_->readImage(pbrPass, graphBrdfLutImage_, sampledImageState);
@@ -6192,6 +7211,74 @@ void Renderer::createRenderGraph() {
                                  .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                              });
 
+    render_graph::PassHandle finalPresentationPass = toneMappingPass;
+    if (config_.rain.enabled) {
+        const render_graph::PassHandle rainPass = renderGraph_->addPass(
+            "Rain composite", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph&,
+                   const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error("Rain pass requires frame context");
+                }
+                recordRainPass(commandBuffer,
+                               *static_cast<const GraphFrameContext*>(userData));
+            });
+        renderGraph_->addDependency(finalPresentationPass, rainPass);
+        renderGraph_->readImage(rainPass, graphDepthImage_, sampledImageState);
+        renderGraph_->readImage(rainPass, graphNormalImage_, sampledImageState);
+        renderGraph_->readBuffer(rainPass, graphUniformBuffer_,
+                                 BufferState{
+                                     .stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                     .access = VK_ACCESS_2_UNIFORM_READ_BIT,
+                                 });
+        renderGraph_->readWriteImage(
+            rainPass, graphSwapchainImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .access = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+        finalPresentationPass = rainPass;
+    }
+    if (config_.editorOverlayEnabled) {
+        const render_graph::PassHandle editorOverlayPass = renderGraph_->addPass(
+            "Editor overlays", QueueType::graphics,
+            [this](VkCommandBuffer commandBuffer, const render_graph::RenderGraph& graph,
+                   const void* userData) {
+                if (userData == nullptr) {
+                    throw std::runtime_error("Editor-overlay pass requires frame context");
+                }
+                recordEditorOverlayPass(commandBuffer, graph,
+                                        *static_cast<const GraphFrameContext*>(userData));
+            });
+        renderGraph_->addDependency(finalPresentationPass, editorOverlayPass);
+        renderGraph_->readBuffer(
+            editorOverlayPass, graphEditorOverlayVertexBuffer_,
+            BufferState{
+                .stages = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT,
+                .access = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT,
+            });
+        renderGraph_->readWriteImage(
+            editorOverlayPass, graphDepthImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                .access = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            });
+        renderGraph_->readWriteImage(
+            editorOverlayPass, graphSwapchainImage_,
+            ImageState{
+                .stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .access = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            });
+        finalPresentationPass = editorOverlayPass;
+    }
+
     if (graphCaptureBuffer_) {
         const render_graph::PassHandle capturePass = renderGraph_->addPass(
             "Capture readback", QueueType::graphics,
@@ -6204,6 +7291,7 @@ void Renderer::createRenderGraph() {
                     recordCapturePass(commandBuffer, graph);
                 }
             });
+        renderGraph_->addDependency(finalPresentationPass, capturePass);
         renderGraph_->readImage(capturePass, graphSwapchainImage_,
                                 ImageState{
                                     .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -6215,10 +7303,12 @@ void Renderer::createRenderGraph() {
                                       .stages = VK_PIPELINE_STAGE_2_COPY_BIT,
                                       .access = VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                   });
+        finalPresentationPass = capturePass;
     }
 
     const render_graph::PassHandle presentPass =
         renderGraph_->addPass("Present transition", QueueType::graphics);
+    renderGraph_->addDependency(finalPresentationPass, presentPass);
     renderGraph_->readImage(presentPass, graphSwapchainImage_,
                             ImageState{
                                 .stages = VK_PIPELINE_STAGE_2_NONE,
@@ -6244,6 +7334,7 @@ void Renderer::createRenderGraph() {
               : dlssUpscalingEnabled()
                   ? " -> NVIDIA DLSS Super Resolution -> Tone mapping"
                   : " -> Native upscaling -> Tone mapping",
+              config_.rain.enabled ? " -> Rain" : "",
               graphCaptureBuffer_ ? " -> Capture" : "", " -> Present");
 
     if (spatialUpscalingEnabled()) {
@@ -6309,7 +7400,10 @@ void Renderer::updatePathTracingDescriptors() {
         !rayReconstructionDiffuseAlbedoView_ || !rayReconstructionSpecularAlbedoView_ ||
         !rayReconstructionNormalRoughnessView_ ||
         !rayReconstructionSpecularHitDistanceView_ ||
-        !rayTracingGeometryBuffer_ || !environmentSamplingBuffer_ || !emissiveTriangleBuffer_) {
+        !rayTracingGeometryBuffer_ || !environmentSamplingBuffer_ || !emissiveTriangleBuffer_ ||
+        !atmosphereTransmittanceView_ || !atmosphereScatteringView_ ||
+        !atmosphereIrradianceView_ || !cloudBaseNoiseView_ ||
+        !cloudDetailNoiseView_ || !proceduralNoiseSampler_) {
         throw std::runtime_error("Path-tracing descriptors require complete ray resources");
     }
     const VkAccelerationStructureKHR topLevelHandle = topLevelStructure_->handle();
@@ -6354,6 +7448,23 @@ void Renderer::updatePathTracingDescriptors() {
         .imageView = environmentView_->handle(),
         .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
     };
+    const std::array atmosphereInfos{
+        VkDescriptorImageInfo{.sampler = iblSampler_->handle(),
+                              .imageView = atmosphereTransmittanceView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        VkDescriptorImageInfo{.sampler = iblSampler_->handle(),
+                              .imageView = atmosphereScatteringView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        VkDescriptorImageInfo{.sampler = iblSampler_->handle(),
+                              .imageView = atmosphereIrradianceView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        VkDescriptorImageInfo{.sampler = proceduralNoiseSampler_->handle(),
+                              .imageView = cloudBaseNoiseView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        VkDescriptorImageInfo{.sampler = proceduralNoiseSampler_->handle(),
+                              .imageView = cloudDetailNoiseView_->handle(),
+                              .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+    };
     const VkDescriptorBufferInfo environmentSamplingInfo{
         .buffer = environmentSamplingBuffer_->handle(),
         .offset = 0U,
@@ -6392,7 +7503,7 @@ void Renderer::updatePathTracingDescriptors() {
             .offset = 0U,
             .range = sizeof(FrameUniform),
         };
-        std::array<VkWriteDescriptorSet, 24> writes{};
+        std::array<VkWriteDescriptorSet, 29> writes{};
         writes[0] = {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext = &accelerationWrite,
@@ -6461,61 +7572,15 @@ void Renderer::updatePathTracingDescriptors() {
                 .pImageInfo = &reconstructionInfos[imageIndex],
             };
         }
-        vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
-                               writes.data(), 0U, nullptr);
-    }
-}
-
-void Renderer::updatePathHistoryDescriptors() {
-    if (!pathTracingEnabled() || !pathHistoryDescriptorPool_ || !hiZSampler_ ||
-        !pathTracingNormalView_ || !pathTracingMotionDepthView_ || !pathTracingDepthView_ ||
-        !pathHistoryValidityView_) {
-        throw std::runtime_error(
-            "Path-history descriptors require complete reconstruction resources");
-    }
-    for (std::size_t writeIndex = 0U; writeIndex < framesInFlight; ++writeIndex) {
-        const std::size_t readIndex = 1U - writeIndex;
-        if (!pathHistoryNormalViews_[readIndex] || !pathHistoryNormalViews_[writeIndex] ||
-            !pathHistoryDepthViews_[readIndex] || !pathHistoryDepthViews_[writeIndex]) {
-            throw std::runtime_error("Path-history ping-pong resources are incomplete");
-        }
-        const std::array sampledInfos{
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingNormalView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingMotionDepthView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingDepthView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathHistoryNormalViews_[readIndex]->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathHistoryDepthViews_[readIndex]->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        };
-        const std::array storageInfos{
-            VkDescriptorImageInfo{.imageView = pathHistoryNormalViews_[writeIndex]->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.imageView = pathHistoryDepthViews_[writeIndex]->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.imageView = pathHistoryValidityView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        };
-        std::array<VkWriteDescriptorSet, 8> writes{};
-        for (std::size_t binding = 0U; binding < writes.size(); ++binding) {
-            const bool sampled = binding < sampledInfos.size();
-            writes[binding] = {
+        for (std::size_t atmosphereIndex = 0; atmosphereIndex < atmosphereInfos.size();
+             ++atmosphereIndex) {
+            writes[24U + atmosphereIndex] = {
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = pathHistoryDescriptorPool_->set(writeIndex),
-                .dstBinding = static_cast<std::uint32_t>(binding),
+                .dstSet = pathTracingDescriptorPool_->set(frameIndex),
+                .dstBinding = static_cast<std::uint32_t>(24U + atmosphereIndex),
                 .descriptorCount = 1U,
-                .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo =
-                    sampled ? &sampledInfos[binding] : &storageInfos[binding - sampledInfos.size()],
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &atmosphereInfos[atmosphereIndex],
             };
         }
         vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
@@ -6523,249 +7588,85 @@ void Renderer::updatePathHistoryDescriptors() {
     }
 }
 
-void Renderer::updatePathReconstructionDescriptors() {
-    if (!pathTracingEnabled() || !pathReconstructionDescriptorPool_ || !brdfLutSampler_ ||
-        !hiZSampler_ || !pathTracingAccumulationView_ || !pathTracingMotionDepthView_ ||
-        !pathHistoryValidityView_ || !pathDenoisedView_) {
+void Renderer::updateAtmosphereEnvironmentDescriptors() {
+    if (!config_.atmosphere.has_value()) {
+        return;
+    }
+    if (!atmosphereEnvironmentDescriptorPool_ || !environmentView_ ||
+        !atmosphereTransmittanceView_ || !atmosphereScatteringView_ ||
+        !atmosphereIrradianceView_ || !cloudBaseNoiseView_ ||
+        !cloudDetailNoiseView_ || !iblSampler_ || !proceduralNoiseSampler_) {
         throw std::runtime_error(
-            "Path reconstruction descriptors require complete temporal resources");
+            "Atmosphere environment descriptors require complete atmosphere resources");
     }
-    for (std::size_t writeIndex = 0U; writeIndex < framesInFlight; ++writeIndex) {
-        const std::size_t readIndex = 1U - writeIndex;
-        if (!pathReconstructionViews_[writeIndex] || !pathMomentViews_[readIndex] ||
-            !pathMomentViews_[writeIndex]) {
-            throw std::runtime_error("Path reconstruction ping-pong resources are incomplete");
-        }
-        const std::array sampledInfos{
-            VkDescriptorImageInfo{.sampler = brdfLutSampler_->handle(),
-                                  .imageView = pathTracingAccumulationView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathTracingMotionDepthView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                  .imageView = pathHistoryValidityView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = brdfLutSampler_->handle(),
-                                  .imageView = pathDenoisedView_->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            VkDescriptorImageInfo{.sampler = brdfLutSampler_->handle(),
-                                  .imageView = pathMomentViews_[readIndex]->handle(),
-                                  .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        };
-        const std::array outputInfos{
-            VkDescriptorImageInfo{
-                .imageView = pathReconstructionViews_[writeIndex]->handle(),
-                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            },
-            VkDescriptorImageInfo{
-                .imageView = pathMomentViews_[writeIndex]->handle(),
-                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            },
-        };
-        std::array<VkWriteDescriptorSet, 7> writes{};
-        for (std::size_t binding = 0U; binding < writes.size(); ++binding) {
-            const bool sampled = binding < sampledInfos.size();
-            writes[binding] = {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = pathReconstructionDescriptorPool_->set(writeIndex),
-                .dstBinding = static_cast<std::uint32_t>(binding),
-                .descriptorCount = 1U,
-                .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo =
-                    sampled ? &sampledInfos[binding] : &outputInfos[binding - sampledInfos.size()],
-            };
-        }
-        vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
-                               writes.data(), 0U, nullptr);
-    }
-}
-
-void Renderer::updatePathDenoisingDescriptors() {
-    if (!pathTracingEnabled() || !pathDenoisingDescriptorPool_ || !hiZSampler_ ||
-        !pathTracingDirectView_ || !pathTracingSurfaceView_ || !pathTracingNormalView_ ||
-        !pathTracingMotionDepthView_ || !pathTracingDepthView_ ||
-        !pathDenoisingDirectViews_.front() || !pathDenoisingDirectViews_.back() ||
-        !pathDenoisingIndirectViews_.front() || !pathDenoisingIndirectViews_.back() ||
-        !pathDenoisedView_) {
-        throw std::runtime_error(
-            "Path denoising descriptors require complete reconstruction resources");
-    }
-    for (std::size_t writeIndex = 0U; writeIndex < framesInFlight; ++writeIndex) {
-        if (!pathReconstructionViews_[writeIndex] || !pathMomentViews_[writeIndex]) {
-            throw std::runtime_error("Path denoising frame resources are incomplete");
-        }
-        for (std::size_t passIndex = 0U; passIndex < pathDenoisingPassCount; ++passIndex) {
-            const vulkan::ImageView& directInput = passIndex == 0U
-                                                       ? *pathTracingDirectView_
-                                                       : *pathDenoisingDirectViews_[passIndex - 1U];
-            const vulkan::ImageView& indirectOrBeautyInput =
-                passIndex == 0U ? *pathReconstructionViews_[writeIndex]
-                                : *pathDenoisingIndirectViews_[passIndex - 1U];
-            const std::array sampledInfos{
-                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                      .imageView = directInput.handle(),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                      .imageView = indirectOrBeautyInput.handle(),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                      .imageView = pathTracingSurfaceView_->handle(),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                      .imageView = pathTracingNormalView_->handle(),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                      .imageView = pathTracingMotionDepthView_->handle(),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                      .imageView = pathTracingDepthView_->handle(),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-                VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                                      .imageView = pathMomentViews_[writeIndex]->handle(),
-                                      .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-            };
-            const bool finalPass = passIndex + 1U == pathDenoisingPassCount;
-            const std::size_t scratchOutput = finalPass ? 0U : passIndex;
-            const VkImageView directOutput =
-                finalPass ? pathDenoisedView_->handle()
-                          : pathDenoisingDirectViews_[scratchOutput]->handle();
-            const VkImageView indirectOutput =
-                finalPass ? pathDenoisedView_->handle()
-                          : pathDenoisingIndirectViews_[scratchOutput]->handle();
-            // All statically reachable storage descriptors must name an image
-            // transitioned by this graph pass, even though the push-constant
-            // branch writes only scratch outputs or only final radiance.
-            const VkImageView radianceOutput =
-                finalPass ? pathDenoisedView_->handle() : directOutput;
-            const std::array outputInfos{
-                VkDescriptorImageInfo{
-                    .imageView = directOutput,
-                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-                },
-                VkDescriptorImageInfo{
-                    .imageView = indirectOutput,
-                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-                },
-                VkDescriptorImageInfo{
-                    .imageView = radianceOutput,
-                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-                },
-            };
-            const std::size_t descriptorIndex = writeIndex * pathDenoisingPassCount + passIndex;
-            std::array<VkWriteDescriptorSet, 10> writes{};
-            for (std::size_t binding = 0U; binding < writes.size(); ++binding) {
-                const bool sampled = binding < sampledInfos.size();
-                writes[binding] = {
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = pathDenoisingDescriptorPool_->set(descriptorIndex),
-                    .dstBinding = static_cast<std::uint32_t>(binding),
-                    .descriptorCount = 1U,
-                    .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                              : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                    .pImageInfo = sampled ? &sampledInfos[binding]
-                                          : &outputInfos[binding - sampledInfos.size()],
-                };
-            }
-            vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
-                                   writes.data(), 0U, nullptr);
-        }
-    }
-}
-
-void Renderer::updateNrdDescriptors() {
-#if RENDERER_ENABLE_NRD
-    if (!pathTracingEnabled() || !pathNrdPrepareDescriptorPool_ ||
-        !pathNrdResolveDescriptorPool_ || !hiZSampler_ ||
-        !pathTracingAccumulationView_ || !pathTracingSurfaceView_ ||
-        !pathTracingNormalView_ || !pathTracingMotionDepthView_ ||
-        !pathTracingDepthView_ || !nrdMotionView_ || !nrdNormalRoughnessView_ ||
-        !nrdViewZView_ || !nrdDiffuseInputView_ || !nrdSpecularInputView_ || !nrdMaterialView_ ||
-        !nrdDiffuseOutputView_ || !nrdSpecularOutputView_ || !pathDenoisedView_) {
-        throw std::runtime_error("NVIDIA NRD descriptors require complete guide and signal resources");
-    }
-    const std::array prepareSampledInfos{
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = pathTracingSurfaceView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = pathTracingNormalView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = pathTracingMotionDepthView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = pathTracingDepthView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
+    const std::array atmosphereInfos{
+        VkDescriptorImageInfo{
+            .sampler = iblSampler_->handle(),
+            .imageView = atmosphereTransmittanceView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        VkDescriptorImageInfo{
+            .sampler = iblSampler_->handle(),
+            .imageView = atmosphereScatteringView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        VkDescriptorImageInfo{
+            .sampler = iblSampler_->handle(),
+            .imageView = atmosphereIrradianceView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        VkDescriptorImageInfo{
+            .sampler = proceduralNoiseSampler_->handle(),
+            .imageView = cloudBaseNoiseView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        VkDescriptorImageInfo{
+            .sampler = proceduralNoiseSampler_->handle(),
+            .imageView = cloudDetailNoiseView_->handle(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
     };
-    const std::array prepareStorageInfos{
-        VkDescriptorImageInfo{.imageView = nrdMotionView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.imageView = nrdNormalRoughnessView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.imageView = nrdViewZView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-    };
-    const std::array resolveSampledInfos{
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = nrdDiffuseOutputView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = nrdSpecularOutputView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = nrdMaterialView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = pathTracingMotionDepthView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-        VkDescriptorImageInfo{.sampler = hiZSampler_->handle(),
-                              .imageView = pathTracingAccumulationView_->handle(),
-                              .imageLayout = VK_IMAGE_LAYOUT_GENERAL},
-    };
-    const VkDescriptorImageInfo resolveStorageInfo{
-        .imageView = pathDenoisedView_->handle(),
+    const VkDescriptorImageInfo outputInfo{
+        .imageView = environmentView_->handle(),
         .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
     };
     for (std::size_t frameIndex = 0U; frameIndex < framesInFlight; ++frameIndex) {
-        std::array<VkWriteDescriptorSet, 7> prepareWrites{};
-        for (std::size_t binding = 0U; binding < prepareWrites.size(); ++binding) {
-            const bool sampled = binding < prepareSampledInfos.size();
-            prepareWrites[binding] = {
+        const VkDescriptorBufferInfo uniformInfo{
+            .buffer = uniformBuffers_[frameIndex]->handle(),
+            .offset = 0U,
+            .range = sizeof(FrameUniform),
+        };
+        std::array<VkWriteDescriptorSet, 7> writes{};
+        writes[0] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = atmosphereEnvironmentDescriptorPool_->set(frameIndex),
+            .dstBinding = 0U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &uniformInfo,
+        };
+        for (std::size_t atmosphereIndex = 0U;
+             atmosphereIndex < atmosphereInfos.size(); ++atmosphereIndex) {
+            writes[1U + atmosphereIndex] = {
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = pathNrdPrepareDescriptorPool_->set(frameIndex),
-                .dstBinding = static_cast<std::uint32_t>(binding),
+                .dstSet = atmosphereEnvironmentDescriptorPool_->set(frameIndex),
+                .dstBinding = static_cast<std::uint32_t>(1U + atmosphereIndex),
                 .descriptorCount = 1U,
-                .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo = sampled
-                                  ? &prepareSampledInfos[binding]
-                                  : &prepareStorageInfos[binding - prepareSampledInfos.size()],
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &atmosphereInfos[atmosphereIndex],
             };
         }
-        vkUpdateDescriptorSets(device_.handle(),
-                               static_cast<std::uint32_t>(prepareWrites.size()),
-                               prepareWrites.data(), 0U, nullptr);
-
-        std::array<VkWriteDescriptorSet, 6> resolveWrites{};
-        for (std::size_t binding = 0U; binding < resolveWrites.size(); ++binding) {
-            const bool sampled = binding < resolveSampledInfos.size();
-            resolveWrites[binding] = {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = pathNrdResolveDescriptorPool_->set(frameIndex),
-                .dstBinding = static_cast<std::uint32_t>(binding),
-                .descriptorCount = 1U,
-                .descriptorType = sampled ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                                          : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo = sampled ? &resolveSampledInfos[binding] : &resolveStorageInfo,
-            };
-        }
-        vkUpdateDescriptorSets(device_.handle(),
-                               static_cast<std::uint32_t>(resolveWrites.size()),
-                               resolveWrites.data(), 0U, nullptr);
+        writes[6] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = atmosphereEnvironmentDescriptorPool_->set(frameIndex),
+            .dstBinding = 6U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &outputInfo,
+        };
+        vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
+                               writes.data(), 0U, nullptr);
     }
-#endif
 }
 
 render_graph::ImageHandle Renderer::pathPresentationSourceImage() const {
@@ -6980,14 +7881,19 @@ void Renderer::updateToneMappingDescriptor() {
                 .imageView = selectedView,
                 .imageLayout = selectedLayout,
             };
+            const bool exactAtmosphereBackground =
+                rayReconstructionEnabled() && config_.atmosphere.has_value() &&
+                config_.pathDebugView == PathDebugView::final;
+            const bool directRadianceDebug =
+                config_.pathDebugView == PathDebugView::indirect ||
+                config_.pathDebugView == PathDebugView::lightingResidual;
             const VkDescriptorImageInfo secondaryInfo{
                 .sampler = brdfLutSampler_->handle(),
-                .imageView = config_.pathDebugView == PathDebugView::indirect ||
-                                     config_.pathDebugView == PathDebugView::lightingResidual
-                                 ? pathTracingDirectView_->handle()
-                                 : selectedView,
-                .imageLayout = config_.pathDebugView == PathDebugView::indirect ||
-                                       config_.pathDebugView == PathDebugView::lightingResidual
+                .imageView = exactAtmosphereBackground
+                                 ? pathTracingAccumulationView_->handle()
+                             : directRadianceDebug ? pathTracingDirectView_->handle()
+                                                   : selectedView,
+                .imageLayout = exactAtmosphereBackground || directRadianceDebug
                                    ? VK_IMAGE_LAYOUT_GENERAL
                                    : selectedLayout,
             };
@@ -7197,6 +8103,65 @@ void Renderer::updateToneMappingDescriptor() {
     }
 }
 
+void Renderer::updateRainDescriptor() {
+    if (!config_.rain.enabled) {
+        return;
+    }
+    if (rainDescriptorPool_ == nullptr || rainDescriptorSetLayout_ == nullptr) {
+        throw std::runtime_error("Rain descriptor resources are incomplete");
+    }
+
+    const VkDescriptorImageInfo depthInfo{
+        .sampler = hiZSampler_->handle(),
+        .imageView = pathTracingEnabled() ? pathTracingDepthView_->handle()
+                                          : renderGraph_->imageView(graphDepthImage_),
+        .imageLayout = pathTracingEnabled() ? VK_IMAGE_LAYOUT_GENERAL
+                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    const VkDescriptorImageInfo normalInfo{
+        .sampler = hiZSampler_->handle(),
+        .imageView = pathTracingEnabled() ? pathTracingNormalView_->handle()
+                                          : renderGraph_->imageView(graphNormalImage_),
+        .imageLayout = pathTracingEnabled() ? VK_IMAGE_LAYOUT_GENERAL
+                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    for (std::size_t index = 0; index < framesInFlight; ++index) {
+        const VkDescriptorBufferInfo uniformInfo{
+            .buffer = uniformBuffers_[index]->handle(),
+            .offset = 0,
+            .range = sizeof(FrameUniform),
+        };
+        const std::array writes{
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = rainDescriptorPool_->set(index),
+                .dstBinding = 0U,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &depthInfo,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = rainDescriptorPool_->set(index),
+                .dstBinding = 1U,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &uniformInfo,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = rainDescriptorPool_->set(index),
+                .dstBinding = 2U,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &normalInfo,
+            },
+        };
+        vkUpdateDescriptorSets(device_.handle(), static_cast<std::uint32_t>(writes.size()),
+                               writes.data(), 0U, nullptr);
+    }
+}
+
 void Renderer::updateShadowDescriptor() {
     if (rayTracingShadowBackend_ == ray_tracing::ShadowBackend::rayQuery) {
         if (topLevelStructure_ == nullptr || rayTracingGeometryBuffer_ == nullptr ||
@@ -7364,11 +8329,77 @@ void Renderer::resetCamera() {
         cameraYaw_ = -0.5F * std::numbers::pi_v<float>;
         cameraPosition_ = sceneCenter_ + glm::vec3(0.0F, 0.0F, cameraDistance);
     }
+    if (config_.atmosphereDemo) {
+        applyAtmosphereDemoCamera();
+    }
     temporalScriptOriginYaw_ = cameraYaw_;
     temporalScriptOrigin_ = cameraPosition_;
     temporalState_.reset();
     cameraMovedThisFrame_ = true;
     previousCameraUpdate_ = std::chrono::steady_clock::now();
+}
+
+void Renderer::applyAtmosphereDemoCamera() {
+    const float sinZenith = std::sin(atmosphereDemoView_.viewZenithAngleRadians);
+    const glm::vec3 referenceOutward{
+        sinZenith * std::cos(atmosphereDemoView_.viewAzimuthAngleRadians),
+        sinZenith * std::sin(atmosphereDemoView_.viewAzimuthAngleRadians),
+        std::cos(atmosphereDemoView_.viewZenithAngleRadians),
+    };
+    // Reference Z-up -> Genesis right-handed Y-up.
+    const glm::vec3 genesisOutward =
+        glm::normalize(glm::vec3(referenceOutward.x, referenceOutward.z,
+                                 -referenceOutward.y));
+    constexpr float verticalFieldOfView = 42.0F;
+    const bool proceduralAtmosphereTerrain = config_.scenePath.empty() &&
+                                              !config_.sceneSnapshot &&
+                                              mainView_.visibilityMask != 0;
+    // The procedural atmosphere scene shares the reference atmosphere's local
+    // tangent origin and meter scale. Keep its real camera at the same radial
+    // distance as the Bruneton camera so cloud-shell intersections and geometry
+    // hit distances describe the same physical segment. Imported scenes still
+    // use ordinary bounds-based framing because they have no planet-scale origin.
+    const float framingRadius = sceneRadius_;
+    // The reference atmosphere presets describe kilometre-scale observer
+    // positions, but this diagnostic scene contains one-metre material spheres.
+    // Using the preset distance as the literal scene camera position made the
+    // spheres disappear. Start close enough to inspect them and derive the
+    // physical atmosphere observer from the resulting world-space camera below.
+    const float cameraDistance = framingRadius /
+                                 std::sin(glm::radians(verticalFieldOfView * 0.5F)) *
+                                 1.10F;
+    cameraPosition_ = proceduralAtmosphereTerrain
+                          ? sceneCenter_ + glm::vec3(1.5F, 0.8F, 12.0F)
+                          : sceneCenter_ + genesisOutward * cameraDistance;
+    glm::vec3 forward = proceduralAtmosphereTerrain
+                            ? glm::normalize(sceneCenter_ - cameraPosition_)
+                            : -genesisOutward;
+    // A hidden-scene atmosphere run is a sky/cloud preview, not an object
+    // orbit. Aim it above the horizon so the camera starts by looking into the
+    // near-side cloud layer. Scene previews such as Sponza retain their normal
+    // inward-facing framing.
+    if (mainView_.visibilityMask == 0 && config_.atmosphere.has_value() &&
+        config_.atmosphere->clouds.enabled) {
+        // Look tangentially across the local horizon rather than back toward
+        // the hidden scene (and almost directly into the default Sun).
+        glm::vec3 horizontalForward{-genesisOutward.z, 0.0F, genesisOutward.x};
+        if (glm::length(horizontalForward) < 1.0e-5F) {
+            horizontalForward = glm::vec3(0.0F, 0.0F, -1.0F);
+        } else {
+            horizontalForward = glm::normalize(horizontalForward);
+        }
+        const float yawCosine = std::cos(config_.atmosphereCameraYawRadians);
+        const float yawSine = std::sin(config_.atmosphereCameraYawRadians);
+        horizontalForward = glm::normalize(glm::vec3{
+            horizontalForward.x * yawCosine + horizontalForward.z * yawSine,
+            0.0F,
+            -horizontalForward.x * yawSine + horizontalForward.z * yawCosine});
+        const float previewPitch = config_.atmosphereCameraPitchRadians;
+        forward = glm::normalize(horizontalForward * std::cos(previewPitch) +
+                                 glm::vec3(0.0F, std::sin(previewPitch), 0.0F));
+    }
+    cameraYaw_ = std::atan2(forward.z, forward.x);
+    cameraPitch_ = std::asin(glm::clamp(forward.y, -1.0F, 1.0F));
 }
 
 void Renderer::updateCamera() {
@@ -7382,13 +8413,227 @@ void Renderer::updateCamera() {
     previousCameraUpdate_ = now;
     deltaSeconds = std::clamp(deltaSeconds, 0.0F, 0.1F);
 
-    platform::RendererInput input = window_.consumeRendererInput();
+    if (config_.weatherDemoEnabled) {
+        updateWeatherDemo(deltaSeconds);
+    }
+
+    if (config_.rain.enabled && deltaSeconds > 0.0F) {
+        rainSimulationTimeSeconds_ =
+            std::fmod(rainSimulationTimeSeconds_ + deltaSeconds, 4'096.0F);
+        const float rainIntensity =
+            std::clamp(config_.rain.intensity, 0.0F, 1.0F);
+        if (rainIntensity > 0.0F) {
+            // A new shower replaces the drying interval. Keeping an explicit
+            // post-rain age lets vapor be born gradually instead of snapping
+            // on when precipitation crosses a narrow shader threshold.
+            rainSteamAgeSeconds_ = 0.0F;
+            // A scalar reservoir advances a deterministic world-space wetting
+            // front in both raster and RTX material shading. Drizzle grows it
+            // slowly; even the accelerated demo takes several seconds to
+            // complete each late wetting stage.
+            const float accumulationPerSecond =
+                std::lerp(0.005F, 0.025F, rainIntensity);
+            rainWetnessAccumulation_ = std::min(
+                1.0F, rainWetnessAccumulation_ +
+                          accumulationPerSecond * deltaSeconds);
+        } else {
+            // The dry portion of the weather demo represents post-storm solar
+            // heating. Evaporation drives both the material recovery and the
+            // steam opacity evaluated by the late weather pass.
+            rainWetnessAccumulation_ = std::max(
+                0.0F, rainWetnessAccumulation_ - 0.033F * deltaSeconds);
+            if (rainWetnessAccumulation_ > 0.0F) {
+                rainSteamAgeSeconds_ = std::min(
+                    rainSteamAgeSeconds_ + deltaSeconds, 60.0F);
+            } else {
+                rainSteamAgeSeconds_ = 0.0F;
+            }
+        }
+    }
+
+    if (config_.atmosphere.has_value() && config_.atmosphere->clouds.enabled &&
+        deltaSeconds > 0.0F) {
+        const lighting::CloudSettings& clouds = config_.atmosphere->clouds;
+        const glm::vec2 referenceWind = glm::normalize(
+            glm::vec2(clouds.windDirection.x, -clouds.windDirection.z));
+        cloudWindOffsetKm_ += referenceWind *
+                              (clouds.windSpeedMetersPerSecond * deltaSeconds / 1'000.0F);
+        const float wrapDistanceKm =
+            std::max(clouds.horizontalScaleMeters / 1'000.0F * 1'024.0F, 1.0F);
+        cloudWindOffsetKm_.x = std::remainder(cloudWindOffsetKm_.x, wrapDistanceKm);
+        cloudWindOffsetKm_.y = std::remainder(cloudWindOffsetKm_.y, wrapDistanceKm);
+        atmosphereEnvironmentUpdatePending_ = true;
+    }
+
+    if (externalCamera_) {
+        cameraPosition_ = externalCamera_->position;
+        const glm::vec3 forward = externalCamera_->forward;
+        cameraYaw_ = std::atan2(forward.z, forward.x);
+        cameraPitch_ = std::asin(std::clamp(forward.y, -1.0F, 1.0F));
+        const float translationDistance = glm::length(cameraPosition_ - previousPosition);
+        const float forwardAgreement = glm::dot(previousForward, forward);
+        cameraMovedThisFrame_ =
+            translationDistance > std::max(sceneRadius_ * 0.000001F, 0.000001F) ||
+            forwardAgreement < 0.999999F;
+        const bool largeTranslation = translationDistance > sceneRadius_ * 0.5F;
+        const bool largeRotation = forwardAgreement < std::cos(glm::radians(30.0F));
+        if (largeTranslation || largeRotation) {
+            temporalState_.reset();
+        }
+        return;
+    }
+
+    platform::RendererInput input = surfaceHost_.consumeRendererInput();
     if (!config_.interactiveCameraInput) {
         input = {};
     }
     if (input.resetCamera) {
         resetCamera();
         return;
+    }
+    bool atmosphereChanged = false;
+    bool atmosphereLightingChanged = false;
+    bool atmosphereDiscontinuity = false;
+    if (config_.atmosphereDemo) {
+        const lighting::AtmosphereDemoView previousAtmosphereView = atmosphereDemoView_;
+        const lighting::TimeOfDaySunSettings timeOfDaySunSettings{
+            .latitudeDegrees = config_.timeOfDayLatitudeDegrees,
+            .dayOfYear = config_.timeOfDayDayOfYear,
+        };
+        if (config_.timeOfDayEnabled && input.timeOfDayToggle) {
+            timeOfDayPaused_ = !timeOfDayPaused_;
+            core::log(core::LogLevel::info, "Time of day ",
+                      timeOfDayPaused_ ? "paused at " : "resumed at ",
+                      timeOfDayHour_, " h");
+        }
+        if (config_.timeOfDayEnabled && input.timeOfDaySpeedSteps != 0) {
+            timeOfDayCycleSeconds_ = std::clamp(
+                timeOfDayCycleSeconds_ *
+                    std::pow(0.5F, static_cast<float>(input.timeOfDaySpeedSteps)),
+                5.0F, 86'400.0F);
+            core::log(core::LogLevel::info, "Time-of-day cycle speed: one day per ",
+                      timeOfDayCycleSeconds_, " seconds");
+        }
+        if (config_.timeOfDayEnabled && input.timeOfDayScrubSteps != 0) {
+            timeOfDayPaused_ = true;
+            timeOfDayHour_ += 0.25F * static_cast<float>(input.timeOfDayScrubSteps);
+            timeOfDayHour_ -= 24.0F * std::floor(timeOfDayHour_ / 24.0F);
+            lighting::applyTimeOfDaySun(atmosphereDemoView_, timeOfDayHour_,
+                                        timeOfDaySunSettings);
+            atmosphereChanged = true;
+            atmosphereLightingChanged = true;
+            core::log(core::LogLevel::info, "Time scrubbed to ", timeOfDayHour_,
+                      " h (paused)");
+        }
+        if (input.atmospherePreset >= 1U && input.atmospherePreset <= 9U) {
+            atmosphereDemoView_ = lighting::atmosphereDemoPreset(input.atmospherePreset);
+            applyAtmosphereDemoCamera();
+            if (config_.timeOfDayEnabled) {
+                timeOfDayPaused_ = true;
+                timeOfDayHour_ = lighting::timeOfDayHourFromSunDirection(
+                    lighting::atmosphereDemoSunDirection(atmosphereDemoView_),
+                    timeOfDaySunSettings);
+            }
+            atmosphereChanged = true;
+            atmosphereLightingChanged = true;
+            atmosphereDiscontinuity = true;
+            core::log(core::LogLevel::info, "Atmosphere preset ", input.atmospherePreset,
+                      ": distance ", atmosphereDemoView_.viewDistanceMeters,
+                      " m, exposure ", atmosphereDemoView_.exposure);
+        }
+        if (input.atmosphereExposureSteps != 0) {
+            atmosphereDemoView_.exposure *=
+                std::pow(1.1F, static_cast<float>(input.atmosphereExposureSteps));
+            atmosphereChanged = true;
+        }
+        if (input.atmosphereWheelDelta != 0.0F) {
+            atmosphereDemoView_.viewDistanceMeters *=
+                std::pow(1.05F, -input.atmosphereWheelDelta);
+            applyAtmosphereDemoCamera();
+            atmosphereChanged = true;
+            atmosphereLightingChanged = true;
+        }
+        if (input.atmosphereDragActive &&
+            (input.atmosphereDeltaX != 0.0F || input.atmosphereDeltaY != 0.0F)) {
+            constexpr float referenceMouseScale = 500.0F;
+            if (input.atmosphereSunDrag) {
+                if (config_.timeOfDayEnabled) {
+                    timeOfDayPaused_ = true;
+                }
+                atmosphereDemoView_.sunZenithAngleRadians = std::clamp(
+                    atmosphereDemoView_.sunZenithAngleRadians +
+                        input.atmosphereDeltaY / referenceMouseScale,
+                    0.0F, std::numbers::pi_v<float>);
+                atmosphereDemoView_.sunAzimuthAngleRadians = std::remainder(
+                    atmosphereDemoView_.sunAzimuthAngleRadians -
+                        input.atmosphereDeltaX / referenceMouseScale,
+                    2.0F * std::numbers::pi_v<float>);
+                if (config_.timeOfDayEnabled) {
+                    timeOfDayHour_ = lighting::timeOfDayHourFromSunDirection(
+                        lighting::atmosphereDemoSunDirection(atmosphereDemoView_),
+                        timeOfDaySunSettings);
+                }
+            } else {
+                atmosphereDemoView_.viewZenithAngleRadians = std::clamp(
+                    atmosphereDemoView_.viewZenithAngleRadians -
+                        input.atmosphereDeltaY / referenceMouseScale,
+                    0.0F, 0.5F * std::numbers::pi_v<float>);
+                atmosphereDemoView_.viewAzimuthAngleRadians = std::remainder(
+                    atmosphereDemoView_.viewAzimuthAngleRadians -
+                        input.atmosphereDeltaX / referenceMouseScale,
+                    2.0F * std::numbers::pi_v<float>);
+                applyAtmosphereDemoCamera();
+            }
+            atmosphereChanged = true;
+            atmosphereLightingChanged = true;
+        }
+        if (config_.timeOfDayEnabled && !timeOfDayPaused_ && deltaSeconds > 0.0F) {
+            const float elapsedSolarHours = 24.0F * deltaSeconds / timeOfDayCycleSeconds_;
+            timeOfDayHour_ += elapsedSolarHours;
+            timeOfDayHour_ -= 24.0F * std::floor(timeOfDayHour_ / 24.0F);
+            // Advance the current Sun around the celestial pole. Unlike
+            // recomputing from the configured date, this preserves a manually
+            // placed or preset Sun exactly when playback resumes.
+            lighting::advanceTimeOfDaySun(atmosphereDemoView_, elapsedSolarHours,
+                                          timeOfDaySunSettings);
+            atmosphereChanged = true;
+            atmosphereLightingChanged = true;
+        }
+        if (atmosphereChanged) {
+            atmosphereDiscontinuity =
+                atmosphereDiscontinuity || lighting::atmosphereHistoryResetRequired(
+                                              previousAtmosphereView,
+                                              atmosphereDemoView_);
+            // Smooth Sun, exposure, and atmosphere-camera motion are ordinary
+            // dynamic scene changes. Raster TAA and Ray Reconstruction must
+            // retain history and adapt continuously; globally resetting every
+            // playback frame exposes fresh cloud-march noise as vibration.
+            // A numbered preset can teleport both camera and Sun, so that
+            // genuinely discontinuous operation still receives a full reset.
+            if (!rayReconstructionEnabled() && atmosphereDiscontinuity) {
+                temporalState_.invalidateHistory();
+            } else if (atmosphereDiscontinuity) {
+                // Streamline owns Ray Reconstruction history, and Genesis has
+                // two CPU/GPU frames in flight. Resetting only the first frame
+                // after a huge atmosphere transition can allow a stale bright
+                // state to re-enter as a slowly fading white blob. Flush the
+                // transition frame plus every in-flight slot.
+                atmosphereHistoryResetFramesRemaining_ = std::max(
+                    atmosphereHistoryResetFramesRemaining_,
+                    static_cast<std::uint32_t>(framesInFlight + 1U));
+                core::log(core::LogLevel::info,
+                          "Atmosphere discontinuity: flushing reconstruction history for ",
+                          atmosphereHistoryResetFramesRemaining_, " frames");
+            }
+            pathTracingResetPending_ = true;
+        }
+        if (atmosphereLightingChanged) {
+            atmosphereEnvironmentUpdatePending_ = true;
+        }
+    }
+    if (atmosphereHistoryResetFramesRemaining_ > 0U) {
+        temporalState_.invalidateHistory();
+        --atmosphereHistoryResetFramesRemaining_;
     }
     if (input.mouseLookActive) {
         constexpr float mouseSensitivity = 0.0025F;
@@ -7425,7 +8670,13 @@ void Renderer::updateCamera() {
         // 1.5x-radius default crossed Sponza in well under a second, which made
         // inspection of path-traced detail impractical. Shift retains that old
         // traversal speed for deliberate fast movement.
-        const float speed = sceneRadius_ * (input.speedBoost ? 1.5F : 0.35F);
+    const bool proceduralAtmosphereTerrain = config_.atmosphereDemo &&
+                                               config_.scenePath.empty() &&
+                                               !config_.sceneSnapshot;
+        const float navigationRadius = proceduralAtmosphereTerrain
+                                           ? std::min(sceneRadius_, 250.0F)
+                                           : sceneRadius_;
+        const float speed = navigationRadius * (input.speedBoost ? 1.5F : 0.35F);
         cameraPosition_ += movement / std::sqrt(movementLengthSquared) * speed * deltaSeconds;
     }
 
@@ -7471,18 +8722,41 @@ void Renderer::updateCamera() {
 void Renderer::updateFrameUniform(std::size_t frameIndex) {
     const VkExtent2D extent = renderExtent();
     const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
-    constexpr float verticalFieldOfView = 42.0F;
+    const float verticalFieldOfViewRadians =
+        externalCamera_ ? externalCamera_->verticalFieldOfViewRadians : glm::radians(42.0F);
+    const bool orthographic = externalCamera_ &&
+                              externalCamera_->projection ==
+                                  RendererCamera::Projection::orthographic;
     const glm::vec3 forward = cameraForward(cameraYaw_, cameraPitch_);
     const glm::mat4 view =
         glm::lookAtRH(cameraPosition_, cameraPosition_ + forward, glm::vec3(0.0F, 1.0F, 0.0F));
     const float cameraDistance = glm::length(cameraPosition_ - sceneCenter_);
-    const float nearPlane = std::max(cameraDistance - sceneRadius_ * 1.5F, sceneRadius_ * 0.001F);
-    const float farPlane = std::max(cameraDistance + sceneRadius_ * 2.0F, sceneRadius_ * 4.0F);
+    const bool localAtmospherePreview = config_.atmosphereDemo &&
+                                        config_.scenePath.empty() &&
+                                        !config_.sceneSnapshot;
+    const float nearPlane = externalCamera_
+                                ? externalCamera_->nearPlane
+                                : (localAtmospherePreview
+                                       ? 0.05F
+                                       : std::max(cameraDistance - sceneRadius_ * 1.5F,
+                                                  sceneRadius_ * 0.001F));
+    const float farPlane = externalCamera_
+                               ? externalCamera_->farPlane
+                               : std::max(cameraDistance + sceneRadius_ * 2.0F,
+                                          sceneRadius_ * 4.0F);
     cameraNear_ = nearPlane;
     cameraFar_ = farPlane;
-    cameraFovRadians_ = glm::radians(verticalFieldOfView);
-    glm::mat4 projection =
-        glm::perspectiveRH_ZO(glm::radians(verticalFieldOfView), aspect, nearPlane, farPlane);
+    cameraFovRadians_ = verticalFieldOfViewRadians;
+    glm::mat4 projection;
+    if (orthographic) {
+        const float halfHeight = externalCamera_->orthographicHeight * 0.5F;
+        const float halfWidth = halfHeight * aspect;
+        projection = glm::orthoRH_ZO(-halfWidth, halfWidth, -halfHeight, halfHeight,
+                                     nearPlane, farPlane);
+    } else {
+        projection =
+            glm::perspectiveRH_ZO(verticalFieldOfViewRadians, aspect, nearPlane, farPlane);
+    }
     projection[1][1] *= -1.0F;
     // Path tracing owns primary-ray sampling. Jittering its projection makes
     // the per-pixel accumulated radiance disagree with the current first-hit
@@ -7496,7 +8770,11 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
     const temporal::CameraMatrices& currentCamera = temporalState_.current();
     const temporal::CameraMatrices& previousCamera = temporalState_.previousForRendering();
     const VkExtent2D outputExtent = swapchain_.extent();
-    const float exposureScale = std::exp2(config_.exposureCompensationEv);
+    const float atmosphereExposureEv =
+        config_.atmosphereDemo
+            ? std::log2(std::max(atmosphereDemoView_.exposure, 0.001F) / 10.0F)
+            : 0.0F;
+    const float exposureScale = std::exp2(atmosphereBaseExposureEv_ + atmosphereExposureEv);
     upscalingFramePlan_ = upscaler_->prepareFrame({
         .renderExtent = {extent.width, extent.height},
         .outputExtent = {outputExtent.width, outputExtent.height},
@@ -7514,14 +8792,31 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
     const glm::vec3 previousCameraPosition = glm::vec3(glm::inverse(previousCamera.view)[3]);
     const glm::uvec2 visibilityMask = gpu_scene::packRenderLayerMask(mainView_.visibilityMask);
     constexpr std::array cascadeFractions{0.32F, 0.62F, 1.0F};
-    const glm::vec3 directionalLightTravel = glm::normalize(glm::vec3(0.35F, -0.75F, -0.55F));
+    const glm::vec3 atmosphereSunReference =
+        config_.atmosphereDemo
+            ? lighting::atmosphereDemoSunDirection(atmosphereDemoView_)
+            : config_.atmosphere.has_value()
+                  ? glm::normalize(glm::vec3(config_.atmosphere->sunDirection.x,
+                                             -config_.atmosphere->sunDirection.z,
+                                             config_.atmosphere->sunDirection.y))
+                  : glm::vec3(0.0F);
+    const glm::vec3 atmosphereSunGenesis =
+        config_.atmosphere.has_value()
+            ? glm::normalize(glm::vec3(atmosphereSunReference.x,
+                                       atmosphereSunReference.z,
+                                       -atmosphereSunReference.y))
+            : glm::vec3(0.0F, 1.0F, 0.0F);
+    const glm::vec3 directionalLightTravel =
+        config_.atmosphere.has_value()
+            ? -atmosphereSunGenesis
+            : glm::normalize(glm::vec3(0.35F, -0.75F, -0.55F));
     const glm::vec3 lightReferenceUp = std::abs(directionalLightTravel.y) > 0.98F
                                            ? glm::vec3(1.0F, 0.0F, 0.0F)
                                            : glm::vec3(0.0F, 1.0F, 0.0F);
     const glm::vec3 lightRight =
         glm::normalize(glm::cross(lightReferenceUp, directionalLightTravel));
     const glm::vec3 lightUp = glm::cross(directionalLightTravel, lightRight);
-    const float tangentHalfFov = std::tan(glm::radians(verticalFieldOfView * 0.5F));
+    const float tangentHalfFov = std::tan(verticalFieldOfViewRadians * 0.5F);
     std::array<glm::vec4, directionalShadowCascadeCount> shadowCascades{};
     std::array<float, directionalShadowCascadeCount> shadowSplits{};
     std::array<float, directionalShadowCascadeCount> shadowDepthRadii{};
@@ -7532,7 +8827,9 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
             nearPlane + (farPlane - nearPlane) * cascadeFractions[cascadeIndex];
         const float centerDistance = 0.5F * (cascadeNear + cascadeFar);
         const float halfDepth = 0.5F * (cascadeFar - cascadeNear);
-        const float halfHeight = cascadeFar * tangentHalfFov;
+        const float halfHeight = orthographic
+                                     ? externalCamera_->orthographicHeight * 0.5F
+                                     : cascadeFar * tangentHalfFov;
         const float halfWidth = halfHeight * aspect;
         const float radius = std::max(
             std::sqrt(halfDepth * halfDepth + halfHeight * halfHeight + halfWidth * halfWidth) *
@@ -7565,7 +8862,73 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         config_.pathDebugView == PathDebugView::final
             ? 0U
             : 4U + static_cast<std::uint32_t>(config_.pathDebugView);
-    const float proceduralLightScale = config_.hdriBackdropDemo ? 0.0F : 1.0F;
+    const bool explicitHdriPathLighting =
+        pathTracingEnabled() && !config_.environmentPath.empty();
+    const float proceduralLightScale =
+        config_.hdriBackdropDemo || explicitHdriPathLighting ? 0.0F : 1.0F;
+    const float sunHorizonVisibility = config_.atmosphere.has_value()
+                                           ? glm::smoothstep(-0.02F, 0.04F,
+                                                             atmosphereSunReference.z)
+                                           : 1.0F;
+    // The atmosphere already contributes the full sky illumination. A slightly
+    // lower analytic Sun keeps rough daylight surfaces below the display
+    // shoulder instead of flattening them toward white, while non-atmosphere
+    // lighting retains the established 3.5 intensity.
+    const float directionalSunIntensity = config_.atmosphere.has_value() ? 2.25F : 3.5F;
+    const lighting::DirectionalLightControls directionalLightControls =
+        lighting::makeDirectionalLightControls(directionalSunIntensity * proceduralLightScale *
+                                                   sunHorizonVisibility,
+                                               config_.shadowsEnabled,
+                                               directionalShadowCascadeCount);
+    glm::vec4 cloudLayerParameters(0.0F);
+    glm::vec4 cloudWeatherParameters(0.0F);
+    if (config_.atmosphere.has_value() && config_.atmosphere->clouds.enabled) {
+        const lighting::AtmosphereSettings& atmosphere = *config_.atmosphere;
+        const lighting::CloudSettings& clouds = atmosphere.clouds;
+        const float innerRadiusKm =
+            (atmosphere.bottomRadiusMeters + clouds.baseAltitudeMeters) / 1'000.0F;
+        cloudLayerParameters = {
+            innerRadiusKm,
+            innerRadiusKm + clouds.thicknessMeters / 1'000.0F,
+            clouds.coverage,
+            clouds.density,
+        };
+        cloudWeatherParameters = {
+            cloudWindOffsetKm_, clouds.horizontalScaleMeters / 1'000.0F,
+            static_cast<float>(config_.cloudDebugView)};
+    }
+    const bool proceduralAtmosphereTerrain = config_.atmosphereDemo &&
+                                              config_.scenePath.empty() &&
+                                              !config_.sceneSnapshot;
+    const float shadingSceneScale = proceduralAtmosphereTerrain
+                                        ? std::min(sceneRadius_, 32.0F)
+                                        : sceneRadius_;
+    glm::vec3 atmosphereCameraKm(0.0F);
+    if (config_.atmosphere.has_value()) {
+        const float bottomRadiusMeters = config_.atmosphere->bottomRadiusMeters;
+        if (proceduralAtmosphereTerrain) {
+            // Treat the procedural plane as the local tangent ground. This
+            // keeps atmosphere distances in metres while allowing the material
+            // grid to use a practical inspection camera.
+            const glm::vec3 localGroundOrigin{
+                sceneCenter_.x, sceneMinimum_.y, sceneCenter_.z};
+            const glm::vec3 localCameraMeters = cameraPosition_ - localGroundOrigin;
+            atmosphereCameraKm = {
+                localCameraMeters.x / 1'000.0F,
+                -localCameraMeters.z / 1'000.0F,
+                (bottomRadiusMeters + localCameraMeters.y) / 1'000.0F,
+            };
+        } else if (config_.atmosphereDemo) {
+            atmosphereCameraKm = lighting::atmosphereDemoCameraFromEarthCenterKm(
+                atmosphereDemoView_, bottomRadiusMeters);
+        } else {
+            atmosphereCameraKm = {
+                0.0F, 0.0F,
+                (bottomRadiusMeters + config_.atmosphere->observerAltitudeMeters) /
+                    1'000.0F,
+            };
+        }
+    }
     const FrameUniform uniform{
         .viewProjection = currentCamera.jitteredViewProjection,
         .inverseViewProjection = glm::inverse(currentCamera.jitteredViewProjection),
@@ -7573,17 +8936,26 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         .previousViewProjection = previousCamera.jitteredViewProjection,
         .previousUnjitteredViewProjection = previousCamera.unjitteredViewProjection,
         .cameraPositionExposure = {cameraPosition_, exposureScale},
-        .directionalDirectionIntensity = {directionalLightTravel, 3.5F * proceduralLightScale},
+        .directionalDirectionIntensity = {directionalLightTravel,
+                                          directionalLightControls.intensity},
         .directionalColor = {1.0F, 0.92F, 0.82F,
                              config_.postTestPattern == post::TestPattern::none
                                  ? config_.filmGrainIntensity
                                  : config_.postTestPosition.y},
-        .pointPositionIntensity = {sceneCenter_ + glm::vec3(-0.60F, 0.45F, 0.85F) * sceneRadius_,
-                                   3.0F * sceneRadius_ * sceneRadius_ * proceduralLightScale},
-        .pointColorRange = {0.45F, 0.65F, 1.0F, sceneRadius_ * 4.0F},
+        .pointPositionIntensity = {
+            sceneCenter_ + glm::vec3(-0.60F, 0.45F, 0.85F) * sceneRadius_,
+            config_.atmosphere.has_value()
+                ? 0.0F
+                : 3.0F * sceneRadius_ * sceneRadius_ * proceduralLightScale},
+        .pointColorRange = {0.45F, 0.65F, 1.0F,
+                            pathTracingEnabled() ? config_.pathShadowAngularRadius
+                                                 : sceneRadius_ * 4.0F},
         .environmentParameters =
             {environmentRotationRadians_,
-             pathTracingEnabled() ? (config_.pathEnvironmentImportanceSampling ? 1.0F : 0.0F)
+             pathTracingEnabled() ? (config_.pathEnvironmentImportanceSampling &&
+                                             !config_.atmosphere.has_value()
+                                         ? 1.0F
+                                         : 0.0F)
                                   : (config_.postTestPattern == post::TestPattern::none
                                          ? 0.0F
                                          : config_.postTestSourceValue),
@@ -7628,20 +9000,32 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         .shadowCascadeCenterRadius1 = shadowCascades[1],
         .shadowCascadeCenterRadius2 = shadowCascades[2],
         .shadowCascadeSplits = {shadowSplits[0], shadowSplits[1], shadowSplits[2],
-                                config_.shadowsEnabled
-                                    ? static_cast<float>(directionalShadowCascadeCount)
-                                    : 0.0F},
+                                static_cast<float>(
+                                    directionalLightControls.activeShadowCascadeCount)},
         .shadowCascadeDepthRadii = {shadowDepthRadii[0], shadowDepthRadii[1], shadowDepthRadii[2],
-                                    sceneRadius_},
+                                    shadingSceneScale},
         .previousCameraPosition = {previousCameraPosition, 1.0F},
+        .atmosphereCamera =
+            config_.atmosphere.has_value()
+                ? glm::vec4(atmosphereCameraKm,
+                            config_.atmosphere->bottomRadiusMeters / 1'000.0F)
+                : glm::vec4(0.0F),
+        .atmosphereSunDirection =
+            {atmosphereSunReference, config_.atmosphere.has_value() ? 1.0F : 0.0F},
+        .cloudLayerParameters = cloudLayerParameters,
+        .cloudWeatherParameters = cloudWeatherParameters,
+        .weatherParameters =
+            {config_.rain.enabled ? config_.rain.intensity : 0.0F,
+             rainSimulationTimeSeconds_, rainSteamAgeSeconds_,
+             rainWetnessAccumulation_},
     };
     uniformBuffers_[frameIndex]->write(std::as_bytes(std::span(&uniform, 1)));
 }
 
 void Renderer::recreateSwapchain() {
-    const auto [width, height] = window_.waitForDrawableSize();
-    (void)window_.consumeFramebufferResize();
-    if (width == 0 || height == 0 || window_.shouldClose()) {
+    const auto [width, height] = surfaceHost_.waitForDrawableSize();
+    (void)surfaceHost_.consumeFramebufferResize();
+    if (width == 0 || height == 0 || surfaceHost_.shouldClose()) {
         return;
     }
     vulkan::check(vkDeviceWaitIdle(device_.handle()), "vkDeviceWaitIdle(swapchain recreation)");
@@ -7700,12 +9084,14 @@ void Renderer::recreateSwapchain() {
         }
         updateUpscalingDescriptor();
         updateToneMappingDescriptor();
+        updateRainDescriptor();
         if (!pathTracingEnabled()) {
             updateHiZDescriptors();
         }
         hiZReady_ = false;
         if (formatChanged) {
             createGraphicsPipelines();
+            createEditorOverlayResources();
         }
     } else {
         core::log(core::LogLevel::info, "Swapchain restored at unchanged ",
@@ -7966,7 +9352,6 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                 : render_graph::ImageState{};
         renderGraph_->bindImportedImage(graphPathDenoisedImage_, pathDenoisedImage_->handle(),
                                         denoisedState, render_graph::QueueType::graphics);
-#if RENDERER_ENABLE_NRD
         const render_graph::ImageState nrdExternalState =
             nrdExternalLayoutsInitialized_
                 ? render_graph::ImageState{
@@ -7984,6 +9369,7 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
                                         render_graph::QueueType::graphics);
         renderGraph_->bindImportedImage(graphNrdMaterialImage_, nrdMaterialImage_->handle(),
                                         nrdExternalState, render_graph::QueueType::graphics);
+#if RENDERER_ENABLE_NRD
         if (!rayReconstructionEnabled()) {
             renderGraph_->bindImportedImage(graphNrdMotionImage_, nrdMotionImage_->handle(),
                                             nrdExternalState, render_graph::QueueType::graphics);
@@ -8120,6 +9506,16 @@ void Renderer::recordFrame(VkCommandBuffer commandBuffer, std::uint32_t imageInd
         renderGraph_->bindImportedBuffer(graphCaptureBuffer_, captureReadbackBuffer_->handle(), 0,
                                          captureReadbackBuffer_->size(), {},
                                          render_graph::QueueType::graphics);
+    }
+    if (config_.editorOverlayEnabled) {
+        renderGraph_->bindImportedBuffer(
+            graphEditorOverlayVertexBuffer_, editorOverlayVertexBuffers_[frameIndex]->handle(),
+            0U, editorOverlayVertexBuffers_[frameIndex]->size(),
+            render_graph::BufferState{
+                .stages = VK_PIPELINE_STAGE_2_HOST_BIT,
+                .access = VK_ACCESS_2_HOST_WRITE_BIT,
+            },
+            render_graph::QueueType::graphics);
     }
     const GraphFrameContext context{
         .imageIndex = imageIndex,
@@ -8260,296 +9656,6 @@ void Renderer::recordHiZPass(VkCommandBuffer commandBuffer, std::size_t level) {
     const VkExtent2D extent = hiZExtents_[level];
     vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
                   (extent.height + workgroupSize - 1U) / workgroupSize, 1);
-}
-
-void Renderer::recordPathTracingPass(VkCommandBuffer commandBuffer,
-                                     const GraphFrameContext& context) {
-    if (!pathTracingPipeline_ || !pathTracingDescriptorPool_) {
-        throw std::runtime_error("Path-tracing dispatch requires a complete ray pipeline");
-    }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathTracing, false);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-                      pathTracingPipeline_->handle());
-    const std::array descriptorSets{
-        pathTracingDescriptorPool_->set(context.frameIndex),
-        bindlessDescriptorPool_->set(0),
-    };
-    vkCmdBindDescriptorSets(
-        commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pathTracingPipeline_->layout(), 0U,
-        static_cast<std::uint32_t>(descriptorSets.size()), descriptorSets.data(), 0U, nullptr);
-    const VkExtent2D extent = renderExtent();
-    const VkShaderStageFlags pathTracingStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR |
-                                                 VK_SHADER_STAGE_MISS_BIT_KHR |
-                                                 VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-    for (std::uint32_t sampleInFrame = 0U; sampleInFrame < pathSamplesThisFrame_; ++sampleInFrame) {
-        const PathTracingControls controls{
-            .sampleIndex = rayReconstructionEnabled()
-                               ? static_cast<std::uint32_t>(renderedFrameCount_) + sampleInFrame
-                               : pathTracingSampleIndex_ + sampleInFrame,
-            .sampleInFrame = sampleInFrame,
-            .samplesThisFrame = pathSamplesThisFrame_,
-            .fixedPrimarySample = rayReconstructionEnabled()
-                                      ? 2U
-                                      : (temporalUpscalingEnabled() ? 1U : 0U),
-        };
-        vkCmdPushConstants(commandBuffer, pathTracingPipeline_->layout(), pathTracingStages, 0U,
-                           sizeof(controls), &controls);
-        vkCmdTraceRaysKHR(commandBuffer, &pathTracingPipeline_->rayGenerationRegion(),
-                          &pathTracingPipeline_->missRegion(), &pathTracingPipeline_->hitRegion(),
-                          &pathTracingPipeline_->callableRegion(), extent.width, extent.height, 1U);
-        if (sampleInFrame + 1U < pathSamplesThisFrame_) {
-            const VkMemoryBarrier2 sampleBarrier{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
-                .dstAccessMask =
-                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            };
-            const VkDependencyInfo dependency{
-                .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                .memoryBarrierCount = 1U,
-                .pMemoryBarriers = &sampleBarrier,
-            };
-            vkCmdPipelineBarrier2(commandBuffer, &dependency);
-        }
-    }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathTracing, true);
-}
-
-void Renderer::recordPathHistoryPass(VkCommandBuffer commandBuffer,
-                                     const GraphFrameContext& context) {
-    if (!pathHistoryPipeline_ || !pathHistoryDescriptorPool_) {
-        throw std::runtime_error("Path-history dispatch requires a complete compute pipeline");
-    }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathHistory, false);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      pathHistoryPipeline_->handle());
-    const VkDescriptorSet descriptorSet = pathHistoryDescriptorPool_->set(context.frameIndex);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pathHistoryPipeline_->layout(), 0U, 1U, &descriptorSet, 0U, nullptr);
-    const std::uint32_t historyValid =
-        pathHistoryLayoutsInitialized_ && temporalState_.historyValid() ? 1U : 0U;
-    vkCmdPushConstants(commandBuffer, pathHistoryPipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT,
-                       0U, sizeof(historyValid), &historyValid);
-    constexpr std::uint32_t workgroupSize = 8U;
-    const VkExtent2D extent = renderExtent();
-    vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
-                  (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathHistory, true);
-}
-
-void Renderer::recordPathReconstructionPass(VkCommandBuffer commandBuffer,
-                                            const GraphFrameContext& context) {
-    if (!pathReconstructionPipeline_ || !pathReconstructionDescriptorPool_) {
-        throw std::runtime_error(
-            "Path reconstruction dispatch requires a complete compute pipeline");
-    }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathReconstruction, false);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      pathReconstructionPipeline_->handle());
-    const VkDescriptorSet descriptorSet =
-        pathReconstructionDescriptorPool_->set(context.frameIndex);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pathReconstructionPipeline_->layout(), 0U, 1U, &descriptorSet, 0U,
-                            nullptr);
-    const PathReconstructionControls controls{
-        .sampleIndex = pathTracingSampleIndex_,
-        .samplesThisFrame = pathSamplesThisFrame_,
-    };
-    vkCmdPushConstants(commandBuffer, pathReconstructionPipeline_->layout(),
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(controls), &controls);
-    constexpr std::uint32_t workgroupSize = 8U;
-    const VkExtent2D extent = renderExtent();
-    vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
-                  (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathReconstruction, true);
-}
-
-void Renderer::recordPathDenoisingPass(VkCommandBuffer commandBuffer,
-                                       const GraphFrameContext& context, std::size_t passIndex) {
-    if (!pathDenoisingPipeline_ || !pathDenoisingDescriptorPool_ ||
-        passIndex >= pathDenoisingPassCount) {
-        throw std::runtime_error("Path denoising dispatch requires a complete compute pipeline");
-    }
-    if (passIndex == 0U) {
-        writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathDenoising, false);
-    }
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      pathDenoisingPipeline_->handle());
-    const std::size_t descriptorIndex = context.frameIndex * pathDenoisingPassCount + passIndex;
-    const VkDescriptorSet descriptorSet = pathDenoisingDescriptorPool_->set(descriptorIndex);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pathDenoisingPipeline_->layout(), 0U, 1U, &descriptorSet, 0U, nullptr);
-    const PathDenoisingControls controls{
-        .sampleIndex = pathTracingSampleIndex_,
-        .stepWidth = 1U << static_cast<std::uint32_t>(passIndex),
-        .passIndex = static_cast<std::uint32_t>(passIndex),
-        .passCount = static_cast<std::uint32_t>(pathDenoisingPassCount),
-        .samplesThisFrame = pathSamplesThisFrame_,
-    };
-    vkCmdPushConstants(commandBuffer, pathDenoisingPipeline_->layout(), VK_SHADER_STAGE_COMPUTE_BIT,
-                       0U, sizeof(controls), &controls);
-    constexpr std::uint32_t workgroupSize = 8U;
-    const VkExtent2D extent = renderExtent();
-    vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
-                  (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
-    if (passIndex + 1U == pathDenoisingPassCount) {
-        writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathDenoising, true);
-    }
-}
-
-void Renderer::recordNrdPreparePass(VkCommandBuffer commandBuffer,
-                                    const GraphFrameContext& context) {
-#if RENDERER_ENABLE_NRD
-    if (!pathNrdPreparePipeline_ || !pathNrdPrepareDescriptorPool_) {
-        throw std::runtime_error("NRD guide preparation requires a complete compute pipeline");
-    }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdPrepare, false);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      pathNrdPreparePipeline_->handle());
-    const VkDescriptorSet descriptorSet = pathNrdPrepareDescriptorPool_->set(context.frameIndex);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pathNrdPreparePipeline_->layout(), 0U, 1U, &descriptorSet, 0U,
-                            nullptr);
-    const glm::mat4 inverseProjection =
-        glm::inverse(temporalState_.current().unjitteredProjection);
-    vkCmdPushConstants(commandBuffer, pathNrdPreparePipeline_->layout(),
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(inverseProjection),
-                       glm::value_ptr(inverseProjection));
-    constexpr std::uint32_t workgroupSize = 8U;
-    const VkExtent2D extent = renderExtent();
-    vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
-                  (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdPrepare, true);
-#else
-    (void)commandBuffer;
-    (void)context;
-#endif
-}
-
-void Renderer::recordNrdDenoisingPass(VkCommandBuffer commandBuffer,
-                                      const GraphFrameContext& context) {
-#if RENDERER_ENABLE_NRD
-    if (!nrdDenoiser_ || !nrdMotionImage_ || !nrdMotionView_ ||
-        !nrdNormalRoughnessImage_ || !nrdNormalRoughnessView_ || !nrdViewZImage_ ||
-        !nrdViewZView_ || !nrdDiffuseInputImage_ || !nrdDiffuseInputView_ ||
-        !nrdSpecularInputImage_ || !nrdSpecularInputView_ || !nrdDiffuseOutputImage_ ||
-        !nrdDiffuseOutputView_ || !nrdSpecularOutputImage_ || !nrdSpecularOutputView_) {
-        throw std::runtime_error("NRD denoising requires complete external resources");
-    }
-    const auto matrixArray = [](const glm::mat4& matrix) {
-        std::array<float, 16> result{};
-        std::memcpy(result.data(), glm::value_ptr(matrix), sizeof(matrix));
-        return result;
-    };
-    const temporal::CameraMatrices& currentCamera = temporalState_.current();
-    const temporal::CameraMatrices& previousCamera = temporalState_.previousForRendering();
-    const VkExtent2D extent = renderExtent();
-    if (extent.width > std::numeric_limits<std::uint16_t>::max() ||
-        extent.height > std::numeric_limits<std::uint16_t>::max()) {
-        throw std::runtime_error("NRD render extent exceeds its 16-bit API limit");
-    }
-    const nrd::CommonSettings settings = nvidia::makeNrdCommonSettings(
-        static_cast<std::uint16_t>(extent.width), static_cast<std::uint16_t>(extent.height),
-        static_cast<std::uint32_t>(renderedFrameCount_),
-        matrixArray(currentCamera.unjitteredProjection),
-        matrixArray(previousCamera.unjitteredProjection), matrixArray(currentCamera.view),
-        matrixArray(previousCamera.view), !temporalState_.historyValid());
-
-    nvidia::NrdExternalResourceTable externalResources{};
-    const auto bind = [&externalResources](nrd::ResourceType type, const vulkan::Image& image,
-                                           const vulkan::ImageView& view) {
-        externalResources[static_cast<std::size_t>(type)] = {
-            .image = image.handle(),
-            .view = view.handle(),
-            .format = image.format(),
-        };
-    };
-    bind(nrd::ResourceType::IN_MV, *nrdMotionImage_, *nrdMotionView_);
-    bind(nrd::ResourceType::IN_NORMAL_ROUGHNESS, *nrdNormalRoughnessImage_,
-         *nrdNormalRoughnessView_);
-    bind(nrd::ResourceType::IN_VIEWZ, *nrdViewZImage_, *nrdViewZView_);
-    bind(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, *nrdDiffuseInputImage_,
-         *nrdDiffuseInputView_);
-    bind(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, *nrdSpecularInputImage_,
-         *nrdSpecularInputView_);
-    bind(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, *nrdDiffuseOutputImage_,
-         *nrdDiffuseOutputView_);
-    bind(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, *nrdSpecularOutputImage_,
-         *nrdSpecularOutputView_);
-
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdDenoising, false);
-    nrdDenoiser_->record(commandBuffer, static_cast<std::uint32_t>(context.frameIndex), settings,
-                         externalResources);
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdDenoising, true);
-#else
-    (void)commandBuffer;
-    (void)context;
-#endif
-}
-
-void Renderer::recordNrdResolvePass(VkCommandBuffer commandBuffer,
-                                    const GraphFrameContext& context) {
-#if RENDERER_ENABLE_NRD
-    if (!pathNrdResolvePipeline_ || !pathNrdResolveDescriptorPool_) {
-        throw std::runtime_error("NRD resolve requires a complete compute pipeline");
-    }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdResolve, false);
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      pathNrdResolvePipeline_->handle());
-    const VkDescriptorSet descriptorSet = pathNrdResolveDescriptorPool_->set(context.frameIndex);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pathNrdResolvePipeline_->layout(), 0U, 1U, &descriptorSet, 0U,
-                            nullptr);
-    constexpr std::uint32_t workgroupSize = 8U;
-    const VkExtent2D extent = renderExtent();
-    vkCmdDispatch(commandBuffer, (extent.width + workgroupSize - 1U) / workgroupSize,
-                  (extent.height + workgroupSize - 1U) / workgroupSize, 1U);
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::nrdResolve, true);
-#else
-    (void)commandBuffer;
-    (void)context;
-#endif
-}
-
-void Renderer::recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
-                                         const GraphFrameContext& context) {
-    if (!pathAovReadbackBuffer_ || context.historyWriteIndex >= framesInFlight) {
-        throw std::runtime_error("Path AOV readback requires complete frame resources");
-    }
-    const std::array<VkImage, pathAovReadbackTargetCount> images{
-        pathTracingAccumulationImage_->handle(),
-        pathTracingDirectImage_->handle(),
-        pathTracingSurfaceImage_->handle(),
-        pathTracingNormalImage_->handle(),
-        pathTracingMotionDepthImage_->handle(),
-        pathTracingDepthImage_->handle(),
-        pathHistoryValidityImage_->handle(),
-        pathReconstructionImages_[context.historyWriteIndex]->handle(),
-        pathDenoisedImage_->handle(),
-    };
-    const VkExtent2D extent = renderExtent();
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathAovReadback, false);
-    for (std::size_t index = 0U; index < images.size(); ++index) {
-        const VkBufferImageCopy copy{
-            .bufferOffset = pathAovReadbackOffsets_[index],
-            .bufferRowLength = 0U,
-            .bufferImageHeight = 0U,
-            .imageSubresource =
-                {
-                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .mipLevel = 0U,
-                    .baseArrayLayer = 0U,
-                    .layerCount = 1U,
-                },
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {extent.width, extent.height, 1U},
-        };
-        vkCmdCopyImageToBuffer(commandBuffer, images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               pathAovReadbackBuffer_->handle(), 1U, &copy);
-    }
-    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathAovReadback, true);
 }
 
 void Renderer::recordReactiveMaskPass(VkCommandBuffer commandBuffer,
@@ -8700,6 +9806,40 @@ void Renderer::recordUpscalingPass(VkCommandBuffer commandBuffer,
     vkCmdDraw(commandBuffer, 3U, 1U, 0U, 0U);
     vkCmdEndRendering(commandBuffer);
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::upscaling, true);
+}
+
+void Renderer::updateWeatherDemo(float deltaSeconds) {
+    if (!config_.weatherDemoEnabled) {
+        return;
+    }
+
+    weatherDemoTimeSeconds_ = std::fmod(
+        weatherDemoTimeSeconds_ + deltaSeconds, config_.weatherDemoCycleSeconds);
+    const float phase = weatherDemoTimeSeconds_ / config_.weatherDemoCycleSeconds;
+    const float cycleAngle = 2.0F * std::numbers::pi_v<float> * phase;
+    float rainIntensity = 0.0F;
+    if (phase < 0.12F) {
+        rainIntensity = std::lerp(
+            0.0F, 0.35F, glm::smoothstep(0.0F, 0.12F, phase));
+    } else if (phase < 0.42F) {
+        rainIntensity = std::lerp(
+            0.35F, 1.0F, glm::smoothstep(0.12F, 0.42F, phase));
+    } else if (phase < 0.55F) {
+        rainIntensity = 1.0F;
+    } else if (phase < 0.66F) {
+        rainIntensity = 1.0F - glm::smoothstep(0.55F, 0.66F, phase);
+    }
+    const float windSpeed = std::lerp(
+        3.0F, 32.0F, std::pow(rainIntensity, 0.75F));
+    const float direction = weatherDemoBaseWindDirectionRadians_ + cycleAngle +
+                            glm::radians(20.0F) * std::sin(cycleAngle);
+    const glm::vec3 windDirection{std::cos(direction), 0.0F, std::sin(direction)};
+
+    config_.rain.intensity = rainIntensity;
+    config_.rain.windVelocityMetersPerSecond = windDirection * windSpeed;
+    lighting::CloudSettings& clouds = config_.atmosphere->clouds;
+    clouds.windDirection = windDirection;
+    clouds.windSpeedMetersPerSecond = windSpeed;
 }
 
 void Renderer::recordDlssPass(VkCommandBuffer commandBuffer,
@@ -9092,6 +10232,59 @@ void Renderer::recordToneMappingPass(VkCommandBuffer commandBuffer,
     vkCmdDraw(commandBuffer, 3, 1, 0, 0);
     vkCmdEndRendering(commandBuffer);
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::toneMapping, true);
+}
+
+void Renderer::recordRainPass(VkCommandBuffer commandBuffer,
+                              const GraphFrameContext& context) {
+    if (!config_.rain.enabled || rainPipeline_ == nullptr || rainDescriptorPool_ == nullptr) {
+        return;
+    }
+
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::rain, false);
+    const VkRenderingAttachmentInfo colorAttachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = swapchain_.imageView(context.imageIndex),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    const VkRenderingInfo renderingInfo{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = {.offset = {0, 0}, .extent = swapchain_.extent()},
+        .layerCount = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &colorAttachment,
+    };
+    vkCmdBeginRendering(commandBuffer, &renderingInfo);
+    const VkViewport viewport{
+        .x = 0.0F,
+        .y = 0.0F,
+        .width = static_cast<float>(swapchain_.extent().width),
+        .height = static_cast<float>(swapchain_.extent().height),
+        .minDepth = 0.0F,
+        .maxDepth = 1.0F,
+    };
+    const VkRect2D scissor{.offset = {0, 0}, .extent = swapchain_.extent()};
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      rainPipeline_->handle());
+    const VkDescriptorSet descriptorSet = rainDescriptorPool_->set(context.frameIndex);
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            rainPipeline_->layout(), 0, 1, &descriptorSet, 0, nullptr);
+    const weather::RainSettings& settings = config_.rain;
+    const RainControls controls{
+        .amountTimeSpeedLength = {settings.intensity, rainSimulationTimeSeconds_,
+                                  settings.fallSpeedMetersPerSecond,
+                                  settings.streakLengthMeters},
+        .windMaximumDistance = {settings.windVelocityMetersPerSecond,
+                                settings.maximumDistanceMeters},
+    };
+    vkCmdPushConstants(commandBuffer, rainPipeline_->layout(), VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(controls), &controls);
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    vkCmdEndRendering(commandBuffer);
+    writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::rain, true);
 }
 
 void Renderer::recordCapturePass(VkCommandBuffer commandBuffer,

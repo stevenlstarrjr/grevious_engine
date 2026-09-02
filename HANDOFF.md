@@ -1,6 +1,6 @@
 # Genesis Render Handoff
 
-Last updated: 2026-08-29
+Last updated: 2026-09-02
 
 Repository: <https://github.com/stevenlstarrjr/grevious_engine>
 
@@ -20,16 +20,39 @@ The planned host-engine physics direction is documented in
 preferred first host backend behind `IPhysicsWorld`; Blast and Flow are optional
 later host integrations. Genesis Render consumes renderer-neutral scene/transform/
 geometry/volume updates and must never expose or link PhysX, Blast, Flow, Jolt,
-or CUDA types. CPU physics and cross-vendor Vulkan rendering remain mandatory
-fallback contracts.
+or CUDA types through its public renderer API.
+
+The supported product hardware target is **NVIDIA RTX-capable graphics cards
+only**. Required devices must provide Vulkan 1.3, acceleration structures, and
+the ray-tracing pipeline. CUDA, DLSS/Ray Reconstruction, and other NVIDIA-specific
+techniques are valid implementation choices. Existing portable/raster/reference
+paths may remain useful for diagnostics and blended-material rendering, but AMD,
+Intel, integrated, and software Vulkan devices are not supported product targets.
 
 ## What Works Now
+
+- The renderer core is available as the SDL-independent `Genesis::Renderer`
+  static library. `RenderSurface` separates presentation from SDL, the Win32
+  implementation accepts an existing HWND, and Genisis Studio embeds it inside
+  a Qt window without linking SDL into the viewport host.
+- The editor integration has explicit W/M/R ownership: W and M use the Genesis
+  raster renderer with a host-supplied post-tone-map overlay pass; W replaces
+  the scene presentation with workbench triangles, while M composites the grid,
+  selection, component, and gizmo geometry over PBR. R is the clean path-traced
+  view with no editor overlays. The legacy Studio Vulkan viewport source remains
+  compiled and preserved but is not an automatic runtime fallback.
+- Material Preview supports live in-memory scene replacement. Reserved device-
+  local scene buffers receive asynchronous geometry, instance, material,
+  transform, and meshlet-work uploads without rebuilding pipelines, swapchain,
+  or IBL; capacity/texture/RT changes take the deliberate full-rebuild path.
+  W/M are event-driven while idle, and M disables unused RT acceleration
+  structures in favor of raster shadows. Empty editor scenes are valid.
 
 - Vulkan 1.3 device/swapchain, synchronization2, dynamic rendering, timeline
   semaphores, asynchronous uploads, VMA resources, and validation.
 - Render Graph-managed passes, barriers, layouts, and resource ownership.
 - Metallic/roughness PBR, GGX, normal mapping, emissive materials, HDR IBL,
-  exposure, ACES-fit tone mapping, and certified single-level bloom.
+  exposure, a shared real-time AgX display transform, and certified single-level bloom.
 - GPU-driven projected-size LOD, meshlets, frustum culling, previous-frame Hi-Z
   occlusion, and indirect-count rendering.
 - TAA, motion vectors, contrast-adaptive history weighting, presentation-only
@@ -37,6 +60,59 @@ fallback contracts.
   regressions.
 - One shadow-casting sun with three GPU-culled 2048x2048 cascades, 3x3 PCF,
   stable centers, and alpha-cutout shadows.
+- Bruneton's precomputed Earth atmosphere now drives the shared raster/path sky
+  and Sun. It supports the original nine demo views, interactive Sun placement,
+  astronomical day/night playback, and automatic procedural stars/Milky Way.
+  A 24-step spherical-shell cloud marcher with four-step self-shadowing updates
+  a shared 512x256 RGBA32F environment cache; alpha carries Sun transmittance so
+  clouds cover the disk and attenuate raster/path direct sunlight. The cache
+  follows wind in real time and costs about 1.7-2.0 ms on the RTX 2060 SUPER.
+  NanoVDB remains the planned imported/local sparse-volume representation, not
+  the planet-scale weather-cloud implementation.
+- Camera-local rain is available through `--rain on` and
+  `--rain-intensity 0..1`. `--wind-speed 0..75` and
+  `--wind-direction DEGREES` drive one horizontal wind shared with the clouds;
+  direction 0 is world +X and 90 is world +Z. Six irregular distance layers produce depth-tested analytic
+  streaks after temporal reconstruction and tone mapping, keeping rain out of
+  TAA/DLSS/Ray Reconstruction history. Rain falls at 24 m/s in a
+  wind-independent monotonic phase; smooth low-frequency gusts and per-layer
+  variation change streak slant without ever making drops move upward.
+  `--demo weather` runs a continuous 90-second drizzle/downpour/storm/clearing
+  showcase with intensity 0-1, wind 3-32 m/s, and a smoothly rotating direction;
+  the zero-rain interval raises low analytic steam while accumulated wetness
+  evaporates. `--weather-cycle-seconds 12..300` changes its duration.
+  Rain, ground-contact, and ripple colors also follow Sun elevation: nighttime
+  values are faint cool reflections rather than a fixed bright multiplier, while
+  the established daylight response is unchanged.
+  Weather materials share three persistent responses between raster and RTX
+  closest-hit shading. `rainReceiver` grows stable splash-sized dark spots that
+  deepen through repeated analytic deposits and add darkness where they overlap,
+  forming a damp surface before bounded glossy puddles appear. No uniform
+  completion blend or synchronized spot expansion is used; newly arriving
+  rain-impact marks close the last dry gaps through short staggered deposit
+  events, with no independent whole-ground damp-opacity ramp or hard saturation
+  clamp. Mature neighbouring cells overlap so dry pixels cannot survive the
+  impact phase. Impact dampness completes by reservoir 0.72; each raster fragment
+  and RTX closest hit then gates pooling from its final local damp value. The full
+  future puddle footprint darkens while matte through 0.84. Glossy water begins
+  at basin peaks at 0.86 and slowly expands through 1.0. Accumulation is capped
+  at 0.025 per second so the late matte and glossy stages each remain visible for
+  several seconds in the 90-second demo. Evaporation is 0.033 per second, making
+  the full drying sequence about 30 seconds at maximum saturation. The opt-in
+  `wetCoat` role grows from patches into a continuous glossy film for roads,
+  vehicle paint, grills, and similar surfaces. A session reservoir drives each
+  fixed world-space layer; the sphere matrix previews wet coat while the ground
+  previews dampness plus puddles.
+  The composite samples depth plus world normals
+  for short-lived, perspective-correct contact ripples on upward-facing surfaces.
+  The combined streak/impact pass measured about 0.33 ms at 1280x720 on the RTX
+  2060 SUPER with DLSS Ray Reconstruction. The damp spots are an analytic
+  impact pattern; simulated per-drop deposition, drainage, and saved wetness
+  state remain deferred.
+  The dirt ground's 4K displacement source currently drives a stronger derived
+  normal (38.4 gradient scale, 1.15 material normal strength). The 100 km ground
+  remains two triangles, so true geometric/RT displacement is still a separate
+  near-field geometry/intersection task.
 - Honest Vulkan RT capability/device policy, a deterministic RT scene planner,
   static BLAS/TLAS ownership/build code, and synchronized per-frame TLAS
   updates validated on RTX hardware.
@@ -90,11 +166,11 @@ fallback contracts.
   SUPER reports both features supported and executes the graph as `TLAS update
   -> noisy path tracing -> NVIDIA DLSS Ray Reconstruction -> tone mapping ->
   Present`.
-- NVIDIA NRD RELAX remains the portable path-denoiser mode. Ray Reconstruction
+- NVIDIA NRD RELAX remains the renderer-owned diagnostic path-denoiser mode. Ray Reconstruction
   bypasses the local temporal, spatial, and NRD stack so histories have one
-  owner. Path-traced presentation preserves additional shadow latitude without
-  changing the linear transport buffers, and recursive transport no longer
-  multiplies baked glTF AO into traced visibility.
+  owner. Raster and path-traced presentation now share AgX for highlight rolloff,
+  hue retention, and shadow latitude without changing linear transport buffers;
+  recursive transport no longer multiplies baked glTF AO into traced visibility.
 
 ## Concrete Progress Numbers
 
@@ -114,6 +190,9 @@ These are tested examples, not final engine maximums:
 | GPU scene scale-test instances | 32,768 |
 | GPU LOD/meshlet work candidates | 262,144 |
 | Shadow-casting lights | 1 directional sun |
+| Dynamic atmosphere/cloud environment | 512x256 RGBA32F |
+| Cloud view/light march | 24 / 4 steps |
+| RTX 2060 dynamic cloud cache | 1.7-2.0 ms |
 | Raster shadow maps when selected | 3 x 2048x2048 D32 |
 | Ray-query directional-shadow on/off RMSE | 0.0467753439165 |
 | Ray-query alpha-shadow on/off RMSE | 0.0175814992413 |
@@ -301,7 +380,8 @@ Validated on NVIDIA RTX 2060 Super 8 GB with driver 595.84:
 
 Implemented and tested:
 
-- `--ray-tracing off|auto|required` and complete optional-device policy.
+- `--ray-tracing off|auto|required` and complete internal capability policy;
+  the supported product target itself remains RTX-only.
 - Whole primitive/LOD ranges retained alongside raster meshlets.
 - One static BLAS plan per reusable primitive group and one TLAS instance per
   rendered object.
@@ -350,7 +430,8 @@ the delta is the defensible effect measurement; it is not presented as a
 standalone traversal timestamp. `tools/validate_ray_query_timings.sh` reproduces
 the gate and writes both raw reports plus a summary.
 
-Raster shadows remain the certified portable and blended-material backend.
+Raster shadows remain the certified reference and blended-material backend;
+they are not a non-RTX product-support path.
 
 ## Progressive Path-Tracing Slice
 
@@ -524,6 +605,25 @@ Not working yet:
 
 ## Latest Windows RTX / Ray Reconstruction Checkpoint
 
+### 2026-08-31 atmosphere, clouds, and stars update
+
+- Procedural planetary clouds, wind animation, cloud-aware sunlight, and the
+  automatic night sky are live in both raster and path modes. Default cloud
+  coverage/density are 0.42/0.8; CLI overrides are `--clouds`,
+  `--cloud-coverage`, and `--cloud-density`.
+- The dynamic environment image must retain `VK_IMAGE_USAGE_STORAGE_BIT` when
+  atmosphere is enabled. Its first sampled-to-storage transition waits for the
+  asynchronous startup upload; removing either rule causes invalid/no cloud
+  cache writes or a transfer/graphics layout-transition hazard.
+- Release CTest passes 20/20. A validated 640x360 raster atmosphere run is clean.
+  The bounded 1280x720 Sponza/DLSS Quality/Ray Reconstruction run measured
+  1.78 ms cloud cache, 16.29 ms path tracing, and 8.69 ms Ray Reconstruction on
+  the RTX 2060 SUPER.
+- The user's Fluid Ninja-style clone is a useful later reference for local
+  smoke/fire fields, but it is a 2D stable-fluid field lofted for volume
+  rendering and is intentionally not used for planet-scale clouds. NanoVDB is
+  deferred until imported/simulated sparse local volumes are implemented.
+
 This is the exact state at the end of the 2026-08-29 Windows session:
 
 - GitHub `main` and local `main` both point to `b312d7a1e74a78fa32eae4ad7d99e0a0e1d29c9f`
@@ -568,10 +668,11 @@ Exact command used for that accepted run:
   the floor, arches, cloth, and walls. The real presentation problem was the
   compact ACES fit crushing valid low radiance when bright sun patches were in
   the same SDR image.
-- `rendererPathTracedDisplayFitted` now preserves about three additional stops
-  of deep-shadow latitude with an exponential falloff that leaves sunlight on
-  the normal ACES shoulder. This is a path-presentation transform only; raw
-  scene-linear buffers remain unchanged.
+- Production presentation now uses the same logarithmic AgX display transform
+  for raster and path output. It replaces the path-only shadow boost, retains
+  color separation through bright skies and wet reflections, and leaves raw
+  scene-linear buffers unchanged. The compact ACES fit remains only for isolated
+  diagnostic views.
 - The path hit shader no longer multiplies glTF baked ambient occlusion into
   environment or recursive throughput. Ray visibility already accounts for
   occlusion; repeated AO multiplication would bias physical transport darker.
@@ -627,9 +728,10 @@ important indirect light sampled consistently before Ray Reconstruction.
 6. Then expand materials and lighting: transmission/glass, additional punctual
    lights, stronger emissive coverage, and animated/deforming scene tests.
 
-Keep the portable NRD/reference paths as diagnostic controls, but optimize and
+Keep the NRD/reference paths as diagnostic controls, but optimize and
 validate the RTX/Ray Reconstruction graph first. The immediate continuation is
-step 1, not backend sharpening or a cross-vendor adapter.
+step 1, beginning with deterministic Sponza motion/quality gates before enabling
+another reuse implementation.
 
 ## Clone, Build, and Test
 
@@ -706,10 +808,12 @@ a deliberate change requiring corresponding test/provenance review.
 - The current finest-LOD BLAS policy is a baseline, not permanent RT LOD.
 - Bloom's current one-level implementation is a certified baseline; public
   `radius` and `intensity` remain future-pyramid compatible.
-- CBT is the planned terrain refinement architecture. Mesh shaders are only an
-  optional backend. Terrain remains planning-only.
-- Raster operation on Intel, AMD, and NVIDIA must not depend on optional RT or
-  mesh-shader support.
+- A six-face cube sphere with crack-free Concurrent Binary Tree refinement is
+  the planned planetary-terrain architecture. Mesh shaders are only an optional
+  backend. Terrain remains planning-only while cloud work is active.
+- NVIDIA RTX capability is the mandatory product baseline. Raster paths remain
+  useful for material techniques and diagnostic comparison, not as support for
+  non-RTX hardware.
 
 ## Primary Documents
 
@@ -717,8 +821,8 @@ a deliberate change requiring corresponding test/provenance review.
 - `ARCHITECTURE.md`: ownership, pass order, synchronization, post stack,
   shadows, RT foundation, and future terrain compatibility.
 - `PBRT_PROVENANCE.md`: PBRT-derived concepts and reviewed revisions.
-- `GPU_VENDOR_LIBRARIES.md`: optional vendor SDK candidates and the
-  renderer-owned interface/fallback rules that govern future evaluations.
+- `GPU_VENDOR_LIBRARIES.md`: NVIDIA RTX SDK candidates, non-product research
+  references, and the renderer-owned ownership rules governing integrations.
 
 Always distinguish:
 

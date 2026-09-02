@@ -47,6 +47,9 @@ struct GraphicsPipelineCreateInfo {
     // The renderer uses counter-clockwise mesh winding and flips projection Y
     // for Vulkan clip space, preserving CCW front faces in framebuffer space.
     VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    float lineWidth = 1.0F;
+    bool alphaBlendEnable = false;
     VkPipelineCache cache = VK_NULL_HANDLE;
     std::span<const VkDescriptorSetLayout> descriptorSetLayouts{};
     std::span<const VkPushConstantRange> pushConstantRanges{};

@@ -9,6 +9,11 @@
 const float PBR_PI = 3.14159265358979323846;
 const float PBR_MIN_ALPHA = 1.0e-4;
 
+vec4 effectiveGltfBaseColor(vec4 factor, vec4 textureSample, vec4 vertexColor)
+{
+    return clamp(factor * textureSample * vertexColor, vec4(0.0), vec4(1.0));
+}
+
 float pow5(float value)
 {
     float squared = value * value;

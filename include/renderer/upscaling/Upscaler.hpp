@@ -19,7 +19,10 @@ enum class JitterConvention { renderPixelOffsets };
 enum class ExposureConvention { linearMultiplier };
 
 inline constexpr float minimumSpatialRenderScale = 0.5F;
-inline constexpr float maximumSpatialRenderScale = 1.0F;
+// The color-only spatial pass also resolves supersampling. A scale above one traces more
+// pixels than the SDL swapchain and downsamples them into the smaller interactive window.
+inline constexpr float maximumSpatialRenderScale = 2.0F;
+inline constexpr float maximumUpscalingRenderScale = 1.0F;
 inline constexpr float qualitySpatialRenderScale = 2.0F / 3.0F;
 inline constexpr float balancedSpatialRenderScale = 10.0F / 17.0F;
 inline constexpr float performanceSpatialRenderScale = 0.5F;

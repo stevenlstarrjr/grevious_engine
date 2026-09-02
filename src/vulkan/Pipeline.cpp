@@ -132,7 +132,7 @@ GraphicsPipeline::GraphicsPipeline(const Device& device,
     };
     const VkPipelineInputAssemblyStateCreateInfo inputAssembly{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .topology = createInfo.topology,
     };
     const VkPipelineViewportStateCreateInfo viewportState{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -147,14 +147,20 @@ GraphicsPipeline::GraphicsPipeline(const Device& device,
         .depthBiasEnable = createInfo.depthBiasEnable,
         .depthBiasConstantFactor = createInfo.depthBiasConstantFactor,
         .depthBiasSlopeFactor = createInfo.depthBiasSlopeFactor,
-        .lineWidth = 1.0F,
+        .lineWidth = createInfo.lineWidth,
     };
     const VkPipelineMultisampleStateCreateInfo multisample{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
     };
     const VkPipelineColorBlendAttachmentState colorAttachment{
-        .blendEnable = VK_FALSE,
+        .blendEnable = createInfo.alphaBlendEnable,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
     };

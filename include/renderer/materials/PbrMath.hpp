@@ -1,6 +1,7 @@
 #pragma once
 
 #include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
 
 #include <optional>
 
@@ -17,6 +18,13 @@ struct MetallicRoughnessBsdfSample {
     glm::vec3 throughput{0.0F};
     float pdf = 0.0F;
 };
+
+// glTF effective base color is the component-wise product of the material
+// factor, sampled base-color texture, and linear COLOR_0 value. Missing
+// textures and vertex colors are represented by white.
+[[nodiscard]] glm::vec4 effectiveGltfBaseColor(const glm::vec4& factor,
+                                               const glm::vec4& textureSample,
+                                               const glm::vec4& vertexColor);
 
 // glTF stores perceptual roughness. Its isotropic GGX alpha is roughness^2;
 // this is intentionally distinct from PBRT's legacy scene-parameter remap.

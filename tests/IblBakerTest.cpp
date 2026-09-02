@@ -1,6 +1,8 @@
+#include "renderer/lighting/Atmosphere.hpp"
 #include "renderer/lighting/IblBaker.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <numbers>
@@ -30,6 +32,14 @@ float luminanceVariance(const renderer::lighting::FloatImage& image) {
     }
     const double mean = sum / static_cast<double>(count);
     return static_cast<float>(squaredSum / static_cast<double>(count) - mean * mean);
+}
+
+float luminanceAt(const renderer::lighting::FloatImage& image, std::uint32_t x,
+                  std::uint32_t y) {
+    const std::size_t offset =
+        (static_cast<std::size_t>(y) * image.width + x) * image.channels;
+    return 0.2126F * image.texels[offset] + 0.7152F * image.texels[offset + 1U] +
+           0.0722F * image.texels[offset + 2U];
 }
 
 void verifyAliasDistribution(
@@ -65,6 +75,84 @@ void verifyAliasDistribution(
 int main() {
     try {
         namespace rl = renderer::lighting;
+        const rl::TimeOfDaySunSettings equinox{
+            .latitudeDegrees = 0.0F,
+            .dayOfYear = 81U,
+        };
+        const glm::vec3 noonSun = rl::timeOfDaySunDirection(12.0F, equinox);
+        const glm::vec3 midnightSun = rl::timeOfDaySunDirection(0.0F, equinox);
+        const glm::vec3 sunriseSun = rl::timeOfDaySunDirection(6.0F, equinox);
+        const glm::vec3 sunsetSun = rl::timeOfDaySunDirection(18.0F, equinox);
+        require(noonSun.z > 0.999F && midnightSun.z < -0.999F,
+                "Equatorial equinox Sun did not cross the zenith and nadir");
+        require(sunriseSun.x > 0.999F && std::abs(sunriseSun.z) < 1.0e-4F &&
+                    sunsetSun.x < -0.999F && std::abs(sunsetSun.z) < 1.0e-4F,
+                "Equatorial equinox sunrise or sunset direction is incorrect");
+
+        const rl::TimeOfDaySunSettings summer{};
+        constexpr std::array<float, 6> testHours{0.0F, 6.0F, 9.25F,
+                                                 12.0F, 18.0F, 23.75F};
+        for (const float hour : testHours) {
+            const glm::vec3 direction = rl::timeOfDaySunDirection(hour, summer);
+            const float recovered = rl::timeOfDayHourFromSunDirection(direction, summer);
+            const float difference =
+                std::abs(std::remainder(recovered - hour, 24.0F));
+            require(std::abs(glm::length(direction) - 1.0F) < 1.0e-5F &&
+                        difference < 1.0e-3F,
+                    "Time-of-day Sun direction failed its hour round trip");
+        }
+        rl::AtmosphereDemoView advancingView{};
+        rl::applyTimeOfDaySun(advancingView, 10.0F, summer);
+        rl::advanceTimeOfDaySun(advancingView, 2.0F, summer);
+        require(glm::dot(rl::atmosphereDemoSunDirection(advancingView),
+                         rl::timeOfDaySunDirection(12.0F, summer)) > 0.99999F,
+                "Incremental time-of-day Sun motion diverged from the astronomical path");
+
+        const rl::AtmosphereDemoView surfaceView = rl::atmosphereDemoPreset(1U);
+        rl::AtmosphereDemoView smoothSunView = surfaceView;
+        smoothSunView.sunAzimuthAngleRadians +=
+            std::numbers::pi_v<float> / 180.0F;
+        require(!rl::atmosphereHistoryResetRequired(surfaceView, smoothSunView),
+                "Smooth Sun motion incorrectly requires a history reset");
+        require(rl::atmosphereHistoryResetRequired(
+                    surfaceView, rl::atmosphereDemoPreset(8U)),
+                "Surface-to-orbit transition did not require a history reset");
+        rl::AtmosphereDemoView exposureJump = surfaceView;
+        exposureJump.exposure *= 4.0F;
+        require(rl::atmosphereHistoryResetRequired(surfaceView, exposureJump),
+                "Large atmosphere exposure change did not require a history reset");
+
+        rl::AtmosphereSettings atmosphereSettings;
+        atmosphereSettings.environmentWidth = 64;
+        atmosphereSettings.environmentHeight = 32;
+        atmosphereSettings.clouds.enabled = true;
+        const rl::FloatImage atmosphere =
+            rl::makePrecomputedAtmosphereEnvironment(atmosphereSettings);
+        require(atmosphere.valid(), "Precomputed atmosphere environment is invalid");
+        for (const float value : atmosphere.texels) {
+            require(std::isfinite(value) && value >= 0.0F,
+                    "Precomputed atmosphere contains invalid radiance");
+        }
+        const float zenithLuminance = luminanceAt(atmosphere, 32U, 0U);
+        const float horizonLuminance = luminanceAt(atmosphere, 32U, 15U);
+        require(zenithLuminance > 0.0F && horizonLuminance > 0.0F,
+                "Precomputed atmosphere lost sky radiance");
+        require(luminanceVariance(atmosphere) > 1.0e-5F,
+                "Precomputed atmosphere lost directional scattering variation");
+
+        rl::AtmosphereSettings invalidCloudAtmosphere = atmosphereSettings;
+        invalidCloudAtmosphere.clouds.thicknessMeters =
+            invalidCloudAtmosphere.topRadiusMeters -
+            invalidCloudAtmosphere.bottomRadiusMeters;
+        bool rejectedInvalidClouds = false;
+        try {
+            (void)rl::makePrecomputedAtmosphereEnvironment(invalidCloudAtmosphere);
+        } catch (const std::runtime_error&) {
+            rejectedInvalidClouds = true;
+        }
+        require(rejectedInvalidClouds,
+                "Atmosphere accepted a cloud shell outside its physical extent");
+
         rl::FloatImage environment = rl::makeProceduralStudioEnvironment(64, 32);
         require(environment.valid() &&
                     *std::max_element(environment.texels.begin(), environment.texels.end()) >

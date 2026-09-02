@@ -2,9 +2,16 @@
 
 ## Purpose
 
-This document catalogs NVIDIA, AMD, and Intel graphics/rendering libraries and SDKs that may be useful to Genesis Render, a Linux/Wayland Vulkan renderer. Vendor technologies should remain optional components behind renderer-owned interfaces rather than becoming architectural foundations.
+This document catalogs NVIDIA graphics/rendering libraries that may be used by
+Genesis Render and AMD/Intel techniques that may still be useful as research
+references. Genesis supports **NVIDIA RTX-capable graphics cards only**; AMD,
+Intel, integrated, and software Vulkan devices are not product targets.
 
-Genesis Render should continue to use Vulkan as the common low-level graphics API, retain a portable raster path, and provide fallbacks when vendor-specific features are unavailable.
+Vulkan remains the renderer's low-level graphics API. NVIDIA-specific RTX,
+DLSS/Ray Reconstruction, CUDA, profiling, latency, and simulation technologies
+are valid first-class implementation choices. Renderer-owned interfaces still
+define resource ownership and synchronization so SDK integrations do not leak
+uncontrolled lifetimes into the render graph.
 
 ---
 
@@ -19,7 +26,7 @@ Genesis Render should continue to use Vulkan as the common low-level graphics AP
 | **NVIDIA Reflex** | Reduces system/input latency | Future latency subsystem | Later |
 | **Streamline** | Framework for integrating supported rendering features | Evaluate as an integration option where Linux/Vulkan support fits | Evaluate |
 | **Nsight Graphics** | GPU debugging, frame inspection, shader/performance analysis | Development and profiling | High |
-| **Vulkan RTX extensions/features** | Hardware ray tracing and related GPU capabilities | BLAS/TLAS, ray queries, ray pipelines | Already in use / core optional path |
+| **Vulkan RTX extensions/features** | Hardware ray tracing and related GPU capabilities | BLAS/TLAS, ray queries, ray pipelines | Already in use / mandatory platform path |
 
 ### NVIDIA integration direction
 
@@ -39,6 +46,9 @@ NRD is particularly relevant once Genesis Render begins using very low ray count
 ---
 
 ## AMD / GPUOpen
+
+The following entries are research or algorithm references only. They do not
+represent AMD hardware support goals.
 
 | Library / SDK | Purpose | Potential Genesis Render Use | Priority |
 |---|---|---|---|
@@ -78,6 +88,9 @@ Radeon Rays likewise should not replace Genesis Render's native Vulkan accelerat
 ---
 
 ## Intel
+
+The following entries are research, CPU tooling, or historical validation
+references only. They do not represent Intel GPU support goals.
 
 | Library / SDK | Purpose | Potential Genesis Render Use | Priority |
 |---|---|---|---|
@@ -237,19 +250,20 @@ Do not require any vendor latency provider for normal rendering.
 
 ## Suggested Evaluation Order
 
-1. **AMD SPD** — directly relevant to existing hierarchical image operations such as Hi-Z and future bloom pyramids.
-2. **FSR + XeSS + DLSS** — validate the `IUpscaler` abstraction against three genuinely different implementations.
-3. **NVIDIA NRD + FidelityFX Denoiser** — evaluate when low-sample RT effects expand beyond hard ray-query shadows.
-4. **Intel OIDN** — add alongside the experimental progressive path tracer.
-5. **Nsight / Radeon GPU tools / Intel profiling tools** — establish comparable performance-analysis workflows across vendors.
-6. **Ray Reconstruction / frame generation / latency technologies** — add only after the basic temporal-upscaling and RT pipelines are mature.
-7. **Brixelizer GI / Open PGL / advanced vendor research libraries** — investigate as the GI and path-tracing architecture evolves.
+1. **DLSS Super Resolution and Ray Reconstruction** — production reconstruction path on the supported RTX hardware floor.
+2. **Nsight Graphics and NVIDIA profiling tools** — establish repeatable RTX performance and correctness gates.
+3. **NVIDIA NRD** — retain as a renderer-owned diagnostic/control denoiser where useful.
+4. **Reflex, frame generation, and latency technologies** — evaluate after the core rendering and frame-time telemetry are mature.
+5. **CUDA/PhysX/Flow interoperability** — evaluate for measured simulation workloads with explicit Vulkan synchronization and shared-resource ownership.
+6. **AMD/Intel algorithms and research libraries** — study only where the technique is useful; they are not product backends.
 
 ---
 
 ## Core Rule
 
-Vendor SDKs should accelerate or improve Genesis Render; they should not define Genesis Render.
+The NVIDIA RTX platform defines the supported hardware floor. External SDKs may
+accelerate or improve Genesis Render, while Genesis continues to own its engine
+contracts and resource lifetimes.
 
 ```text
 Genesis Render owns:
@@ -260,11 +274,11 @@ Genesis Render owns:
     Temporal contracts
     Resource ownership
     Vulkan device/runtime
-    Raster fallback
+    Raster material/reference paths
     RT policy
     Public renderer interfaces
 
-Vendors provide optional implementations:
+NVIDIA SDKs provide platform implementations:
     Upscaling
     Denoising
     Frame generation
@@ -273,4 +287,5 @@ Vendors provide optional implementations:
     Profiling/debugging tools
 ```
 
-This keeps the renderer functional across AMD, NVIDIA, Intel, and conforming Vulkan/Mesa implementations while still allowing each GPU family to expose its strongest optional capabilities.
+This keeps NVIDIA-specific optimization compatible with the renderer's explicit
+ownership model without implying support for non-RTX hardware.

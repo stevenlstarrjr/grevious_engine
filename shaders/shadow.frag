@@ -20,6 +20,7 @@ layout(set = 1, binding = 0) uniform sampler2D materialTextures[];
 layout(location = 0) in vec2 uv;
 layout(location = 1) in vec2 uv1;
 layout(location = 2) in flat uint materialIndex;
+layout(location = 3) in vec4 vertexColor;
 
 const uint BASE_COLOR_TEXTURE_BIT = 1u << 0u;
 const uint ALPHA_MASK_MATERIAL_BIT = 1u << 0u;
@@ -31,7 +32,7 @@ void main()
         return;
     }
 
-    float alpha = material.baseColorFactor.a;
+    float alpha = material.baseColorFactor.a * vertexColor.a;
     if ((material.textureState.y & BASE_COLOR_TEXTURE_BIT) != 0u) {
         vec2 baseColorUv =
             (material.textureState.w & BASE_COLOR_TEXTURE_BIT) != 0u ? uv1 : uv;

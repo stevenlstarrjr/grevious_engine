@@ -203,6 +203,20 @@ void testExposureAndToneMapping() {
     require(acesFitted(glm::vec3{0.0F}) == glm::vec3{0.0F}, "ACES black is not black");
     const glm::vec3 color = acesFitted(glm::vec3{0.25F, 1.0F, 4.0F});
     require(color.r < color.g && color.g < color.b, "ACES fit unexpectedly inverted color order");
+
+    previous = glm::vec3{-1.0F};
+    for (const float value :
+         std::array{0.0F, 1.0e-6F, 0.01F, 0.18F, 1.0F, 4.0F, 64.0F, 65504.0F}) {
+        const glm::vec3 mapped = agxToneMap(glm::vec3{value});
+        require(std::isfinite(mapped.r) && mapped.r >= 0.0F && mapped.r <= 1.0F,
+                "AgX produced invalid output");
+        require(mapped.r >= previous.r, "AgX is non-monotonic");
+        previous = mapped;
+    }
+    require(agxToneMap(glm::vec3{0.0F}) == glm::vec3{0.0F}, "AgX black is not black");
+    const glm::vec3 agxColor = agxToneMap(glm::vec3{0.25F, 1.0F, 4.0F});
+    require(agxColor.r < agxColor.g && agxColor.g < agxColor.b,
+            "AgX unexpectedly inverted color order");
     for (const float ev : {-4.0F, -2.0F, 0.0F, 2.0F, 4.0F}) {
         const glm::vec3 result = compositeToneMap(glm::vec3{4.0F}, glm::vec3{2.0F}, ev);
         require(std::isfinite(result.r), "exposure/tone-map chain is non-finite");

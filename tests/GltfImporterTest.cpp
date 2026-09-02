@@ -106,6 +106,25 @@ void testEmissiveStrength() {
             "KHR_materials_emissive_strength was not applied to the emissive factor");
 }
 
+void testVertexColors() {
+    const rs::Scene scene =
+        ra::importGltf(sample("Models/BoxVertexColors/glTF/BoxVertexColors.gltf"));
+    require(scene.validate().ok(), scene.validate().describe());
+    require(scene.primitives().size() == 1U,
+            "BoxVertexColors did not import exactly one primitive");
+    const rs::MeshPrimitive& primitive = scene.primitives().front();
+    require(primitive.colors.size() == primitive.positions.size() &&
+                primitive.colors.size() == 24U,
+            "COLOR_0 did not retain one value per imported vertex");
+    bool foundNonWhite = false;
+    for (const glm::vec4& color : primitive.colors) {
+        foundNonWhite = foundNonWhite || color != glm::vec4(1.0F);
+        require(close(color.a, 1.0F),
+                "VEC3 COLOR_0 did not receive the required default alpha of one");
+    }
+    require(foundNonWhite, "Imported COLOR_0 values were replaced by the white default");
+}
+
 void testPolicyFailuresAreActionable() {
     ra::GltfImportOptions smallSource;
     smallSource.limits.maxSourceFileBytes = 32;
@@ -156,6 +175,7 @@ int main() {
         testBinaryTexturedBox();
         testMetallicRoughnessMaterialGrid();
         testEmissiveStrength();
+        testVertexColors();
         testPolicyFailuresAreActionable();
         return 0;
     } catch (const std::exception& error) {

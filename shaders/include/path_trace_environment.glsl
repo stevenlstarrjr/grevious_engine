@@ -22,6 +22,22 @@ struct PathEnvironmentSample
     float pdf;
 };
 
+vec3 samplePathEnvironmentCone(inout uint state, vec3 axis, float angularRadius)
+{
+    if (angularRadius <= 0.0) {
+        return axis;
+    }
+    float cosineTheta = mix(1.0, cos(angularRadius), pathTraceRandom(state));
+    float sineTheta = sqrt(max(1.0 - cosineTheta * cosineTheta, 0.0));
+    float phi = 2.0 * PATH_TRACE_PI * pathTraceRandom(state);
+    vec3 reference = abs(axis.y) < 0.999 ? vec3(0.0, 1.0, 0.0)
+                                         : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(reference, axis));
+    vec3 bitangent = cross(axis, tangent);
+    return normalize(axis * cosineTheta +
+                     (tangent * cos(phi) + bitangent * sin(phi)) * sineTheta);
+}
+
 float pathEnvironmentTexelSolidAngle(uint row, uint width, uint height)
 {
     float theta0 = PATH_TRACE_PI * float(row) / float(height);
@@ -49,7 +65,9 @@ float pathEnvironmentPdf(vec3 worldDirection, float rotation, bool importanceSam
 }
 
 PathEnvironmentSample samplePathEnvironment(inout uint state, float rotation,
-                                            bool importanceSampling)
+                                            bool importanceSampling,
+                                            float shadowAngularRadius,
+                                            bool dynamicAtmosphereEnvironment)
 {
     ivec2 dimensions = textureSize(environmentMap, 0);
     uint width = uint(dimensions.x);
@@ -83,8 +101,16 @@ PathEnvironmentSample samplePathEnvironment(inout uint state, float rotation,
     float solidAngle = pathEnvironmentTexelSolidAngle(y, width, height);
 
     PathEnvironmentSample result;
-    result.direction = normalize(rotateEnvironmentDirection(textureDirection, -rotation));
-    result.radiance = max(textureLod(environmentMap, uv, 0.0).rgb, vec3(0.0));
+    vec3 sourceDirection = normalize(rotateEnvironmentDirection(textureDirection, -rotation));
+    // Sampling a finite cone around the selected HDR texel convolves the lighting source while
+    // retaining its total energy. The unblurred environment remains available to camera and
+    // reflection rays, so this changes penumbra width rather than background sharpness.
+    result.direction = samplePathEnvironmentCone(state, sourceDirection, shadowAngularRadius);
+    vec2 radianceUv = dynamicAtmosphereEnvironment
+                          ? directionToDualParaboloidUv(sourceDirection)
+                          : uv;
+    result.radiance = max(textureLod(environmentMap, radianceUv, 0.0).rgb,
+                          vec3(0.0));
     result.pdf = importanceSampling
                      ? (solidAngle > 0.0
                             ? max(environmentAliasEntries[selected].probabilityMass /

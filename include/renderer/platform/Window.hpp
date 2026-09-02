@@ -1,36 +1,16 @@
 #pragma once
 
-#include <volk.h>
+#include "renderer/platform/RenderSurface.hpp"
 
 #include <cstdint>
 #include <string_view>
-#include <utility>
-#include <vector>
 
 struct SDL_Window;
 union SDL_Event;
 
 namespace renderer::platform {
 
-// Renderer-demo controls only. This plain snapshot keeps SDL types out of the
-// renderer and does not establish a game-input subsystem.
-struct RendererInput {
-    bool moveForward = false;
-    bool moveBackward = false;
-    bool moveLeft = false;
-    bool moveRight = false;
-    bool moveUp = false;
-    bool moveDown = false;
-    bool speedBoost = false;
-    bool resetCamera = false;
-    bool rotateEnvironmentLeft = false;
-    bool rotateEnvironmentRight = false;
-    bool mouseLookActive = false;
-    float mouseDeltaX = 0.0F;
-    float mouseDeltaY = 0.0F;
-};
-
-class Window final {
+class Window final : public RenderSurface {
   public:
     Window(std::uint32_t width, std::uint32_t height, std::string_view title);
     ~Window();
@@ -38,15 +18,15 @@ class Window final {
     Window(const Window&) = delete;
     Window& operator=(const Window&) = delete;
 
-    [[nodiscard]] bool shouldClose() const;
+    [[nodiscard]] bool shouldClose() const override;
     void pollEvents();
     void resize(std::uint32_t width, std::uint32_t height);
-    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> waitForDrawableSize();
-    [[nodiscard]] bool consumeFramebufferResize();
-    [[nodiscard]] RendererInput consumeRendererInput();
-    [[nodiscard]] std::vector<const char*> requiredVulkanExtensions() const;
-    [[nodiscard]] VkSurfaceKHR createSurface(VkInstance instance) const;
-    void destroySurface(VkInstance instance, VkSurfaceKHR surface) const;
+    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> waitForDrawableSize() override;
+    [[nodiscard]] bool consumeFramebufferResize() override;
+    [[nodiscard]] RendererInput consumeRendererInput() override;
+    [[nodiscard]] std::vector<const char*> requiredVulkanExtensions() const override;
+    [[nodiscard]] VkSurfaceKHR createSurface(VkInstance instance) const override;
+    void destroySurface(VkInstance instance, VkSurfaceKHR surface) const override;
 
   private:
     void processEvent(const SDL_Event& event);
@@ -56,9 +36,17 @@ class Window final {
     bool closeRequested_ = false;
     bool framebufferResized_ = false;
     bool mouseLookActive_ = false;
+    bool atmosphereSunDragActive_ = false;
     bool resetCameraRequested_ = false;
     float mouseDeltaX_ = 0.0F;
     float mouseDeltaY_ = 0.0F;
+    float atmosphereSunDeltaX_ = 0.0F;
+    float atmosphereSunDeltaY_ = 0.0F;
+    int atmosphereExposureSteps_ = 0;
+    std::uint32_t atmospherePreset_ = 0U;
+    bool timeOfDayToggle_ = false;
+    int timeOfDaySpeedSteps_ = 0;
+    int timeOfDayScrubSteps_ = 0;
 };
 
 } // namespace renderer::platform

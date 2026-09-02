@@ -160,6 +160,85 @@ void testScaleRelativeTransformValidation() {
     require(collapsedRejected, "GPU scene packing accepted a collapsed mesh transform");
 }
 
+renderer::scene::Scene makeVertexColorTriangleScene(bool includeColors) {
+    namespace rs = renderer::scene;
+    rs::Scene source("vertex color triangle");
+    rs::MeshPrimitive primitive;
+    primitive.positions = {{-1.0F, -1.0F, 0.0F}, {1.0F, -1.0F, 0.0F},
+                           {0.0F, 1.0F, 0.0F}};
+    primitive.normals = {{0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F},
+                         {0.0F, 0.0F, 1.0F}};
+    if (includeColors) {
+        primitive.colors = {{1.0F, 0.0F, 0.0F, 0.25F},
+                            {0.0F, 1.0F, 0.0F, 0.50F},
+                            {0.0F, 0.0F, 1.0F, 0.75F}};
+    }
+    primitive.indices = {0U, 1U, 2U};
+    const rs::PrimitiveHandle primitiveHandle = source.addPrimitive(std::move(primitive));
+    const rs::MeshHandle meshHandle = source.addMesh(rs::Mesh{.primitives = {primitiveHandle}});
+    const rs::NodeHandle node = source.addNode(rs::Node{.mesh = meshHandle});
+    source.addRoot(node);
+    return source;
+}
+
+void testVertexColorPackingAndDefault() {
+    using namespace renderer::gpu_scene;
+    const PackedScene colored = packScene(makeVertexColorTriangleScene(true));
+    require(colored.vertices.size() == 3U &&
+                colored.vertices[0].color == glm::vec4(1.0F, 0.0F, 0.0F, 0.25F) &&
+                colored.vertices[1].color == glm::vec4(0.0F, 1.0F, 0.0F, 0.50F) &&
+                colored.vertices[2].color == glm::vec4(0.0F, 0.0F, 1.0F, 0.75F),
+            "GPU scene packing dropped or changed glTF COLOR_0 RGBA");
+
+    const PackedScene uncolored = packScene(makeVertexColorTriangleScene(false));
+    require(uncolored.vertices.size() == 3U &&
+                uncolored.vertices[0].color == glm::vec4(1.0F) &&
+                uncolored.vertices[1].color == glm::vec4(1.0F) &&
+                uncolored.vertices[2].color == glm::vec4(1.0F),
+            "A missing COLOR_0 attribute did not pack as white");
+}
+
+void testOneTextureCanUseDistinctSemanticDescriptors() {
+    namespace rs = renderer::scene;
+    using namespace renderer::gpu_scene;
+    const rs::TextureHandle shared = rs::TextureHandle::fromIndex(0U);
+    rs::Material material;
+    material.baseColorTexture.texture = shared;
+    material.metallicRoughnessTexture.texture = shared;
+    material.normalTexture.texture = shared;
+    material.occlusionTexture.texture = shared;
+    material.emissiveTexture.texture = shared;
+    constexpr std::array<std::uint32_t, 1> baseColor{11U};
+    constexpr std::array<std::uint32_t, 1> metallicRoughness{22U};
+    constexpr std::array<std::uint32_t, 1> normal{33U};
+    constexpr std::array<std::uint32_t, 1> occlusion{44U};
+    constexpr std::array<std::uint32_t, 1> emissive{55U};
+    const MaterialRecord packed = packMaterial(
+        material, MaterialTextureDescriptorTable{
+                      .baseColor = baseColor,
+                      .metallicRoughness = metallicRoughness,
+                      .normal = normal,
+                      .occlusion = occlusion,
+                      .emissive = emissive,
+                  });
+    require(packed.textureIndices == glm::uvec4(11U, 22U, 33U, 44U) &&
+                packed.textureState.x == 55U,
+            "One source texture reused across sRGB, data, and normal roles lost its "
+            "usage-specific descriptors");
+}
+
+void testWeatherMaterialRolesPackIndependently() {
+    namespace rs = renderer::scene;
+    using namespace renderer::gpu_scene;
+    rs::Material material;
+    material.rainReceiver = true;
+    material.wetCoat = true;
+    const MaterialRecord packed = packMaterial(material, std::span<const std::uint32_t>{});
+    require((packed.textureState.z & rainReceiverMaterial) != 0U &&
+                (packed.textureState.z & wetCoatMaterial) != 0U,
+            "Weather material roles were not preserved in GPU material flags");
+}
+
 } // namespace
 
 int main() {
@@ -194,6 +273,9 @@ int main() {
         testMeshletVertexCapacity();
         testEmissiveTriangleDistribution();
         testScaleRelativeTransformValidation();
+        testVertexColorPackingAndDefault();
+        testOneTextureCanUseDistinctSemanticDescriptors();
+        testWeatherMaterialRolesPackIndependently();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -6,7 +6,7 @@
 #include <cstdint>
 
 namespace renderer::platform {
-class Window;
+class RenderSurface;
 }
 
 namespace renderer::vulkan {
@@ -15,7 +15,7 @@ enum class ValidationMode { off, available, required };
 
 class Instance final {
   public:
-    Instance(const platform::Window& window, ValidationMode validationMode,
+    Instance(const platform::RenderSurface& surfaceHost, ValidationMode validationMode,
              PFN_vkGetInstanceProcAddr customGetInstanceProcAddr = nullptr);
     ~Instance();
 
@@ -30,7 +30,7 @@ class Instance final {
     }
 
   private:
-    const platform::Window& window_;
+    const platform::RenderSurface& surfaceHost_;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;

@@ -47,8 +47,15 @@ const uint ALPHA_MASK_MATERIAL_BIT = 1u << 0u;
 
 vec2 vertexUv(uint vertexIndex, bool useUv1)
 {
-    uint firstComponent = vertexIndex * 14u + (useUv1 ? 12u : 6u);
+    uint firstComponent = vertexIndex * 18u + (useUv1 ? 12u : 6u);
     return vec2(vertexData[firstComponent], vertexData[firstComponent + 1u]);
+}
+
+vec4 vertexColor(uint vertexIndex)
+{
+    uint firstComponent = vertexIndex * 18u + 14u;
+    return vec4(vertexData[firstComponent], vertexData[firstComponent + 1u],
+                vertexData[firstComponent + 2u], vertexData[firstComponent + 3u]);
 }
 
 void main()
@@ -59,15 +66,18 @@ void main()
         return;
     }
 
-    float alpha = material.baseColorFactor.a;
+    uvec4 geometry = rayGeometryRanges[instance.meshMaterial.x];
+    uint triangleFirstIndex = geometry.x + gl_PrimitiveID * 3u;
+    uvec3 triangle =
+        uvec3(indices[triangleFirstIndex], indices[triangleFirstIndex + 1u],
+              indices[triangleFirstIndex + 2u]) + geometry.y;
+    vec3 weights = vec3(1.0 - hitBarycentrics.x - hitBarycentrics.y,
+                        hitBarycentrics);
+    vec4 color = vertexColor(triangle.x) * weights.x +
+                 vertexColor(triangle.y) * weights.y +
+                 vertexColor(triangle.z) * weights.z;
+    float alpha = material.baseColorFactor.a * color.a;
     if ((material.textureState.y & BASE_COLOR_TEXTURE_BIT) != 0u) {
-        uvec4 geometry = rayGeometryRanges[instance.meshMaterial.x];
-        uint triangleFirstIndex = geometry.x + gl_PrimitiveID * 3u;
-        uvec3 triangle =
-            uvec3(indices[triangleFirstIndex], indices[triangleFirstIndex + 1u],
-                  indices[triangleFirstIndex + 2u]) + geometry.y;
-        vec3 weights = vec3(1.0 - hitBarycentrics.x - hitBarycentrics.y,
-                            hitBarycentrics);
         bool useUv1 = (material.textureState.w & BASE_COLOR_TEXTURE_BIT) != 0u;
         vec2 uv = vertexUv(triangle.x, useUv1) * weights.x +
                   vertexUv(triangle.y, useUv1) * weights.y +

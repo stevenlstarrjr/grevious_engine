@@ -53,6 +53,23 @@ struct Options {
     std::filesystem::path scenePath;
     bool sceneAnimationStaticPose = false;
     std::filesystem::path environmentPath;
+    bool atmosphereEnabled = false;
+    bool cloudsEnabled = true;
+    float cloudCoverage = 0.42F;
+    float cloudDensity = 1.0F;
+    // Calibrated to begin on a broken-cloud boundary rather than in a uniform
+    // clear or overcast column, making the default demo useful from horizon to
+    // zenith without changing the procedural weather itself.
+    glm::vec2 cloudInitialOffsetKm{72.0F, -15.5F};
+    renderer::CloudDebugView cloudDebugView = renderer::CloudDebugView::final;
+    bool rainEnabled = false;
+    float rainIntensity = 0.65F;
+    // Preserve the established cloud drift while making it the shared
+    // horizontal weather wind used by precipitation as well.
+    float windSpeedMetersPerSecond = 18.0F;
+    float windDirectionDegrees = 14.0F;
+    bool weatherDemoEnabled = false;
+    float weatherDemoCycleSeconds = 90.0F;
     float exposureCompensationEv = 0.0F;
     float environmentRotationDegrees = 0.0F;
     std::filesystem::path capturePath;
@@ -65,11 +82,20 @@ struct Options {
     bool bloomEnabled = true;
     float bloomIntensity = renderer::post::bloomIntensity;
     float bloomRadius = 1.0F;
-    float filmGrainIntensity = 0.015F;
+    float filmGrainIntensity = 0.0F;
     bool emissiveSphereDemo = false;
     bool directionalShadowDemo = false;
     bool hdriBackdropDemo = false;
     bool alphaShadowDemo = false;
+    bool atmosphereDemo = false;
+    std::uint32_t atmosphereCameraPreset = 0U;
+    float atmosphereCameraPitchDegrees = 5.0F;
+    float atmosphereCameraYawDegrees = 0.0F;
+    bool timeOfDayEnabled = false;
+    float timeOfDayHour = 16.0F;
+    float timeOfDayCycleSeconds = 120.0F;
+    float timeOfDayLatitudeDegrees = 35.0F;
+    std::uint32_t timeOfDayDayOfYear = 172U;
     bool shadowsEnabled = true;
     renderer::ray_tracing::Request rayTracingRequest = renderer::ray_tracing::Request::automatic;
     renderer::vulkan::HardwarePolicy hardwarePolicy =
@@ -84,6 +110,7 @@ struct Options {
     float upscalingRenderScale = 1.0F;
     bool upscalingRenderScaleSpecified = false;
     bool pathEnvironmentImportanceSampling = true;
+    float pathShadowAngularRadiusDegrees = 0.5F;
     bool pathEmissiveTriangleSampling = true;
     std::uint32_t pathMaxBounces = renderer::defaultPathBounceCount;
     std::uint32_t pathInteractiveSamples = renderer::defaultPathInteractiveSampleCount;
@@ -160,13 +187,96 @@ float parseFilmGrainIntensity(std::string_view text) {
     return value;
 }
 
+float parseTimeOfDayHour(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.0F || value >= 24.0F) {
+        throw std::runtime_error("--time-hour requires a finite value in [0, 24)");
+    }
+    return value;
+}
+
+std::uint32_t parseAtmosphereCameraPreset(std::string_view text) {
+    std::uint32_t value = 0U;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0U || value > 9U) {
+        throw std::runtime_error("--atmosphere-camera-preset requires an integer in [1, 9]");
+    }
+    return value;
+}
+
+float parseAtmosphereCameraPitch(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < -85.0F || value > 89.0F) {
+        throw std::runtime_error(
+            "--atmosphere-camera-pitch requires finite degrees in [-85, 89]");
+    }
+    return value;
+}
+
+float parseCloudDensity(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.1F || value > 4.0F) {
+        throw std::runtime_error("--cloud-density requires a finite value in [0.1, 4]");
+    }
+    return value;
+}
+
+float parseCloudOffsetCoordinate(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        std::abs(value) > 100'000.0F) {
+        throw std::runtime_error(
+            "--cloud-offset requires two finite kilometer coordinates");
+    }
+    return value;
+}
+
+float parseTimeOfDayCycleSeconds(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 5.0F || value > 86'400.0F) {
+        throw std::runtime_error(
+            "--day-cycle-seconds requires a finite value in [5, 86400]");
+    }
+    return value;
+}
+
+float parseTimeOfDayLatitude(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < -89.9F || value > 89.9F) {
+        throw std::runtime_error(
+            "--time-latitude requires a finite value in [-89.9, 89.9]");
+    }
+    return value;
+}
+
+std::uint32_t parseTimeOfDayDayOfYear(std::string_view text) {
+    std::uint32_t value = 0U;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0U ||
+        value > 365U) {
+        throw std::runtime_error("--time-day-of-year requires an integer in [1, 365]");
+    }
+    return value;
+}
+
 float parseRenderScale(std::string_view text) {
     float value = 0.0F;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
     if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
         value < renderer::upscaling::minimumSpatialRenderScale ||
         value > renderer::upscaling::maximumSpatialRenderScale) {
-        throw std::runtime_error("--render-scale requires a finite value in [0.5, 1.0]");
+        throw std::runtime_error("--render-scale requires a finite value in [0.5, 2.0]");
     }
     return value;
 }
@@ -256,6 +366,47 @@ float parseEnvironmentRotation(std::string_view text) {
     return std::remainder(value, 360.0F);
 }
 
+float parseWindSpeed(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.0F || value > 75.0F) {
+        throw std::runtime_error("--wind-speed requires a finite value in [0, 75] m/s");
+    }
+    return value;
+}
+
+float parseWindDirection(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value)) {
+        throw std::runtime_error("--wind-direction requires a finite angle in degrees");
+    }
+    return value;
+}
+
+float parseWeatherDemoCycleSeconds(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 12.0F || value > 300.0F) {
+        throw std::runtime_error(
+            "--weather-cycle-seconds requires a finite value in [12, 300]");
+    }
+    return value;
+}
+
+float parsePathShadowAngularRadius(std::string_view text) {
+    float value = 0.0F;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0.0F || value > 5.0F) {
+        throw std::runtime_error(
+            "--path-shadow-angular-radius requires finite degrees in [0, 5]");
+    }
+    return value;
+}
+
 std::uint64_t parseFrameCount(std::string_view text) {
     std::uint64_t value = 0;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
@@ -288,7 +439,22 @@ Options parseOptions(int argc, char** argv) {
             std::cout << "Usage: genesis_render [--frames N] "
                          "[--validation off|available|required] "
                          "[--scene PATH] [--scene-animation reject|static-pose] "
-                         "[--environment PATH] [--environment-rotation DEGREES] "
+                         "[--environment PATH | --atmosphere] "
+                         "[--clouds on|off] [--cloud-coverage 0..1] "
+                         "[--cloud-density 0.1..4] "
+                         "[--cloud-offset X_KM Y_KM] "
+                         "[--cloud-debug final|transmittance|shafts] "
+                         "[--rain on|off] [--rain-intensity 0..1] "
+                         "[--wind-speed 0..75] [--wind-direction DEGREES] "
+                         "[--weather-demo on|off] [--weather-cycle-seconds 12..300] "
+                         "[--atmosphere-camera-preset 1..9] "
+                         "[--atmosphere-camera-pitch -85..89] "
+                         "[--atmosphere-camera-yaw DEGREES] "
+                         "[--time-of-day on|off] [--time-hour 0..24) "
+                         "[--day-cycle-seconds 5..86400] "
+                         "[--time-latitude -89.9..89.9] "
+                         "[--time-day-of-year 1..365] "
+                         "[--environment-rotation DEGREES] "
                          "[--exposure-ev STOPS] [--capture PATH] "
                          "[--timing-output PATH] "
                          "[--capture-frame N] [--visibility-mask MASK] "
@@ -301,8 +467,9 @@ Options parseOptions(int argc, char** argv) {
                          "[--render-mode rasterized|path-traced] "
                          "[--upscaler native|spatial|temporal|dlss] "
                          "[--upscaler-quality quality|balanced|performance] "
-                         "[--render-scale 0.5..1.0] "
+                         "[--render-scale 0.5..2.0] "
                          "[--path-environment-sampling importance|uniform] "
+                         "[--path-shadow-angular-radius DEGREES] "
                          "[--path-emissive-sampling on|off] "
                          "[--path-max-bounces 1|2|3|4] "
                          "[--path-interactive-samples 1..8] "
@@ -314,7 +481,7 @@ Options parseOptions(int argc, char** argv) {
                          "[--rt-transform-script none|oscillate] "
                          "[--occlusion-culling on|off] "
                          "[--demo pbr-grid|emissive-sphere|directional-shadow|hdri-backdrop|"
-                         "alpha-shadow] "
+                         "alpha-shadow|atmosphere|weather] "
                          "[--debug-view final|motion|history-validity|bloom|hdr|reactive-mask] "
                          "[--post-test PATTERN] [--post-value LINEAR_HDR] "
                          "[--post-position X Y] "
@@ -449,6 +616,130 @@ Options parseOptions(int argc, char** argv) {
         }
         if (argument == "--bloom-radius" && index + 1 < argc) {
             options.bloomRadius = parseBloomRadius(argv[++index]);
+            continue;
+        }
+        if (argument == "--atmosphere") {
+            options.atmosphereEnabled = true;
+            continue;
+        }
+        if (argument == "--clouds" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.cloudsEnabled = true;
+            } else if (value == "off") {
+                options.cloudsEnabled = false;
+            } else {
+                throw std::runtime_error("--clouds requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--cloud-coverage" && index + 1 < argc) {
+            options.cloudCoverage = parseUnitCoordinate(argv[++index]);
+            continue;
+        }
+        if (argument == "--cloud-density" && index + 1 < argc) {
+            options.cloudDensity = parseCloudDensity(argv[++index]);
+            continue;
+        }
+        if (argument == "--cloud-offset" && index + 2 < argc) {
+            options.cloudInitialOffsetKm = {
+                parseCloudOffsetCoordinate(argv[++index]),
+                parseCloudOffsetCoordinate(argv[++index])};
+            continue;
+        }
+        if (argument == "--cloud-debug" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "final") {
+                options.cloudDebugView = renderer::CloudDebugView::final;
+            } else if (value == "transmittance") {
+                options.cloudDebugView = renderer::CloudDebugView::transmittance;
+            } else if (value == "shafts") {
+                options.cloudDebugView = renderer::CloudDebugView::shafts;
+            } else {
+                throw std::runtime_error(
+                    "--cloud-debug requires final, transmittance, or shafts");
+            }
+            continue;
+        }
+        if (argument == "--rain" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.rainEnabled = true;
+            } else if (value == "off") {
+                options.rainEnabled = false;
+            } else {
+                throw std::runtime_error("--rain requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--rain-intensity" && index + 1 < argc) {
+            options.rainIntensity = parseUnitCoordinate(argv[++index]);
+            continue;
+        }
+        if (argument == "--wind-speed" && index + 1 < argc) {
+            options.windSpeedMetersPerSecond = parseWindSpeed(argv[++index]);
+            continue;
+        }
+        if (argument == "--wind-direction" && index + 1 < argc) {
+            options.windDirectionDegrees = parseWindDirection(argv[++index]);
+            continue;
+        }
+        if (argument == "--weather-demo" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.weatherDemoEnabled = true;
+                options.atmosphereDemo = true;
+                options.atmosphereEnabled = true;
+                options.rainEnabled = true;
+            } else if (value == "off") {
+                options.weatherDemoEnabled = false;
+            } else {
+                throw std::runtime_error("--weather-demo requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--weather-cycle-seconds" && index + 1 < argc) {
+            options.weatherDemoCycleSeconds =
+                parseWeatherDemoCycleSeconds(argv[++index]);
+            continue;
+        }
+        if (argument == "--time-of-day" && index + 1 < argc) {
+            const std::string_view value(argv[++index]);
+            if (value == "on") {
+                options.timeOfDayEnabled = true;
+            } else if (value == "off") {
+                options.timeOfDayEnabled = false;
+            } else {
+                throw std::runtime_error("--time-of-day requires on or off");
+            }
+            continue;
+        }
+        if (argument == "--atmosphere-camera-preset" && index + 1 < argc) {
+            options.atmosphereCameraPreset = parseAtmosphereCameraPreset(argv[++index]);
+            continue;
+        }
+        if (argument == "--atmosphere-camera-pitch" && index + 1 < argc) {
+            options.atmosphereCameraPitchDegrees = parseAtmosphereCameraPitch(argv[++index]);
+            continue;
+        }
+        if (argument == "--atmosphere-camera-yaw" && index + 1 < argc) {
+            options.atmosphereCameraYawDegrees = parseEnvironmentRotation(argv[++index]);
+            continue;
+        }
+        if (argument == "--time-hour" && index + 1 < argc) {
+            options.timeOfDayHour = parseTimeOfDayHour(argv[++index]);
+            continue;
+        }
+        if (argument == "--day-cycle-seconds" && index + 1 < argc) {
+            options.timeOfDayCycleSeconds = parseTimeOfDayCycleSeconds(argv[++index]);
+            continue;
+        }
+        if (argument == "--time-latitude" && index + 1 < argc) {
+            options.timeOfDayLatitudeDegrees = parseTimeOfDayLatitude(argv[++index]);
+            continue;
+        }
+        if (argument == "--time-day-of-year" && index + 1 < argc) {
+            options.timeOfDayDayOfYear = parseTimeOfDayDayOfYear(argv[++index]);
             continue;
         }
         if (argument == "--film-grain" && index + 1 < argc) {
@@ -592,6 +883,11 @@ Options parseOptions(int argc, char** argv) {
             options.pathInteractiveSamples = parsePathInteractiveSampleCount(argv[++index]);
             continue;
         }
+        if (argument == "--path-shadow-angular-radius" && index + 1 < argc) {
+            options.pathShadowAngularRadiusDegrees =
+                parsePathShadowAngularRadius(argv[++index]);
+            continue;
+        }
         if (argument == "--path-denoiser" && index + 1 < argc) {
             const std::string_view value(argv[++index]);
             if (value == "nrd") {
@@ -657,30 +953,57 @@ Options parseOptions(int argc, char** argv) {
                 options.directionalShadowDemo = false;
                 options.hdriBackdropDemo = false;
                 options.alphaShadowDemo = false;
+                options.atmosphereDemo = false;
+                options.weatherDemoEnabled = false;
             } else if (value == "emissive-sphere") {
                 options.emissiveSphereDemo = true;
                 options.directionalShadowDemo = false;
                 options.hdriBackdropDemo = false;
                 options.alphaShadowDemo = false;
+                options.atmosphereDemo = false;
+                options.weatherDemoEnabled = false;
             } else if (value == "directional-shadow") {
                 options.emissiveSphereDemo = false;
                 options.directionalShadowDemo = true;
                 options.hdriBackdropDemo = false;
                 options.alphaShadowDemo = false;
+                options.atmosphereDemo = false;
+                options.weatherDemoEnabled = false;
             } else if (value == "hdri-backdrop") {
                 options.emissiveSphereDemo = false;
                 options.directionalShadowDemo = false;
                 options.hdriBackdropDemo = true;
                 options.alphaShadowDemo = false;
+                options.atmosphereDemo = false;
+                options.weatherDemoEnabled = false;
             } else if (value == "alpha-shadow") {
                 options.emissiveSphereDemo = false;
                 options.directionalShadowDemo = false;
                 options.hdriBackdropDemo = false;
                 options.alphaShadowDemo = true;
+                options.atmosphereDemo = false;
+                options.weatherDemoEnabled = false;
+            } else if (value == "atmosphere") {
+                options.emissiveSphereDemo = false;
+                options.directionalShadowDemo = false;
+                options.hdriBackdropDemo = false;
+                options.alphaShadowDemo = false;
+                options.atmosphereDemo = true;
+                options.atmosphereEnabled = true;
+                options.weatherDemoEnabled = false;
+            } else if (value == "weather") {
+                options.emissiveSphereDemo = false;
+                options.directionalShadowDemo = false;
+                options.hdriBackdropDemo = false;
+                options.alphaShadowDemo = false;
+                options.atmosphereDemo = true;
+                options.atmosphereEnabled = true;
+                options.rainEnabled = true;
+                options.weatherDemoEnabled = true;
             } else {
                 throw std::runtime_error(
                     "--demo requires pbr-grid, emissive-sphere, directional-shadow, "
-                    "hdri-backdrop, or alpha-shadow");
+                    "hdri-backdrop, alpha-shadow, atmosphere, or weather");
             }
             continue;
         }
@@ -761,6 +1084,12 @@ Options parseOptions(int argc, char** argv) {
     }
     if (options.aovExportFrameSpecified && options.aovExportDirectory.empty()) {
         throw std::runtime_error("--aov-frame requires --aov-export");
+    }
+    if (options.atmosphereEnabled && !options.environmentPath.empty()) {
+        throw std::runtime_error("--atmosphere and --environment are mutually exclusive");
+    }
+    if (options.timeOfDayEnabled && !options.atmosphereDemo) {
+        throw std::runtime_error("--time-of-day on requires --demo atmosphere");
     }
     if (!options.capturePath.empty() && options.frameLimit.has_value() &&
         *options.frameLimit < options.captureFrame) {
@@ -905,11 +1234,33 @@ int run(const Options& options) {
                 aovFrameSink = std::make_shared<renderer::output::PfmAovDirectorySink>(
                     options.aovExportDirectory);
             }
+            std::optional<renderer::lighting::AtmosphereSettings> atmosphereSettings;
+            const float windDirectionRadians =
+                options.windDirectionDegrees * std::numbers::pi_v<float> / 180.0F;
+            const glm::vec3 windDirection{
+                std::cos(windDirectionRadians), 0.0F, std::sin(windDirectionRadians)};
+            const glm::vec3 windVelocity =
+                windDirection * options.windSpeedMetersPerSecond;
+            if (options.atmosphereEnabled) {
+                atmosphereSettings.emplace();
+                atmosphereSettings->clouds.enabled = options.cloudsEnabled;
+                atmosphereSettings->clouds.coverage = options.cloudCoverage;
+                atmosphereSettings->clouds.density = options.cloudDensity;
+                atmosphereSettings->clouds.windDirection = windDirection;
+                atmosphereSettings->clouds.windSpeedMetersPerSecond =
+                    options.windSpeedMetersPerSecond;
+            }
             renderer::Renderer renderer(
                 window, instance, device,
                 {.scenePath = options.scenePath,
                  .sceneAnimationStaticPose = options.sceneAnimationStaticPose,
                  .environmentPath = options.environmentPath,
+                 .atmosphere = atmosphereSettings,
+                 .rain = {.enabled = options.rainEnabled,
+                          .intensity = options.rainIntensity,
+                          .windVelocityMetersPerSecond = windVelocity},
+                 .weatherDemoEnabled = options.weatherDemoEnabled,
+                 .weatherDemoCycleSeconds = options.weatherDemoCycleSeconds,
                  .exposureCompensationEv = options.exposureCompensationEv,
                  .environmentRotationRadians =
                      options.environmentRotationDegrees * std::numbers::pi_v<float> / 180.0F,
@@ -928,6 +1279,21 @@ int run(const Options& options) {
                  .directionalShadowDemo = options.directionalShadowDemo,
                  .hdriBackdropDemo = options.hdriBackdropDemo,
                  .alphaShadowDemo = options.alphaShadowDemo,
+                 .atmosphereDemo = options.atmosphereDemo,
+                 .atmosphereCameraPreset = options.atmosphereCameraPreset,
+                 .atmosphereCameraPitchRadians =
+                     options.atmosphereCameraPitchDegrees *
+                     std::numbers::pi_v<float> / 180.0F,
+                 .atmosphereCameraYawRadians =
+                     options.atmosphereCameraYawDegrees *
+                     std::numbers::pi_v<float> / 180.0F,
+                 .cloudInitialOffsetKm = options.cloudInitialOffsetKm,
+                 .cloudDebugView = options.cloudDebugView,
+                 .timeOfDayEnabled = options.timeOfDayEnabled,
+                 .timeOfDayHour = options.timeOfDayHour,
+                 .timeOfDayCycleSeconds = options.timeOfDayCycleSeconds,
+                 .timeOfDayLatitudeDegrees = options.timeOfDayLatitudeDegrees,
+                 .timeOfDayDayOfYear = options.timeOfDayDayOfYear,
                  .shadowsEnabled = options.shadowsEnabled,
                  .rayTracingRequest = options.rayTracingRequest,
                  .rayTracingTransformScript = options.rayTracingTransformScript,
@@ -942,6 +1308,8 @@ int run(const Options& options) {
                      nullptr,
 #endif
                  .pathEnvironmentImportanceSampling = options.pathEnvironmentImportanceSampling,
+                 .pathShadowAngularRadius =
+                     options.pathShadowAngularRadiusDegrees * std::numbers::pi_v<float> / 180.0F,
                  .pathEmissiveTriangleSampling = options.pathEmissiveTriangleSampling,
                  .pathMaxBounces = options.pathMaxBounces,
                  .pathInteractiveSamples = options.pathInteractiveSamples,
@@ -1000,6 +1368,8 @@ int main(int argc, char** argv) {
     try {
         return run(parseOptions(argc, argv));
     } catch (const std::exception& error) {
+        std::cerr << "Genesis Render fatal error: " << error.what() << '\n';
+        std::cerr.flush();
         renderer::core::log(renderer::core::LogLevel::error, error.what());
         return 1;
     }

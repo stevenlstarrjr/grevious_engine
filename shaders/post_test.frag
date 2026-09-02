@@ -25,6 +25,10 @@ layout(set = 0, binding = 0) uniform FrameData
     vec4 shadowCascadeSplits;
     vec4 shadowCascadeDepthRadii;
     vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
 } frameData;
 
 layout(location = 0) out vec4 outColor;

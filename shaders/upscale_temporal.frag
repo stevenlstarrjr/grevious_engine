@@ -62,8 +62,14 @@ void main()
         }
     }
 
-    vec2 jitterCorrection = (controls.temporalJitter.zw - controls.temporalJitter.xy) /
-                            vec2(renderSize);
+    // Depth 1 is the unjittered procedural background. Finite surfaces need
+    // projection-jitter correction; applying it to the sky shifts its history
+    // despite the sky shader already removing that jitter from its ray.
+    bool proceduralBackground = depth >= 0.999999 && motion.z >= 0.999999;
+    vec2 jitterCorrection = proceduralBackground
+        ? vec2(0.0)
+        : (controls.temporalJitter.zw - controls.temporalJitter.xy) /
+              vec2(renderSize);
     vec2 previousUv = uv - motion.xy + jitterCorrection;
     bool insideHistory = all(greaterThanEqual(previousUv, vec2(0.0))) &&
                          all(lessThanEqual(previousUv, vec2(1.0)));

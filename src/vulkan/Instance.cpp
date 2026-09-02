@@ -1,7 +1,7 @@
 #include "renderer/vulkan/Instance.hpp"
 
 #include "renderer/core/Log.hpp"
-#include "renderer/platform/Window.hpp"
+#include "renderer/platform/RenderSurface.hpp"
 #include "renderer/vulkan/VulkanError.hpp"
 
 #include <algorithm>
@@ -99,9 +99,9 @@ VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo(void* userData) {
 
 } // namespace
 
-Instance::Instance(const platform::Window& window, ValidationMode validationMode,
+Instance::Instance(const platform::RenderSurface& surfaceHost, ValidationMode validationMode,
                    PFN_vkGetInstanceProcAddr customGetInstanceProcAddr)
-    : window_(window) {
+    : surfaceHost_(surfaceHost) {
     VolkInitializationGuard volkGuard(customGetInstanceProcAddr);
     std::uint32_t loaderVersion = VK_API_VERSION_1_0;
     check(vkEnumerateInstanceVersion(&loaderVersion), "vkEnumerateInstanceVersion");
@@ -127,7 +127,7 @@ Instance::Instance(const platform::Window& window, ValidationMode validationMode
                containsExtension(layerExtensions, name);
     };
 
-    auto enabledExtensions = window.requiredVulkanExtensions();
+    auto enabledExtensions = surfaceHost.requiredVulkanExtensions();
     const bool debugUtilsAvailable = extensionAvailable(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (debugUtilsAvailable) {
         enabledExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -200,7 +200,7 @@ Instance::Instance(const platform::Window& window, ValidationMode validationMode
                       "vkCreateDebugUtilsMessengerEXT");
             }
         }
-        surface_ = window.createSurface(instance_);
+        surface_ = surfaceHost.createSurface(instance_);
     } catch (...) {
         if (debugMessenger_ != VK_NULL_HANDLE) {
             const auto destroyMessenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
@@ -228,7 +228,7 @@ Instance::Instance(const platform::Window& window, ValidationMode validationMode
 
 Instance::~Instance() {
     if (surface_ != VK_NULL_HANDLE && instance_ != VK_NULL_HANDLE) {
-        window_.destroySurface(instance_, surface_);
+        surfaceHost_.destroySurface(instance_, surface_);
     }
     if (debugMessenger_ != VK_NULL_HANDLE && instance_ != VK_NULL_HANDLE) {
         const auto destroyMessenger = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(

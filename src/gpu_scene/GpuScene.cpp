@@ -127,6 +127,12 @@ MaterialRecord packMaterial(const scene::Material& material,
     if (material.doubleSided) {
         packed.textureState.z |= doubleSidedMaterial;
     }
+    if (material.rainReceiver) {
+        packed.textureState.z |= rainReceiverMaterial;
+    }
+    if (material.wetCoat) {
+        packed.textureState.z |= wetCoatMaterial;
+    }
     return packed;
 }
 
@@ -237,6 +243,8 @@ PackedScene packScene(const scene::Scene& scene,
                 .tangent = tangent,
                 .uv1 = primitive.texCoords[1].empty() ? glm::vec2(0.0F)
                                                       : primitive.texCoords[1][vertexIndex],
+                .color = primitive.colors.empty() ? glm::vec4(1.0F)
+                                                  : primitive.colors[vertexIndex],
             });
         }
         if (primitive.indices.empty()) {

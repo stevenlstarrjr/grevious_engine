@@ -139,10 +139,26 @@ RendererInput Window::consumeRendererInput() {
         .mouseLookActive = mouseLookActive_,
         .mouseDeltaX = mouseDeltaX_,
         .mouseDeltaY = mouseDeltaY_,
+        .atmosphereDragActive = atmosphereSunDragActive_,
+        .atmosphereSunDrag = atmosphereSunDragActive_,
+        .atmosphereDeltaX = atmosphereSunDeltaX_,
+        .atmosphereDeltaY = atmosphereSunDeltaY_,
+        .atmosphereExposureSteps = atmosphereExposureSteps_,
+        .atmospherePreset = atmospherePreset_,
+        .timeOfDayToggle = timeOfDayToggle_,
+        .timeOfDaySpeedSteps = timeOfDaySpeedSteps_,
+        .timeOfDayScrubSteps = timeOfDayScrubSteps_,
     };
     resetCameraRequested_ = false;
     mouseDeltaX_ = 0.0F;
     mouseDeltaY_ = 0.0F;
+    atmosphereSunDeltaX_ = 0.0F;
+    atmosphereSunDeltaY_ = 0.0F;
+    atmosphereExposureSteps_ = 0;
+    atmospherePreset_ = 0U;
+    timeOfDayToggle_ = false;
+    timeOfDaySpeedSteps_ = 0;
+    timeOfDayScrubSteps_ = 0;
     return input;
 }
 
@@ -193,22 +209,56 @@ void Window::processEvent(const SDL_Event& event) {
         framebufferResized_ = true;
     } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST && event.window.windowID == windowId) {
         setMouseLook(false);
+        atmosphereSunDragActive_ = false;
     } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.windowID == windowId &&
                event.button.button == SDL_BUTTON_RIGHT) {
         setMouseLook(true);
     } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.windowID == windowId &&
                event.button.button == SDL_BUTTON_RIGHT) {
         setMouseLook(false);
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.windowID == windowId &&
+               event.button.button == SDL_BUTTON_LEFT &&
+               (SDL_GetModState() & SDL_KMOD_CTRL) != 0) {
+        atmosphereSunDragActive_ = true;
+        atmosphereSunDeltaX_ = 0.0F;
+        atmosphereSunDeltaY_ = 0.0F;
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.windowID == windowId &&
+               event.button.button == SDL_BUTTON_LEFT) {
+        atmosphereSunDragActive_ = false;
     } else if (event.type == SDL_EVENT_MOUSE_MOTION && event.motion.windowID == windowId &&
                mouseLookActive_) {
         mouseDeltaX_ += event.motion.xrel;
         mouseDeltaY_ += event.motion.yrel;
+    } else if (event.type == SDL_EVENT_MOUSE_MOTION && event.motion.windowID == windowId &&
+               atmosphereSunDragActive_) {
+        atmosphereSunDeltaX_ += event.motion.xrel;
+        atmosphereSunDeltaY_ += event.motion.yrel;
     } else if (event.type == SDL_EVENT_KEY_DOWN && event.key.windowID == windowId &&
                !event.key.repeat) {
         if (event.key.scancode == SDL_SCANCODE_ESCAPE) {
             setMouseLook(false);
         } else if (event.key.scancode == SDL_SCANCODE_R) {
             resetCameraRequested_ = true;
+        } else if (event.key.scancode == SDL_SCANCODE_EQUALS ||
+                   event.key.scancode == SDL_SCANCODE_KP_PLUS) {
+            ++atmosphereExposureSteps_;
+        } else if (event.key.scancode == SDL_SCANCODE_MINUS ||
+                   event.key.scancode == SDL_SCANCODE_KP_MINUS) {
+            --atmosphereExposureSteps_;
+        } else if (event.key.scancode == SDL_SCANCODE_T) {
+            timeOfDayToggle_ = true;
+        } else if (event.key.scancode == SDL_SCANCODE_LEFTBRACKET) {
+            --timeOfDaySpeedSteps_;
+        } else if (event.key.scancode == SDL_SCANCODE_RIGHTBRACKET) {
+            ++timeOfDaySpeedSteps_;
+        } else if (event.key.scancode == SDL_SCANCODE_COMMA) {
+            --timeOfDayScrubSteps_;
+        } else if (event.key.scancode == SDL_SCANCODE_PERIOD) {
+            ++timeOfDayScrubSteps_;
+        } else if (event.key.scancode >= SDL_SCANCODE_1 &&
+                   event.key.scancode <= SDL_SCANCODE_9) {
+            atmospherePreset_ =
+                static_cast<std::uint32_t>(event.key.scancode - SDL_SCANCODE_1) + 1U;
         }
     }
 }

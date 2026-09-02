@@ -42,6 +42,9 @@ struct VertexRecord {
     glm::vec2 uv0{0.0F};
     glm::vec4 tangent{1.0F, 0.0F, 0.0F, 1.0F};
     glm::vec2 uv1{0.0F};
+    // glTF COLOR_0 is linear RGBA. White preserves the glTF default when the
+    // primitive does not provide a vertex-color attribute.
+    glm::vec4 color{1.0F};
 };
 
 struct alignas(16) TransformRecord {
@@ -148,6 +151,8 @@ enum MaterialFlag : std::uint32_t {
     alphaBlendMaterial = 1U << 1U,
     doubleSidedMaterial = 1U << 2U,
     additiveMaterial = 1U << 3U,
+    rainReceiverMaterial = 1U << 4U,
+    wetCoatMaterial = 1U << 5U,
 };
 
 inline constexpr std::uint32_t invalidTextureDescriptor = ~std::uint32_t{0};
@@ -227,7 +232,8 @@ static_assert(offsetof(VertexRecord, normal) == 3 * sizeof(float));
 static_assert(offsetof(VertexRecord, uv0) == 6 * sizeof(float));
 static_assert(offsetof(VertexRecord, tangent) == 8 * sizeof(float));
 static_assert(offsetof(VertexRecord, uv1) == 12 * sizeof(float));
-static_assert(sizeof(VertexRecord) == 14 * sizeof(float));
+static_assert(offsetof(VertexRecord, color) == 14 * sizeof(float));
+static_assert(sizeof(VertexRecord) == 18 * sizeof(float));
 static_assert(sizeof(TransformRecord) == 48 * sizeof(float));
 static_assert(alignof(TransformRecord) == 16);
 static_assert(sizeof(PrimitiveRecord) == 8 * sizeof(std::uint32_t));

@@ -2,6 +2,7 @@
 
 #include <glm/common.hpp>
 #include <glm/geometric.hpp>
+#include <glm/mat3x3.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -235,8 +236,41 @@ glm::vec3 acesFitted(const glm::vec3& color) {
                       1.0F);
 }
 
+glm::vec3 agxToneMap(const glm::vec3& color) {
+    const glm::mat3 agxInset{
+        glm::vec3{0.842479062253094F, 0.0423282422610123F, 0.0423756549057051F},
+        glm::vec3{0.0784335999999992F, 0.878468636469772F, 0.0784336000000000F},
+        glm::vec3{0.0792237451477643F, 0.0791661274605434F, 0.879142973793104F},
+    };
+    const glm::mat3 agxOutset{
+        glm::vec3{1.19687900512017F, -0.0528968517574562F, -0.0529716355144438F},
+        glm::vec3{-0.0980208811401368F, 1.15190312990417F, -0.0980434501171241F},
+        glm::vec3{-0.0990297440797205F, -0.0989611768448433F, 1.15107367264116F},
+    };
+    constexpr float minEv = -12.47393F;
+    constexpr float maxEv = 4.026069F;
+
+    glm::vec3 working = agxInset * glm::max(color, glm::vec3{0.0F});
+    for (int component = 0; component < 3; ++component) {
+        working[component] = std::clamp(
+            (std::log2(std::max(working[component], 1.0e-10F)) - minEv) /
+                (maxEv - minEv),
+            0.0F, 1.0F);
+    }
+    const glm::vec3 x2 = working * working;
+    const glm::vec3 x4 = x2 * x2;
+    working = 15.5F * x4 * x2 - 40.14F * x4 * working + 31.96F * x4 -
+              6.868F * x2 * working + 0.4298F * x2 + 0.1191F * working - 0.00232F;
+
+    glm::vec3 displayLinear = glm::max(agxOutset * working, glm::vec3{0.0F});
+    for (int component = 0; component < 3; ++component) {
+        displayLinear[component] = std::pow(displayLinear[component], 2.2F);
+    }
+    return glm::clamp(displayLinear, 0.0F, 1.0F);
+}
+
 glm::vec3 compositeToneMap(const glm::vec3& hdr, const glm::vec3& bloom, float exposureEv) {
-    return acesFitted(applyExposure(hdr + bloom * bloomIntensity, exposureEv));
+    return agxToneMap(applyExposure(hdr + bloom * bloomIntensity, exposureEv));
 }
 
 ImageMetrics measure(const HdrImage& image) {

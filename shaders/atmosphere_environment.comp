@@ -1,0 +1,67 @@
+#version 460
+
+#include "include/ibl.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform FrameData
+{
+    mat4 viewProjection;
+    mat4 inverseViewProjection;
+    mat4 unjitteredViewProjection;
+    mat4 previousViewProjection;
+    mat4 previousUnjitteredViewProjection;
+    vec4 cameraPositionExposure;
+    vec4 directionalDirectionIntensity;
+    vec4 directionalColor;
+    vec4 pointPositionIntensity;
+    vec4 pointColorRange;
+    vec4 environmentParameters;
+    uvec4 cullingParameters;
+    uvec4 visibilityMask;
+    vec4 temporalJitter;
+    uvec4 temporalFlags;
+    vec4 shadowSceneCenterRadius;
+    vec4 shadowCascadeCenterRadius1;
+    vec4 shadowCascadeCenterRadius2;
+    vec4 shadowCascadeSplits;
+    vec4 shadowCascadeDepthRadii;
+    vec4 previousCameraPosition;
+    vec4 atmosphereCamera;
+    vec4 atmosphereSunDirection;
+    vec4 cloudLayerParameters;
+    vec4 cloudWeatherParameters;
+} frameData;
+
+#define BRUNETON_TRANSMITTANCE_BINDING 1
+#define BRUNETON_SCATTERING_BINDING 2
+#define BRUNETON_IRRADIANCE_BINDING 3
+#define GENESIS_CLOUD_BASE_NOISE_BINDING 4
+#define GENESIS_CLOUD_DETAIL_NOISE_BINDING 5
+#include "include/genesis_atmosphere.glsl"
+
+layout(set = 0, binding = 6, rgba32f) uniform writeonly image2D environmentOutput;
+
+void main()
+{
+    ivec2 coordinate = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(environmentOutput);
+    if (any(greaterThanEqual(coordinate, extent))) {
+        return;
+    }
+
+    vec2 uv = (vec2(coordinate) + 0.5) / vec2(extent);
+    vec3 direction = dualParaboloidUvToDirection(uv);
+    float cloudTransmittance;
+    float rayJitter = genesisNoiseInterleavedGradient(vec2(coordinate));
+    vec3 radiance = genesisAtmosphereCloudRadiance(
+        direction, frameData.atmosphereCamera.xyz,
+        frameData.atmosphereSunDirection.xyz,
+        frameData.cloudLayerParameters, frameData.cloudWeatherParameters,
+        false, rayJitter, cloudTransmittance);
+    // Alpha carries cloud transmittance for primary-ray solar-disk compositing.
+    // Secondary environment rays consume RGB only and therefore never count
+    // the camera-visible solar disk as a second direct-light source.
+    imageStore(environmentOutput, coordinate,
+               vec4(radiance, cloudTransmittance));
+}
