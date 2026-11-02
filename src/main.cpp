@@ -53,6 +53,8 @@ struct Options {
     std::filesystem::path scenePath;
     bool sceneAnimationStaticPose = false;
     std::filesystem::path environmentPath;
+    std::filesystem::path virtualBaseColor;
+    std::uint32_t virtualPoolMiB = 64;
     bool atmosphereEnabled = false;
     bool cloudsEnabled = true;
     float cloudCoverage = 0.42F;
@@ -440,6 +442,7 @@ Options parseOptions(int argc, char** argv) {
                          "[--validation off|available|required] "
                          "[--scene PATH] [--scene-animation reject|static-pose] "
                          "[--environment PATH | --atmosphere] "
+                         "[--virtual-base-color TILEPACK --vt-pool-mib 1..192] "
                          "[--clouds on|off] [--cloud-coverage 0..1] "
                          "[--cloud-density 0.1..4] "
                          "[--cloud-offset X_KM Y_KM] "
@@ -486,7 +489,7 @@ Options parseOptions(int argc, char** argv) {
                          "[--post-test PATTERN] [--post-value LINEAR_HDR] "
                          "[--post-position X Y] "
                          "[--resolution WIDTH HEIGHT] "
-                         "[--camera-script none|translate|teleport|rotate|approach] "
+                         "[--camera-script none|translate|teleport|rotate|approach|zoom-hold] "
                          "[--camera-start front|side|interior] "
                          "[--camera-input on|off] "
                          "[--resize-script [standard|odd|stress]]\n";
@@ -518,6 +521,16 @@ Options parseOptions(int argc, char** argv) {
             } else {
                 throw std::runtime_error("--gpu-policy requires nvidia-rtx or portable");
             }
+            continue;
+        }
+        if (argument == "--virtual-base-color" && index + 1 < argc) {
+            options.virtualBaseColor = argv[++index];
+            continue;
+        }
+        if (argument == "--vt-pool-mib" && index + 1 < argc) {
+            const auto size = parseFrameCount(argv[++index]);
+            if (size < 1 || size > 192) throw std::runtime_error("--vt-pool-mib requires 1..192");
+            options.virtualPoolMiB = static_cast<std::uint32_t>(size);
             continue;
         }
         if (argument == "--environment" && index + 1 < argc) {
@@ -1058,9 +1071,11 @@ Options parseOptions(int argc, char** argv) {
                 options.temporalCameraScript = renderer::TemporalCameraScript::rotate;
             } else if (value == "approach") {
                 options.temporalCameraScript = renderer::TemporalCameraScript::approach;
+            } else if (value == "zoom-hold") {
+                options.temporalCameraScript = renderer::TemporalCameraScript::zoomHold;
             } else {
                 throw std::runtime_error(
-                    "--camera-script requires none, translate, teleport, rotate, or approach");
+                    "--camera-script requires none, translate, teleport, rotate, approach, or zoom-hold");
             }
             continue;
         }
@@ -1255,6 +1270,8 @@ int run(const Options& options) {
                 {.scenePath = options.scenePath,
                  .sceneAnimationStaticPose = options.sceneAnimationStaticPose,
                  .environmentPath = options.environmentPath,
+                 .virtualBaseColor = options.virtualBaseColor,
+                 .virtualPoolMiB = options.virtualPoolMiB,
                  .atmosphere = atmosphereSettings,
                  .rain = {.enabled = options.rainEnabled,
                           .intensity = options.rainIntensity,

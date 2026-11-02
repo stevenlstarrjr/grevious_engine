@@ -1,4 +1,5 @@
 #include "renderer/renderer/Renderer.hpp"
+#include "VirtualTexture.hpp"
 
 #if RENDERER_ENABLE_NRD
 #include "renderer/nvidia/NrdVulkanDenoiser.hpp"
@@ -76,6 +77,8 @@ void Renderer::recordPathTracingPass(VkCommandBuffer commandBuffer,
             .fixedPrimarySample = rayReconstructionEnabled()
                                       ? 2U
                                       : (temporalUpscalingEnabled() ? 1U : 0U),
+            .virtualState = virtualTexture_ ? virtualTexture_->stateAddress() : 0,
+            .virtualPixels = virtualTexture_ ? virtualTexture_->pixelsAddress() : 0,
         };
         vkCmdPushConstants(commandBuffer, pathTracingPipeline_->layout(), pathTracingStages, 0U,
                            sizeof(controls), &controls);
@@ -98,6 +101,19 @@ void Renderer::recordPathTracingPass(VkCommandBuffer commandBuffer,
             };
             vkCmdPipelineBarrier2(commandBuffer, &dependency);
         }
+    }
+    if (virtualTexture_) {
+        const VkMemoryBarrier2 feedbackBarrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+        };
+        const VkDependencyInfo dependency{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                          .memoryBarrierCount = 1,
+                                          .pMemoryBarriers = &feedbackBarrier};
+        vkCmdPipelineBarrier2(commandBuffer, &dependency);
     }
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathTracing, true);
 }
