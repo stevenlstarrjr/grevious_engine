@@ -280,6 +280,7 @@ endif()
 add_library(renderer_output STATIC src/output/AovExport.cpp)
 target_compile_features(renderer_output PUBLIC cxx_std_20)
 target_include_directories(renderer_output PUBLIC include)
+target_link_libraries(renderer_output PRIVATE renderer_images)
 set_target_properties(renderer_output PROPERTIES CXX_EXTENSIONS OFF)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(renderer_output PRIVATE
@@ -451,6 +452,8 @@ set(RENDERER_SHADER_SOURCES
     shaders/path_nrd_resolve.comp
 )
 set(RENDERER_SHADER_HEADERS
+    shaders/include/look_frame.glsl
+    shaders/include/first_hit_ids.glsl
     shaders/include/bruneton_atmosphere.glsl
     shaders/include/genesis_atmosphere.glsl
     shaders/include/genesis_clouds.glsl

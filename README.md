@@ -365,6 +365,46 @@ Some useful ways to explore it:
   --environment path/to/studio.hdr
 ```
 
+## Shot look controls
+
+These controls are available on the Windows and Linux command line and through
+`RendererConfig`. Both raster and path tracing accept the three look controls.
+
+| Option | Effect |
+| --- | --- |
+| `--visible-sky-ev -6` | Darken the entire camera-visible environment by six stops. Environment lighting and reflections use the original radiance. Default is zero. |
+| `--clay` | Preview the geometry with neutral 18% diffuse gray, zero metallic and 0.85 roughness. The original normals, alpha cutouts and lamp emission remain active. |
+| `--white-balance-k 3200` | Set the camera white balance for a warm illuminant. The resulting image is cooler. Higher values warm the image. The default of 6500 K is neutral. Valid range is 2000–12000 K. |
+
+White balance uses green-normalized linear RGB gains before the final AgX display
+transform. The linear AOVs and diagnostic views retain their original values.
+
+### Object and material ID passes
+
+Add `--id-aovs` to a path-traced `--aov-export DIRECTORY` job. The selected frame
+contains numeric `object_id.pfm` and `material_id.pfm` planes, lossless RGB
+selection images `object_id.png` and `material_id.png`, and `id_legend.csv`
+with names, IDs and swatches. In Fusion, load the PNG as data with no color
+conversion and pick the desired RGB color. Use nearest-neighbor sampling if resizing.
+
+Background has ID zero. glTF node and material IDs are their one-based scene
+indices. An object's primitives share its object ID, and instances using the same
+material share its material ID. The IDs are stable across captures of the same
+scene layout. The mattes sample the visible opaque or alpha-tested surface with
+a dedicated pixel-center ray and have hard edges. They use the internal render
+resolution, like the other path AOVs. The default AOV export keeps its 15 original planes.
+Use the native NRD path when exporting AOVs. DLSS Ray Reconstruction has a
+separate output pipeline.
+
+```powershell
+.\build\windows\bin\Release\genesis_render.exe --render-mode path-traced --scene shot.glb --environment night.hdr --visible-sky-ev -6 --white-balance-k 5200 --id-aovs --aov-export build/shot-passes --frames 64 --aov-frame 64 --capture build/shot.png --capture-frame 64
+```
+
+To verify the controls with a real HDR environment, run
+`python tools/validate_look_controls.py <renderer> <hdr-file> <test-output-directory>`
+with NumPy and Pillow installed. It compares matched raster/path captures and
+checks the named mattes, alpha cutouts, shared materials and preserved emission.
+
 ## Where the project stands
 
 Genesis Render is under active development. Opaque and alpha-masked ray-query shadows

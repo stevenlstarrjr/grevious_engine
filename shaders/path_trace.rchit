@@ -1,4 +1,6 @@
 #version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_nonuniform_qualifier : require
 
@@ -17,35 +19,9 @@
 #include "include/weather_wetness.glsl"
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT sceneTlas;
-layout(set = 0, binding = 2) uniform FrameData
-{
-    mat4 viewProjection;
-    mat4 inverseViewProjection;
-    mat4 unjitteredViewProjection;
-    mat4 previousViewProjection;
-    mat4 previousUnjitteredViewProjection;
-    vec4 cameraPositionExposure;
-    vec4 directionalDirectionIntensity;
-    vec4 directionalColor;
-    vec4 pointPositionIntensity;
-    vec4 pointColorRange;
-    vec4 environmentParameters;
-    uvec4 cullingParameters;
-    uvec4 visibilityMask;
-    vec4 temporalJitter;
-    uvec4 temporalFlags;
-    vec4 shadowSceneCenterRadius;
-    vec4 shadowCascadeCenterRadius1;
-    vec4 shadowCascadeCenterRadius2;
-    vec4 shadowCascadeSplits;
-    vec4 shadowCascadeDepthRadii;
-    vec4 previousCameraPosition;
-    vec4 atmosphereCamera;
-    vec4 atmosphereSunDirection;
-    vec4 cloudLayerParameters;
-    vec4 cloudWeatherParameters;
-    vec4 weatherParameters;
-} frameData;
+#define LOOK_FRAME_BINDING 2
+#include "include/look_frame.glsl"
+#include "include/first_hit_ids.glsl"
 
 layout(std430, set = 0, binding = 3) readonly buffer Vertices
 {
@@ -406,6 +382,10 @@ void writePathDirectRadianceAov(vec3 directRadiance)
 void main()
 {
     uint currentDepth = payload.depth;
+    if (currentDepth == ID_ONLY_RAY_DEPTH) {
+        writeFirstHitIds(instances[gl_InstanceCustomIndexEXT].meshMaterial.zy + uvec2(1u));
+        return;
+    }
     if (currentDepth == 0u) {
         payload.primaryHitDistance = max(gl_HitTEXT, 0.0);
     }
@@ -526,6 +506,11 @@ void main()
         }
     }
 
+    if (frameData.lookOptions.x != 0u) {
+        baseColor = vec3(clayAlbedo);
+        metallic = 0.0;
+        roughness = clayRoughness;
+    }
     if (currentDepth == 0u && controls.sampleInFrame + 1u == controls.samplesThisFrame) {
         writePathFirstHitAovs(objectPosition, transform, baseColor, roughness,
                               geometricNormal, normal);

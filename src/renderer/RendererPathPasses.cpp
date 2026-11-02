@@ -334,6 +334,19 @@ void Renderer::recordPathAovReadbackPass(VkCommandBuffer commandBuffer,
         vkCmdCopyImageToBuffer(commandBuffer, images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                pathAovReadbackBuffer_->handle(), 1U, &copy);
     }
+    if (config_.idAovs) {
+        const VkMemoryBarrier2 barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+        };
+        const VkDependencyInfo dependency{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                          .memoryBarrierCount = 1,
+                                          .pMemoryBarriers = &barrier};
+        vkCmdPipelineBarrier2(commandBuffer, &dependency);
+    }
     writeGpuTimestamp(commandBuffer, context.frameIndex, GpuTimingPass::pathAovReadback, true);
 }
 

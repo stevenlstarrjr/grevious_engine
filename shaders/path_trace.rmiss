@@ -1,38 +1,15 @@
 #version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_ray_tracing : require
 
 #include "include/ibl.glsl"
 #include "include/path_trace.glsl"
 #include "include/path_trace_environment.glsl"
 
-layout(set = 0, binding = 2) uniform FrameData
-{
-    mat4 viewProjection;
-    mat4 inverseViewProjection;
-    mat4 unjitteredViewProjection;
-    mat4 previousViewProjection;
-    mat4 previousUnjitteredViewProjection;
-    vec4 cameraPositionExposure;
-    vec4 directionalDirectionIntensity;
-    vec4 directionalColor;
-    vec4 pointPositionIntensity;
-    vec4 pointColorRange;
-    vec4 environmentParameters;
-    uvec4 cullingParameters;
-    uvec4 visibilityMask;
-    vec4 temporalJitter;
-    uvec4 temporalFlags;
-    vec4 shadowSceneCenterRadius;
-    vec4 shadowCascadeCenterRadius1;
-    vec4 shadowCascadeCenterRadius2;
-    vec4 shadowCascadeSplits;
-    vec4 shadowCascadeDepthRadii;
-    vec4 previousCameraPosition;
-    vec4 atmosphereCamera;
-    vec4 atmosphereSunDirection;
-    vec4 cloudLayerParameters;
-    vec4 cloudWeatherParameters;
-} frameData;
+#define LOOK_FRAME_BINDING 2
+#include "include/look_frame.glsl"
+#include "include/first_hit_ids.glsl"
 
 layout(location = 0) rayPayloadInEXT RadiancePayload payload;
 layout(set = 0, binding = 12, rgba32f) uniform image2D directRadianceImage;
@@ -65,6 +42,10 @@ layout(push_constant) uniform PathTracePushConstants
 
 void main()
 {
+    if (payload.depth == ID_ONLY_RAY_DEPTH) {
+        writeFirstHitIds(uvec2(0u));
+        return;
+    }
     bool atmosphereEnabled = frameData.atmosphereSunDirection.w > 0.5;
     vec3 backgroundDirection = normalize(gl_WorldRayDirectionEXT);
     if (atmosphereEnabled && payload.depth == 0u &&
@@ -133,6 +114,9 @@ void main()
         }
     } else {
         radiance = max(textureLod(environmentMap, uv, 0.0).rgb, vec3(0.0));
+    }
+    if (payload.depth == 0u) {
+        radiance *= frameData.lookColor.w;
     }
     if (payload.depth > 0u) {
         float environmentPdf = pathEnvironmentPdf(

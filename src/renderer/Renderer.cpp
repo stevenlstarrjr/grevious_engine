@@ -250,6 +250,22 @@ SphereMesh createSphereMesh(std::uint32_t latitudeSegments, std::uint32_t longit
     return mesh;
 }
 
+// Approximate a blackbody chromaticity (Kang et al., 2002) in linear Rec.709.
+// Relative channel gains make 6500 K exactly neutral in the existing camera.
+glm::vec3 blackbodyWhiteRgb(float kelvin) {
+    const double t = 1000.0 / kelvin;
+    const double x = kelvin <= 4000.0F
+                         ? ((-0.2661239 * t - 0.2343589) * t + 0.8776956) * t + 0.179910
+                         : ((-3.0258469 * t + 2.1070379) * t + 0.2226347) * t + 0.240390;
+    const double y =
+        kelvin <= 2222.0F   ? ((-1.1063814 * x - 1.34811020) * x + 2.18555832) * x - 0.20219683
+        : kelvin <= 4000.0F ? ((-0.9549476 * x - 1.37418593) * x + 2.09137015) * x - 0.16748867
+                            : ((3.0817580 * x - 5.87338670) * x + 3.75112997) * x - 0.37001483;
+    const double X = x / y, Z = (1.0 - x - y) / y;
+    return {3.2404542 * X - 1.5371385 - 0.4985314 * Z, -0.9692660 * X + 1.8760108 + 0.0415560 * Z,
+            0.0556434 * X - 0.2040259 + 1.0572252 * Z};
+}
+
 struct CpuScenePayload {
     std::vector<gpu_scene::VertexRecord> vertices;
     std::vector<std::uint32_t> indices;
@@ -267,6 +283,8 @@ struct CpuScenePayload {
     std::vector<Texture> textures;
     std::vector<gpu_scene::MeshletWorkRecord> meshletWork;
     std::string label;
+    std::vector<output::IdLabel> objectLabels;
+    std::vector<output::IdLabel> materialLabels;
 };
 
 CpuScenePayload makeAlphaShadowScenePayload() {
@@ -682,9 +700,10 @@ CpuScenePayload makeEmptyScenePayload(std::string label) {
     return payload;
 }
 
-CpuScenePayload makeScenePayload(const scene::Scene& source, std::string label) {
-    if (source.primitives().empty() ||
-        scene::evaluate(source).meshInstances.empty()) {
+CpuScenePayload makeScenePayload(const scene::Scene& source, std::string label,
+                                 bool collectIds = false) {
+    const auto evaluated = scene::evaluate(source);
+    if (source.primitives().empty() || evaluated.meshInstances.empty()) {
         return makeEmptyScenePayload(std::move(label));
     }
     enum class TextureUsage : std::uint8_t { linearData, srgbColor, normal, count };
@@ -781,17 +800,27 @@ CpuScenePayload makeScenePayload(const scene::Scene& source, std::string label) 
         .textures = std::move(textures),
         .label = std::move(label),
     };
+    if (collectIds) {
+        for (const auto& instance : evaluated.meshInstances) {
+            payload.objectLabels.push_back(
+                {instance.node.index() + 1U, source.node(instance.node).name});
+        }
+        for (const auto& material : source.materials()) {
+            payload.materialLabels.push_back(
+                {static_cast<std::uint32_t>(payload.materialLabels.size() + 1U), material.name});
+        }
+    }
     payload.meshletWork = gpu_scene::makeMeshletWorkRecords(payload.primitiveLods, packed.lods,
                                                             packed.meshlets, payload.instances);
     return payload;
 }
 
 CpuScenePayload loadGltfScenePayload(const std::filesystem::path& scenePath,
-                                     bool allowAnimationStaticPose) {
+                                     bool allowAnimationStaticPose, bool collectIds) {
     assets::GltfImportOptions importOptions;
     importOptions.allowAnimationStaticPose = allowAnimationStaticPose;
     scene::Scene source = assets::importGltf(scenePath, importOptions);
-    return makeScenePayload(source, scenePath.string());
+    return makeScenePayload(source, scenePath.string(), collectIds);
 }
 
 glm::vec3 cameraForward(float yaw, float pitch) {
@@ -1060,6 +1089,17 @@ Renderer::Renderer(platform::RenderSurface& surfaceHost, const vulkan::Instance&
         if (!config_.capturePath.empty() && config_.captureFrame == 0) {
             throw std::runtime_error("Capture frame must be greater than zero");
         }
+        if (!std::isfinite(config_.visibleSkyEv) || std::abs(config_.visibleSkyEv) > 16.0F ||
+            !std::isfinite(config_.whiteBalanceKelvin) || config_.whiteBalanceKelvin < 2000.0F ||
+            config_.whiteBalanceKelvin > 12000.0F) {
+            throw std::invalid_argument("Invalid camera look settings");
+        }
+        if (config_.idAovs && !config_.aovFrameSink) {
+            throw std::invalid_argument("ID passes require a path AOV export sink");
+        }
+        const glm::vec3 gains =
+            blackbodyWhiteRgb(6500.0F) / blackbodyWhiteRgb(config_.whiteBalanceKelvin);
+        lookColor_ = glm::vec4(gains / gains.g, std::exp2(config_.visibleSkyEv));
         if (config_.aovFrameSink && !pathTracingEnabled()) {
             throw std::runtime_error("AOV frame export requires path-traced render mode");
         }
@@ -2197,11 +2237,18 @@ void Renderer::createPathTracingResources() {
             readbackBytes = addDeviceSize(
                 readbackBytes, multiplyDeviceSize(readbackPixelCount, bytesPerPixel[index]));
         }
+        VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (config_.idAovs) {
+            pathIdOffset_ = alignDeviceSize(readbackBytes, 8U);
+            readbackBytes =
+                addDeviceSize(pathIdOffset_, multiplyDeviceSize(readbackPixelCount, 8U));
+            usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        }
         pathAovReadbackBuffer_ = std::make_unique<vulkan::Buffer>(
             device_, memoryAllocator_,
             vulkan::BufferCreateInfo{
                 .size = readbackBytes,
-                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .usage = usage,
                 .requiredMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 .preferredMemory =
                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
@@ -2303,14 +2350,35 @@ void Renderer::createSceneResources() {
         const std::string label = config_.sceneSnapshot->name().empty()
                                       ? "embedded editor scene"
                                       : config_.sceneSnapshot->name();
-        scene = makeScenePayload(*config_.sceneSnapshot, label);
+        scene = makeScenePayload(*config_.sceneSnapshot, label, config_.idAovs);
     } else if (!config_.scenePath.empty()) {
-        scene = loadGltfScenePayload(config_.scenePath, config_.sceneAnimationStaticPose);
+        scene = loadGltfScenePayload(config_.scenePath, config_.sceneAnimationStaticPose,
+                                     config_.idAovs);
     } else {
         scene = makeProceduralScenePayload(config_.emissiveSphereDemo,
                                            config_.directionalShadowDemo,
                                            config_.hdriBackdropDemo, config_.alphaShadowDemo,
                                            config_.atmosphereDemo);
+    }
+    if (config_.idAovs) {
+        objectLabels_ = std::move(scene.objectLabels);
+        materialLabels_ = std::move(scene.materialLabels);
+        const auto completeLabels = [](auto& labels, std::size_t count, const char* prefix) {
+            if (count > 0xffffffU)
+                throw std::length_error("ID passes support 24-bit IDs");
+            while (labels.size() < count) {
+                const auto id = static_cast<std::uint32_t>(labels.size() + 1U);
+                labels.push_back({id, std::string(prefix) + " " + std::to_string(id)});
+            }
+            for (auto& label : labels) {
+                if (label.id > 0xffffffU)
+                    throw std::length_error("ID exceeds the 24-bit PNG range");
+                if (label.name.empty())
+                    label.name = std::string(prefix) + " " + std::to_string(label.id);
+            }
+        };
+        completeLabels(objectLabels_, scene.transforms.size(), "Object");
+        completeLabels(materialLabels_, scene.materials.size(), "Material");
     }
     if (pathTracingEnabled() && scene.textures.empty()) {
         // The procedural PBR grid marks the renderer's fallback descriptor as a
@@ -8929,6 +8997,10 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
             };
         }
     }
+    const VkDeviceAddress idAddress = config_.idAovs && !pathAovExportComplete_ &&
+                                              renderedFrameCount_ + 1U == config_.aovExportFrame
+                                          ? pathAovReadbackBuffer_->deviceAddress() + pathIdOffset_
+                                          : 0U;
     const FrameUniform uniform{
         .viewProjection = currentCamera.jitteredViewProjection,
         .inverseViewProjection = glm::inverse(currentCamera.jitteredViewProjection),
@@ -8942,23 +9014,22 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
                              config_.postTestPattern == post::TestPattern::none
                                  ? config_.filmGrainIntensity
                                  : config_.postTestPosition.y},
-        .pointPositionIntensity = {
-            sceneCenter_ + glm::vec3(-0.60F, 0.45F, 0.85F) * sceneRadius_,
-            config_.atmosphere.has_value()
-                ? 0.0F
-                : 3.0F * sceneRadius_ * sceneRadius_ * proceduralLightScale},
+        .pointPositionIntensity = {sceneCenter_ + glm::vec3(-0.60F, 0.45F, 0.85F) * sceneRadius_,
+                                   config_.atmosphere.has_value()
+                                       ? 0.0F
+                                       : 3.0F * sceneRadius_ * sceneRadius_ * proceduralLightScale},
         .pointColorRange = {0.45F, 0.65F, 1.0F,
                             pathTracingEnabled() ? config_.pathShadowAngularRadius
                                                  : sceneRadius_ * 4.0F},
         .environmentParameters =
             {environmentRotationRadians_,
-             pathTracingEnabled() ? (config_.pathEnvironmentImportanceSampling &&
-                                             !config_.atmosphere.has_value()
-                                         ? 1.0F
-                                         : 0.0F)
-                                  : (config_.postTestPattern == post::TestPattern::none
-                                         ? 0.0F
-                                         : config_.postTestSourceValue),
+             pathTracingEnabled()
+                 ? (config_.pathEnvironmentImportanceSampling && !config_.atmosphere.has_value()
+                        ? 1.0F
+                        : 0.0F)
+                 : (config_.postTestPattern == post::TestPattern::none
+                        ? 0.0F
+                        : config_.postTestSourceValue),
              pathTracingEnabled()
                  ? static_cast<float>(config_.pathMaxBounces)
                  : (config_.postTestPattern == post::TestPattern::movingSquare
@@ -8985,17 +9056,13 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         .visibilityMask = {visibilityMask, static_cast<std::uint32_t>(config_.postTestPattern),
                            std::bit_cast<std::uint32_t>(config_.bloomIntensity)},
         .temporalJitter = {currentCamera.jitterPixels, previousCamera.jitterPixels},
-        .temporalFlags = {pathTracingEnabled()
-                              ? pathTracingSampleIndex_
-                              : (config_.taaEnabled && temporalState_.historyValid() ? 1U : 0U),
-                          pathTracingEnabled()
-                              ? pathDebugCode
-                              : static_cast<std::uint32_t>(config_.temporalDebugView),
-                          config_.taaEnabled || temporalUpscalingEnabled() ||
-                                  dlssUpscalingEnabled()
-                              ? 1U
-                              : 0U,
-                          config_.bloomEnabled ? 1U : 0U},
+        .temporalFlags =
+            {pathTracingEnabled() ? pathTracingSampleIndex_
+                                  : (config_.taaEnabled && temporalState_.historyValid() ? 1U : 0U),
+             pathTracingEnabled() ? pathDebugCode
+                                  : static_cast<std::uint32_t>(config_.temporalDebugView),
+             config_.taaEnabled || temporalUpscalingEnabled() || dlssUpscalingEnabled() ? 1U : 0U,
+             config_.bloomEnabled ? 1U : 0U},
         .shadowSceneCenterRadius = shadowCascades[0],
         .shadowCascadeCenterRadius1 = shadowCascades[1],
         .shadowCascadeCenterRadius2 = shadowCascades[2],
@@ -9007,17 +9074,18 @@ void Renderer::updateFrameUniform(std::size_t frameIndex) {
         .previousCameraPosition = {previousCameraPosition, 1.0F},
         .atmosphereCamera =
             config_.atmosphere.has_value()
-                ? glm::vec4(atmosphereCameraKm,
-                            config_.atmosphere->bottomRadiusMeters / 1'000.0F)
+                ? glm::vec4(atmosphereCameraKm, config_.atmosphere->bottomRadiusMeters / 1'000.0F)
                 : glm::vec4(0.0F),
-        .atmosphereSunDirection =
-            {atmosphereSunReference, config_.atmosphere.has_value() ? 1.0F : 0.0F},
+        .atmosphereSunDirection = {atmosphereSunReference,
+                                   config_.atmosphere.has_value() ? 1.0F : 0.0F},
         .cloudLayerParameters = cloudLayerParameters,
         .cloudWeatherParameters = cloudWeatherParameters,
-        .weatherParameters =
-            {config_.rain.enabled ? config_.rain.intensity : 0.0F,
-             rainSimulationTimeSeconds_, rainSteamAgeSeconds_,
-             rainWetnessAccumulation_},
+        .weatherParameters = {config_.rain.enabled ? config_.rain.intensity : 0.0F,
+                              rainSimulationTimeSeconds_, rainSteamAgeSeconds_,
+                              rainWetnessAccumulation_},
+        .lookColor = lookColor_,
+        .lookOptions = {config_.clay ? 1U : 0U, 0U, static_cast<std::uint32_t>(idAddress),
+                        static_cast<std::uint32_t>(idAddress >> 32U)},
     };
     uniformBuffers_[frameIndex]->write(std::as_bytes(std::span(&uniform, 1)));
 }
@@ -10475,6 +10543,24 @@ void Renderer::writePathAovExport() const {
     frame.planes.push_back(std::move(hitDistance));
     frame.planes.push_back(std::move(historyValidity));
     frame.planes.push_back(std::move(variance));
+    if (config_.idAovs) {
+        auto objectIds = makePlane(output::AovSemantic::objectId, 1U);
+        auto materialIds = makePlane(output::AovSemantic::materialId, 1U);
+        for (std::size_t pixel = 0; pixel < pixelCount; ++pixel) {
+            std::array<std::uint32_t, 2> ids{};
+            std::memcpy(ids.data(), source + pathIdOffset_ + pixel * sizeof(ids), sizeof(ids));
+            if (ids[0] > objectLabels_.size() || ids[1] > materialLabels_.size()) {
+                throw std::runtime_error("First-hit ID outside the scene lookup");
+            }
+            objectIds.pixels[pixel] =
+                ids[0] ? static_cast<float>(objectLabels_[ids[0] - 1U].id) : 0.0F;
+            materialIds.pixels[pixel] = static_cast<float>(ids[1]);
+        }
+        frame.planes.push_back(std::move(objectIds));
+        frame.planes.push_back(std::move(materialIds));
+        frame.objectLabels = objectLabels_;
+        frame.materialLabels = materialLabels_;
+    }
     config_.aovFrameSink->consume(std::move(frame));
     core::log(core::LogLevel::info, "Exported path AOV frame ", config_.aovExportFrame, " with ",
               pathTracingSampleIndex_, " accumulated sample(s) through renderer-neutral sink");

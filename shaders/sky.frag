@@ -2,34 +2,8 @@
 
 #include "include/ibl.glsl"
 
-layout(set = 0, binding = 0) uniform FrameData
-{
-    mat4 viewProjection;
-    mat4 inverseViewProjection;
-    mat4 unjitteredViewProjection;
-    mat4 previousViewProjection;
-    mat4 previousUnjitteredViewProjection;
-    vec4 cameraPositionExposure;
-    vec4 directionalDirectionIntensity;
-    vec4 directionalColor;
-    vec4 pointPositionIntensity;
-    vec4 pointColorRange;
-    vec4 environmentParameters;
-    uvec4 cullingParameters;
-    uvec4 visibilityMask;
-    vec4 temporalJitter;
-    uvec4 temporalFlags;
-    vec4 shadowSceneCenterRadius;
-    vec4 shadowCascadeCenterRadius1;
-    vec4 shadowCascadeCenterRadius2;
-    vec4 shadowCascadeSplits;
-    vec4 shadowCascadeDepthRadii;
-    vec4 previousCameraPosition;
-    vec4 atmosphereCamera;
-    vec4 atmosphereSunDirection;
-    vec4 cloudLayerParameters;
-    vec4 cloudWeatherParameters;
-} frameData;
+#define LOOK_FRAME_BINDING 0
+#include "include/look_frame.glsl"
 
 layout(set = 0, binding = 5) uniform sampler2D environmentMap;
 
@@ -100,7 +74,7 @@ void main()
                            rotatedDirectionToLatLongUv(
                                direction, frameData.environmentParameters.x)).rgb;
     }
-    outColor = vec4(radiance, 1.0);
+    outColor = vec4(radiance * frameData.lookColor.w, 1.0);
     // Reproject the infinite environment as a direction (w = 0). Camera
     // translation must not introduce parallax into sky motion vectors.
     vec4 currentClip = frameData.unjitteredViewProjection * vec4(direction, 0.0);

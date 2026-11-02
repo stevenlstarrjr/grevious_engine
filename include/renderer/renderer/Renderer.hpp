@@ -156,6 +156,10 @@ struct RendererConfig {
     bool weatherDemoEnabled = false;
     float weatherDemoCycleSeconds = 90.0F;
     float exposureCompensationEv = 0.0F;
+    float visibleSkyEv = 0.0F;
+    float whiteBalanceKelvin = 6500.0F;
+    bool clay = false;
+    bool idAovs = false;
     float environmentRotationRadians = 0.0F;
     std::filesystem::path capturePath;
     std::filesystem::path timingOutputPath;
@@ -315,6 +319,10 @@ class Renderer final {
         glm::vec4 cloudWeatherParameters{0.0F};
         // Rain intensity, simulation time, post-rain steam age, and accumulated wetness.
         glm::vec4 weatherParameters{0.0F};
+        // RGB camera adaptation, W camera-visible environment multiplier.
+        glm::vec4 lookColor{1.0F};
+        // X clay override, ZW optional uint64 first-hit ID capture address.
+        glm::uvec4 lookOptions{0U};
     };
 
     struct BloomControls {
@@ -333,7 +341,7 @@ class Renderer final {
         render_graph::ImageHandle scratch;
     };
 
-    static_assert(sizeof(FrameUniform) == 164 * sizeof(float));
+    static_assert(sizeof(FrameUniform) == 172 * sizeof(float));
 
     struct GraphFrameContext {
         std::uint32_t imageIndex = 0;
@@ -577,6 +585,10 @@ class Renderer final {
     std::array<std::unique_ptr<vulkan::Buffer>, framesInFlight>
         editorOverlayVertexBuffers_{};
     std::unique_ptr<vulkan::Buffer> pathAovReadbackBuffer_;
+    VkDeviceSize pathIdOffset_ = 0;
+    glm::vec4 lookColor_{1.0F};
+    std::vector<output::IdLabel> objectLabels_;
+    std::vector<output::IdLabel> materialLabels_;
     static constexpr std::size_t pathAovReadbackTargetCount =
         static_cast<std::size_t>(PathAovReadbackTarget::count);
     std::array<VkDeviceSize, pathAovReadbackTargetCount> pathAovReadbackOffsets_{};

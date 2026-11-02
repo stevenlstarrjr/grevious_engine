@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -23,6 +24,8 @@ enum class AovSemantic : std::uint32_t {
     hitDistance,
     historyValidity,
     variance,
+    objectId,
+    materialId,
 };
 
 [[nodiscard]] std::string_view aovName(AovSemantic semantic);
@@ -34,12 +37,19 @@ struct AovPlane {
     std::vector<float> pixels;
 };
 
+struct IdLabel {
+    std::uint32_t id;
+    std::string name;
+};
+
 struct AovFrame {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint64_t frameNumber = 0;
     std::uint32_t accumulatedSamples = 0;
     std::vector<AovPlane> planes;
+    std::vector<IdLabel> objectLabels;
+    std::vector<IdLabel> materialLabels;
 };
 
 void validateAovFrame(const AovFrame& frame);

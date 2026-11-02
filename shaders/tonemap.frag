@@ -3,34 +3,8 @@
 #include "include/post.glsl"
 
 layout(set = 0, binding = 0) uniform sampler2D hdrColor;
-layout(set = 0, binding = 1) uniform FrameData
-{
-    mat4 viewProjection;
-    mat4 inverseViewProjection;
-    mat4 unjitteredViewProjection;
-    mat4 previousViewProjection;
-    mat4 previousUnjitteredViewProjection;
-    vec4 cameraPositionExposure;
-    vec4 directionalDirectionIntensity;
-    vec4 directionalColor;
-    vec4 pointPositionIntensity;
-    vec4 pointColorRange;
-    vec4 environmentParameters;
-    uvec4 cullingParameters;
-    uvec4 visibilityMask;
-    vec4 temporalJitter;
-    uvec4 temporalFlags;
-    vec4 shadowSceneCenterRadius;
-    vec4 shadowCascadeCenterRadius1;
-    vec4 shadowCascadeCenterRadius2;
-    vec4 shadowCascadeSplits;
-    vec4 shadowCascadeDepthRadii;
-    vec4 previousCameraPosition;
-    vec4 atmosphereCamera;
-    vec4 atmosphereSunDirection;
-    vec4 cloudLayerParameters;
-    vec4 cloudWeatherParameters;
-} frameData;
+#define LOOK_FRAME_BINDING 1
+#include "include/look_frame.glsl"
 layout(set = 0, binding = 2) uniform sampler2D bloomColor;
 layout(set = 0, binding = 3) uniform sampler2D motionDepth;
 
@@ -277,6 +251,6 @@ void main()
         hdr += texture(bloomColor, uv).rgb * bloomIntensity;
     }
     hdr *= max(frameData.cameraPositionExposure.w, 0.0);
-    vec3 mapped = rendererAgx(hdr);
+    vec3 mapped = rendererAgx(hdr * frameData.lookColor.rgb);
     outColor = vec4(applyFilmGrain(mapped), 1.0);
 }

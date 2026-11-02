@@ -97,6 +97,25 @@ int main() {
                     manifestText.find("\"name\": \"depth\"") != std::string::npos,
                 "AOV manifest metadata is incomplete");
 
+        frame.planes.push_back({renderer::output::AovSemantic::objectId, 1U, {0.0F, 1.0F}});
+        frame.objectLabels.push_back({1U, "Wheel, \"left\""});
+        sink.consume(frame);
+        require(std::filesystem::file_size(directory / "object_id.png") > 8U,
+                "Lossless ID color image was not written");
+        std::ifstream legend(directory / "id_legend.csv");
+        const std::string legendText((std::istreambuf_iterator<char>(legend)), {});
+        require(legendText.find("object_id,1,158,55,121,\"Wheel, \"\"left\"\"\"") !=
+                    std::string::npos,
+                "ID legend did not preserve the object name and color");
+        frame.planes.back().pixels[0] = 0.5F;
+        bool rejectedFractionalId = false;
+        try {
+            renderer::output::validateAovFrame(frame);
+        } catch (const std::invalid_argument&) {
+            rejectedFractionalId = true;
+        }
+        require(rejectedFractionalId, "Fractional object ID was accepted");
+        frame.planes.pop_back();
         frame.planes.push_back(frame.planes.front());
         bool rejectedDuplicate = false;
         try {

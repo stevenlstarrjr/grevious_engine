@@ -1,6 +1,8 @@
 #include "renderer/output/AovExport.hpp"
+#include "renderer/assets/ImageWriter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <fstream>
@@ -52,6 +54,51 @@ void writePfm(const std::filesystem::path& path, const AovFrame& frame,
     }
 }
 
+bool isIdPlane(AovSemantic semantic) {
+    return semantic == AovSemantic::objectId || semantic == AovSemantic::materialId;
+}
+
+std::array<std::uint8_t, 3> idColor(std::uint32_t id) {
+    // An odd multiplier permutes all 24-bit values without collisions. Zero is black.
+    const std::uint32_t rgb = (id * 0x9e3779U) & 0xffffffU;
+    return {static_cast<std::uint8_t>(rgb >> 16U), static_cast<std::uint8_t>(rgb >> 8U),
+            static_cast<std::uint8_t>(rgb)};
+}
+
+void writeIdPng(const std::filesystem::path& path, const AovFrame& frame, const AovPlane& plane) {
+    std::vector<std::uint8_t> rgba(plane.pixels.size() * 4U, 255U);
+    for (std::size_t i = 0; i < plane.pixels.size(); ++i) {
+        const auto color = idColor(static_cast<std::uint32_t>(plane.pixels[i]));
+        std::copy(color.begin(), color.end(), rgba.data() + i * 4U);
+    }
+    assets::writeRgba8Png(path, frame.width, frame.height, rgba);
+}
+
+void writeIdLegend(const std::filesystem::path& path, const AovFrame& frame) {
+    std::ofstream file(path, std::ios::binary);
+    if (!file)
+        throw std::runtime_error("Could not open ID legend: " + path.string());
+    file << "pass,id,r,g,b,name\r\n";
+    const auto writeLabels = [&](std::string_view pass, const std::vector<IdLabel>& labels) {
+        file << pass << ",0,0,0,0,Background\r\n";
+        for (const auto& label : labels) {
+            const auto rgb = idColor(label.id);
+            file << pass << ',' << label.id << ',' << +rgb[0] << ',' << +rgb[1] << ',' << +rgb[2]
+                 << ",\"";
+            for (const char c : label.name) {
+                if (c == '"')
+                    file << '"';
+                file << c;
+            }
+            file << "\"\r\n";
+        }
+    };
+    writeLabels("object_id", frame.objectLabels);
+    writeLabels("material_id", frame.materialLabels);
+    if (!file)
+        throw std::runtime_error("Could not finish ID legend: " + path.string());
+}
+
 } // namespace
 
 std::string_view aovName(AovSemantic semantic) {
@@ -86,12 +133,20 @@ std::string_view aovName(AovSemantic semantic) {
         return "history_validity";
     case AovSemantic::variance:
         return "variance";
+    case AovSemantic::objectId:
+        return "object_id";
+    case AovSemantic::materialId:
+        return "material_id";
     }
     throw std::runtime_error("Unknown AOV semantic");
 }
 
 std::string_view aovDescription(AovSemantic semantic) {
     switch (semantic) {
+    case AovSemantic::objectId:
+        return "Unfiltered first-hit object ID. Zero is background";
+    case AovSemantic::materialId:
+        return "Unfiltered first-hit material ID. Zero is background";
     case AovSemantic::beauty:
         return "Linear scene-referred spatially reconstructed beauty radiance";
     case AovSemantic::rawBeauty:
@@ -145,9 +200,15 @@ void validateAovFrame(const AovFrame& frame) {
         if (expectedValues != plane.pixels.size()) {
             throw std::invalid_argument("AOV plane size does not match the frame extent");
         }
+        const bool idPlane = isIdPlane(plane.semantic);
+        if (idPlane && plane.channels != 1U)
+            throw std::invalid_argument("ID planes must be scalar");
         for (float value : plane.pixels) {
             if (!std::isfinite(value)) {
                 throw std::invalid_argument("AOV planes require finite float values");
+            }
+            if (idPlane && (value < 0.0F || value > 16777215.0F || std::trunc(value) != value)) {
+                throw std::invalid_argument("ID values must be unsigned 24-bit integers");
             }
         }
         if (std::find(semantics.begin(), semantics.end(), plane.semantic) !=
@@ -170,10 +231,17 @@ void PfmAovDirectorySink::consume(AovFrame frame) {
     const std::filesystem::path directory =
         frameDirectory(rootDirectory_, frame.frameNumber);
     createDirectory(directory);
+    bool hasIds = false;
     for (const AovPlane& plane : frame.planes) {
         writePfm(directory / (std::string(aovName(plane.semantic)) + ".pfm"), frame,
                  plane);
+        if (isIdPlane(plane.semantic)) {
+            hasIds = true;
+            writeIdPng(directory / (std::string(aovName(plane.semantic)) + ".png"), frame, plane);
+        }
     }
+    if (hasIds)
+        writeIdLegend(directory / "id_legend.csv", frame);
 
     const std::filesystem::path manifestPath = directory / "manifest.json";
     std::ofstream manifest(manifestPath);
@@ -187,15 +255,19 @@ void PfmAovDirectorySink::consume(AovFrame frame) {
              << "  \"accumulated_samples\": " << frame.accumulatedSamples << ",\n"
              << "  \"width\": " << frame.width << ",\n"
              << "  \"height\": " << frame.height << ",\n"
-             << "  \"encoding\": \"float32-pfm-linear\",\n"
-             << "  \"planes\": [\n";
+             << "  \"encoding\": \"float32-pfm-linear\",\n";
+    if (hasIds)
+        manifest << "  \"id_legend\": \"id_legend.csv\",\n";
+    manifest << "  \"planes\": [\n";
     for (std::size_t index = 0U; index < frame.planes.size(); ++index) {
         const AovPlane& plane = frame.planes[index];
         const std::string_view name = aovName(plane.semantic);
         manifest << "    {\"name\": \"" << name << "\", \"file\": \"" << name
-                 << ".pfm\", \"channels\": " << plane.channels
-                 << ", \"description\": \"" << aovDescription(plane.semantic) << "\"}"
-                 << (index + 1U == frame.planes.size() ? "\n" : ",\n");
+                 << ".pfm\", \"channels\": " << plane.channels << ", \"description\": \""
+                 << aovDescription(plane.semantic) << "\"";
+        if (isIdPlane(plane.semantic))
+            manifest << ", \"color_png\": \"" << name << ".png\"";
+        manifest << "}" << (index + 1U == frame.planes.size() ? "\n" : ",\n");
     }
     manifest << "  ]\n}\n";
     if (!manifest) {

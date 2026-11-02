@@ -71,6 +71,10 @@ struct Options {
     bool weatherDemoEnabled = false;
     float weatherDemoCycleSeconds = 90.0F;
     float exposureCompensationEv = 0.0F;
+    float visibleSkyEv = 0.0F;
+    float whiteBalanceKelvin = 6500.0F;
+    bool clay = false;
+    bool idAovs = false;
     float environmentRotationDegrees = 0.0F;
     std::filesystem::path capturePath;
     std::filesystem::path timingOutputPath;
@@ -137,12 +141,13 @@ struct Options {
 #endif
 };
 
-float parseExposure(std::string_view text) {
+float parseLookValue(std::string_view text, std::string_view option, float minimum, float maximum) {
     float value = 0.0F;
     const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
     if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
-        value < -16.0F || value > 16.0F) {
-        throw std::runtime_error("--exposure-ev requires a finite value in [-16, 16]");
+        value < minimum || value > maximum) {
+        throw std::runtime_error(std::string(option) + " requires a finite value between " +
+                                 std::to_string(minimum) + " and " + std::to_string(maximum));
     }
     return value;
 }
@@ -455,7 +460,8 @@ Options parseOptions(int argc, char** argv) {
                          "[--time-latitude -89.9..89.9] "
                          "[--time-day-of-year 1..365] "
                          "[--environment-rotation DEGREES] "
-                         "[--exposure-ev STOPS] [--capture PATH] "
+                         "[--exposure-ev STOPS] [--visible-sky-ev STOPS] "
+                         "[--white-balance-k 2000..12000] [--clay] [--id-aovs] [--capture PATH] "
                          "[--timing-output PATH] "
                          "[--capture-frame N] [--visibility-mask MASK] "
                          "[--aov-export DIRECTORY] [--aov-frame N] "
@@ -546,7 +552,23 @@ Options parseOptions(int argc, char** argv) {
             continue;
         }
         if (argument == "--exposure-ev" && index + 1 < argc) {
-            options.exposureCompensationEv = parseExposure(argv[++index]);
+            options.exposureCompensationEv = parseLookValue(argv[++index], argument, -16.0F, 16.0F);
+            continue;
+        }
+        if (argument == "--visible-sky-ev" && index + 1 < argc) {
+            options.visibleSkyEv = parseLookValue(argv[++index], argument, -16.0F, 16.0F);
+            continue;
+        }
+        if (argument == "--white-balance-k" && index + 1 < argc) {
+            options.whiteBalanceKelvin = parseLookValue(argv[++index], argument, 2000.0F, 12000.0F);
+            continue;
+        }
+        if (argument == "--clay") {
+            options.clay = true;
+            continue;
+        }
+        if (argument == "--id-aovs") {
+            options.idAovs = true;
             continue;
         }
         if (argument == "--environment-rotation" && index + 1 < argc) {
@@ -1079,6 +1101,9 @@ Options parseOptions(int argc, char** argv) {
         }
         throw std::runtime_error("Unknown or incomplete argument: " + std::string(argument));
     }
+    if (options.idAovs && options.aovExportDirectory.empty()) {
+        throw std::runtime_error("--id-aovs requires --aov-export DIRECTORY");
+    }
     if (options.captureFrameSpecified && options.capturePath.empty()) {
         throw std::runtime_error("--capture-frame requires --capture");
     }
@@ -1262,6 +1287,10 @@ int run(const Options& options) {
                  .weatherDemoEnabled = options.weatherDemoEnabled,
                  .weatherDemoCycleSeconds = options.weatherDemoCycleSeconds,
                  .exposureCompensationEv = options.exposureCompensationEv,
+                 .visibleSkyEv = options.visibleSkyEv,
+                 .whiteBalanceKelvin = options.whiteBalanceKelvin,
+                 .clay = options.clay,
+                 .idAovs = options.idAovs,
                  .environmentRotationRadians =
                      options.environmentRotationDegrees * std::numbers::pi_v<float> / 180.0F,
                  .capturePath = options.capturePath,
@@ -1282,11 +1311,9 @@ int run(const Options& options) {
                  .atmosphereDemo = options.atmosphereDemo,
                  .atmosphereCameraPreset = options.atmosphereCameraPreset,
                  .atmosphereCameraPitchRadians =
-                     options.atmosphereCameraPitchDegrees *
-                     std::numbers::pi_v<float> / 180.0F,
+                     options.atmosphereCameraPitchDegrees * std::numbers::pi_v<float> / 180.0F,
                  .atmosphereCameraYawRadians =
-                     options.atmosphereCameraYawDegrees *
-                     std::numbers::pi_v<float> / 180.0F,
+                     options.atmosphereCameraYawDegrees * std::numbers::pi_v<float> / 180.0F,
                  .cloudInitialOffsetKm = options.cloudInitialOffsetKm,
                  .cloudDebugView = options.cloudDebugView,
                  .timeOfDayEnabled = options.timeOfDayEnabled,
