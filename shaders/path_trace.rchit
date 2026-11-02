@@ -3,6 +3,8 @@
 #extension GL_EXT_buffer_reference_uvec2 : require
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 // Transport structure and cosine-hemisphere sampling are adapted from pbrt-v4,
 // Copyright (c) 1998-2020 Matt Pharr, Wenzel Jakob, and Greg Humphreys;
@@ -105,7 +107,11 @@ layout(push_constant) uniform PathTracePushConstants
     uint sampleInFrame;
     uint samplesThisFrame;
     uint fixedPrimarySample;
+    uvec2 virtualState;
+    uvec2 virtualPixels;
 } controls;
+
+#include "include/virtual_texture.glsl"
 
 const uint BASE_COLOR_TEXTURE_BIT = 1u << 0u;
 const uint METALLIC_ROUGHNESS_TEXTURE_BIT = 1u << 1u;
@@ -192,6 +198,18 @@ vec4 samplePathMaterialTexture(uint textureIndex, uint textureBit,
     vec2 uv = pathTriangleUv(surface, 0, useUv1) * weights.x +
               pathTriangleUv(surface, 1, useUv1) * weights.y +
               pathTriangleUv(surface, 2, useUv1) * weights.z;
+    if (textureBit == BASE_COLOR_TEXTURE_BIT && any(notEqual(controls.virtualState,uvec2(0)))) {
+        VirtualState vt = VirtualState(controls.virtualState);
+        vec2 dimensions = vec2(vt.words[0], vt.words[1]);
+        float footprint = 0.0;
+        for (int i=0;i<3;++i) {
+            int j=(i+1)%3;
+            vec2 delta = pathTriangleUv(surface,i,useUv1)-pathTriangleUv(surface,j,useUv1);
+            float lengthWorld = max(length(surface.worldPositions[i]-surface.worldPositions[j]),1e-7);
+            footprint=max(footprint,coneWidth*length(delta*dimensions)/lengthWorld);
+        }
+        return sampleVirtual(vt, uv, log2(max(1.0,footprint)));
+    }
     float lod = pathTextureLod(textureIndex, surface, useUv1, coneWidth);
     return textureLod(materialTextures[nonuniformEXT(textureIndex)], uv, lod);
 }

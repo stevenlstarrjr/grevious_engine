@@ -58,6 +58,7 @@ class Instance;
 } // namespace renderer::vulkan
 
 namespace renderer {
+class VirtualTexture;
 
 enum class TemporalDebugView : std::uint32_t {
     none = 0,
@@ -73,6 +74,7 @@ enum class TemporalCameraScript : std::uint32_t {
     teleport = 2,
     rotate = 3,
     approach = 4,
+    zoomHold = 5,
 };
 enum class CameraStartView : std::uint32_t {
     front = 0,
@@ -148,6 +150,8 @@ struct RendererConfig {
     std::shared_ptr<const scene::Scene> sceneSnapshot;
     bool sceneAnimationStaticPose = false;
     std::filesystem::path environmentPath;
+    std::filesystem::path virtualBaseColor;
+    std::uint32_t virtualPoolMiB = 64;
     // When present, replaces the fallback studio HDR environment with a
     // physically based precomputed atmosphere. Explicit environmentPath wins.
     std::optional<lighting::AtmosphereSettings> atmosphere;
@@ -367,9 +371,11 @@ class Renderer final {
         std::uint32_t sampleInFrame = 0U;
         std::uint32_t samplesThisFrame = 1U;
         std::uint32_t fixedPrimarySample = 0U;
+        VkDeviceAddress virtualState = 0;
+        VkDeviceAddress virtualPixels = 0;
     };
 
-    static_assert(sizeof(PathTracingControls) == 4 * sizeof(std::uint32_t));
+    static_assert(sizeof(PathTracingControls) == 32);
 
     struct PathReconstructionControls {
         std::uint32_t sampleIndex = 0U;
@@ -544,6 +550,7 @@ class Renderer final {
     RenderView mainView_;
     vulkan::Swapchain swapchain_;
     vulkan::MemoryAllocator memoryAllocator_;
+    std::unique_ptr<VirtualTexture> virtualTexture_;
     vulkan::PipelineCache pipelineCache_;
     std::unique_ptr<vulkan::Buffer> vertexBuffer_;
     std::unique_ptr<vulkan::Buffer> indexBuffer_;

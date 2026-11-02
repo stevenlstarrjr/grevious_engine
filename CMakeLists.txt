@@ -465,6 +465,7 @@ set(RENDERER_SHADER_HEADERS
     shaders/include/path_trace.glsl
     shaders/include/path_trace_bsdf.glsl
     shaders/include/path_trace_environment.glsl
+    shaders/include/virtual_texture.glsl
     shaders/include/weather_wetness.glsl
 )
 set(RENDERER_SHADER_OUTPUTS)
@@ -528,6 +529,7 @@ set(GENESIS_RENDERER_SOURCES
     src/renderer/Renderer.cpp
     src/renderer/RendererEditorOverlay.cpp
     src/renderer/RendererPathDescriptors.cpp
+    src/renderer/VirtualTexture.cpp
     src/renderer/RendererPathPasses.cpp
 )
 if(WIN32)
@@ -543,6 +545,7 @@ add_dependencies(genesis_renderer renderer_shaders)
 
 target_compile_features(genesis_renderer PUBLIC cxx_std_20)
 target_include_directories(genesis_renderer PUBLIC include)
+target_include_directories(genesis_renderer SYSTEM PRIVATE thirdparty/stb)
 if(RENDERER_ENABLE_STREAMLINE)
     target_include_directories(genesis_renderer PRIVATE "${RENDERER_STREAMLINE_ROOT}/include")
 endif()

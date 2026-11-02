@@ -1,4 +1,5 @@
 #include "renderer/renderer/Renderer.hpp"
+#include "VirtualTexture.hpp"
 
 #if RENDERER_ENABLE_NRD
 #include "renderer/nvidia/NrdVulkanDenoiser.hpp"
@@ -1258,6 +1259,11 @@ Renderer::Renderer(platform::RenderSurface& surfaceHost, const vulkan::Instance&
         createFrameResources();
         createCaptureBuffer();
         createSceneResources();
+        if (!config_.virtualBaseColor.empty()) {
+            if (!pathTracingEnabled()) throw std::runtime_error("Virtual texture proof requires path tracing");
+            virtualTexture_ = std::make_unique<VirtualTexture>(config_.virtualBaseColor,
+                device_, memoryAllocator_, config_.virtualPoolMiB);
+        }
         createTemporalResources();
         createUpscalingHistoryResources();
         createPathTracingResources();
@@ -1318,6 +1324,16 @@ VkExtent2D Renderer::renderExtent() const {
 }
 
 void Renderer::drawFrame() {
+    if (virtualTexture_) {
+        // Synchronous proof: no mapping is replaced while an earlier ray can use it.
+        vulkan::check(vkQueueWaitIdle(device_.graphicsQueue()), "VT feedback fence");
+        if (const auto ticket = virtualTexture_->service(uploadContext_, renderedFrameCount_)) {
+            sceneUpload_ = *ticket;
+            sceneUploadPending_ = true;
+            pathTracingResetPending_ = true;
+            temporalState_.reset();
+        }
+    }
     // The dynamic atmosphere cache changes the freshly uploaded environment
     // image from sampled to storage layout on its first use. Finish that one
     // startup upload before recording the reusable per-frame transition; this
@@ -8767,6 +8783,12 @@ void Renderer::updateCamera() {
         cameraPosition_ = temporalScriptOrigin_;
         cameraYaw_ = temporalScriptOriginYaw_ +
                      static_cast<float>(renderedFrameCount_) * rotationRadiansPerFrame;
+    } else if (config_.temporalCameraScript == TemporalCameraScript::zoomHold) {
+        // Repeatable front-on camera move for texture residency comparisons.
+        const float t = glm::smoothstep(16.0F, 92.0F, static_cast<float>(renderedFrameCount_));
+        const float startAltitude = std::max(temporalScriptOrigin_.z - sceneMaximum_.z, sceneRadius_ * 0.02F);
+        const float endAltitude = sceneRadius_ * 0.011F;
+        cameraPosition_.z = sceneMaximum_.z + std::exp(glm::mix(std::log(startAltitude), std::log(endAltitude), t));
     } else if (config_.temporalCameraScript == TemporalCameraScript::approach) {
         constexpr float travelPerFrame = 0.08F;
         const glm::vec3 approachDirection = glm::normalize(sceneCenter_ - temporalScriptOrigin_);
